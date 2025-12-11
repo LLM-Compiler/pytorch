@@ -26,7 +26,7 @@ ios:
 .PHONY: triton
 triton:
 	$(PIP) uninstall -y triton
-	@./scripts/install_triton_wheel.sh
+	@./scripts/install_triton_from_source.sh
 
 .PHONY: clean
 clean: # This will remove ALL build folders.
