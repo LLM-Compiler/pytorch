@@ -61,7 +61,9 @@ if triton is not None:
 
     try:
         from triton.compiler.compiler import ASTSource
+        print(f"DEBUG: ASTSource imported: {ASTSource}", flush=True)
     except ImportError:
+        print("DEBUG: ASTSource import failed", flush=True)
         ASTSource = None
 
     try:
@@ -359,6 +361,7 @@ class CachingAutotuner(KernelInterface):
 
     def _precompile_config(self, cfg: Config, warm_cache_only: bool):
         """Ahead of time compile a given autotuner config."""
+        sys.stderr.write(f"DEBUG: _precompile_config called. ASTSource is {ASTSource}\n")
         compile_meta = copy.deepcopy(self.triton_meta)
         for k, v in cfg.kwargs.items():
             if self.device_props.type == "hip":
@@ -385,12 +388,35 @@ class CachingAutotuner(KernelInterface):
             triton_helpers.set_driver_to_gpu()
 
         if ASTSource:
+            sys.stderr.write("DEBUG: ASTSource found, converting config...\n")
+            # Convert instance_descriptor to attrs dict expected by ASTSource
+            # ASTSource expects attrs with tuple path keys like (0,), (1,), etc.
+            config = compile_meta["configs"][0]
+            sys.stderr.write(f"DEBUG: config type: {type(config)}, value: {config}\n")
+            attrs = {}
+            if hasattr(config, "divisible_by_16"):
+                for arg_idx in config.divisible_by_16:
+                    attrs.setdefault((arg_idx,), []).append(("tt.divisibility", 16))
+            if hasattr(config, "divisible_by_8"):
+                for arg_idx in config.divisible_by_8:
+                    attrs.setdefault((arg_idx,), []).append(("tt.divisibility", 8))
+            
+            # Build complete signature including constexpr arguments for Triton CPU
+            # The signature must match fn.arg_names for proper index resolution
+            full_signature = dict(compile_meta["signature"])
+            for const_name in compile_meta["constants"].keys():
+                if const_name not in full_signature:
+                    full_signature[const_name] = "constexpr"
+            
+            sys.stderr.write(f"DEBUG: attrs created: {attrs}\n")
+            sys.stderr.write(f"DEBUG: full_signature: {full_signature}\n")
+
             compile_args = (
                 ASTSource(
                     self.fn,
-                    compile_meta["signature"],
+                    full_signature,
                     compile_meta["constants"],
-                    compile_meta["configs"][0],
+                    attrs,
                 ),
             )
 
