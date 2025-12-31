@@ -6453,3 +6453,13 @@ from . import jagged_lowerings
 
 
 jagged_lowerings.register_jagged_ops()
+
+# Import custom attention lowering to override fallback
+# This must be imported after make_fallback() calls to override them
+# Import directly to avoid circular dependency
+try:
+    from .kernel.attention_cpu_triton import scaled_dot_product_flash_attention_for_cpu_triton
+    # The function is already registered via @register_lowering decorator
+except (ImportError, AttributeError):
+    # If file doesn't exist or import fails, that's okay - fallback will be used
+    pass
