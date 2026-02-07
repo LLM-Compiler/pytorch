@@ -8,9 +8,10 @@ from torch.fx.experimental._backward_state import BackwardState
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode, track_tensor_tree
 from torch.utils._python_dispatch import _get_current_dispatch_mode
 from torch.utils._pytree import tree_map_only
+from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
 
 
-__all__ = ["trace_wrapped"]
+__all__ = ["trace_wrapped", "TransformGetItemToIndex"]
 
 
 # trace_wrapped(*args, fn) is equivalent to fn(*args), but with a twist:
