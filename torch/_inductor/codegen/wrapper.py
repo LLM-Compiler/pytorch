@@ -538,6 +538,35 @@ class PythonWrapperCodegen(CodeGen):
         aot_inductor_debug_utils = ""
         if int(config.aot_inductor.debug_intermediate_value_printer) > 0:
             aot_inductor_debug_utils = "from torch._inductor.codegen.debug_utils import _print_debugging_tensor_value_info"
+        
+        # Check if extern_kernels is actually used in the generated code
+        # For CPU code, we typically don't need extern_kernels
+        extern_kernels_import = ""
+        try:
+            # Check if there are any external kernel calls in the graph
+            has_extern_kernels = False
+            if V.graph is not None:
+                # Check scheduler for external kernel usage
+                # This is a heuristic - if we're on CPU and using Triton, 
+                # we likely don't need extern_kernels
+                try:
+                    device = V.graph.scheduler.get_current_device_or_throw()
+                    # For CPU with Triton backend, extern_kernels is typically not needed
+                    if device.type != "cpu":
+                        has_extern_kernels = True
+                except Exception:
+                    # If we can't determine, include it for safety
+                    has_extern_kernels = True
+            else:
+                # If graph is not available, include for safety
+                has_extern_kernels = True
+            
+            if has_extern_kernels:
+                extern_kernels_import = "from torch._inductor.select_algorithm import extern_kernels"
+        except Exception:
+            # If there's any error, include it for safety (backward compatibility)
+            extern_kernels_import = "from torch._inductor.select_algorithm import extern_kernels"
+        
         self.imports.splice(
             f"""
                 {aot_config_comment}
@@ -553,7 +582,7 @@ class PythonWrapperCodegen(CodeGen):
                 from torch._inductor.codegen.memory_planning import _align as align
                 from torch import device, empty_strided
                 from {async_compile.__name__} import AsyncCompile
-                from torch._inductor.select_algorithm import extern_kernels
+                {extern_kernels_import}
                 from torch._inductor.codegen.multi_kernel import MultiKernelCall
                 {aot_inductor_debug_utils}
             """,
