@@ -540,6 +540,13 @@ class TritonPrinter(PythonPrinter):
         return f"libdevice.ceil({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
 
     def _helper_sqrt(self, expr):
+        # Use native sqrt for CPU, libdevice for GPU
+        try:
+            device = V.graph.scheduler.get_current_device_or_throw()
+            if device.type == "cpu":
+                return f"tl_math.sqrt({self._print(expr)}.to(tl.float32))"
+        except Exception:
+            pass
         return f"libdevice.sqrt({self._print(expr)}.to(tl.float32))"
 
     def _print_FloatPow(self, expr):
@@ -816,6 +823,16 @@ class TritonOverrides(OpOverrides):
         return cls._shaped_constant(value, dtype, shape=[])
 
     @staticmethod
+    def _is_cpu_device():
+        """Check if the current device is CPU"""
+        try:
+            device = V.graph.scheduler.get_current_device_or_throw()
+            return device.type == "cpu"
+        except Exception:
+            # If we can't determine device, default to False (GPU behavior)
+            return False
+
+    @staticmethod
     def abs(x):
         return f"tl_math.abs({x})"
 
@@ -841,6 +858,9 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def sqrt(x):
+        # Use native sqrt for CPU, libdevice for GPU
+        if TritonOverrides._is_cpu_device():
+            return f"tl_math.sqrt({x})"
         return f"libdevice.sqrt({x})"
 
     @staticmethod
@@ -1044,10 +1064,17 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def rsqrt(x):
+        # Use native rsqrt for CPU: 1 / sqrt(x)
+        if TritonOverrides._is_cpu_device():
+            return f"1.0 / tl_math.sqrt({x})"
         return f"libdevice.rsqrt({x})"
 
     @staticmethod
     def log1p(x):
+        # Use native log1p implementation for CPU: log(1 + x)
+        # This avoids external libdevice dependency for CPU execution
+        if TritonOverrides._is_cpu_device():
+            return f"tl_math.log(1 + {x})"
         return f"libdevice.log1p({x})"
 
     @staticmethod
