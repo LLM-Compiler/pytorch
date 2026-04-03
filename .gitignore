@@ -8,6 +8,8 @@
 
 ## PyTorch
 
+/build_bench_triton_cpu_integrated.sh
+
 .coverage
 coverage.xml
 .dmypy.json
