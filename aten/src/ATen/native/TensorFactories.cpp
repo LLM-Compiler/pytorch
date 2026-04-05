@@ -18,6 +18,7 @@
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 #include <c10/util/MathConstants.h>
+#include <c10/util/numa.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -1736,9 +1737,31 @@ Tensor from_file(c10::string_view filename, std::optional<bool> shared, std::opt
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ clone ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Tensor clone(const Tensor& src, std::optional<c10::MemoryFormat> optional_memory_format) {
+Tensor clone(
+    const Tensor& src,
+    std::optional<c10::MemoryFormat> optional_memory_format,
+    std::optional<int64_t> numa_node) {
   auto memory_format =
       optional_memory_format.value_or(MemoryFormat::Preserve);
+  if (numa_node.has_value()) {
+    TORCH_CHECK(
+        src.device().is_cpu() && src.layout() == c10::kStrided,
+        "clone(..., numa_node=...) is only supported for dense CPU tensors");
+    TORCH_CHECK(
+        c10::IsNUMAEnabled(),
+        "clone(..., numa_node=...) requires NUMA support enabled at build/runtime");
+    const auto num_numa_nodes = c10::GetNumNUMANodes();
+    TORCH_CHECK(
+        num_numa_nodes > 0,
+        "clone(..., numa_node=...) could not determine NUMA node count");
+    TORCH_CHECK(
+        *numa_node >= 0 && *numa_node < num_numa_nodes,
+        "clone(..., numa_node=...) expected numa_node in [0, ",
+        num_numa_nodes - 1,
+        "], but got ",
+        *numa_node);
+  }
+
   Tensor self;
   if (memory_format == MemoryFormat::Preserve) {
     if (src.is_non_overlapping_and_dense()) {
@@ -1749,6 +1772,15 @@ Tensor clone(const Tensor& src, std::optional<c10::MemoryFormat> optional_memory
     }
   } else {
     self = at::empty_like(src, src.options(), memory_format);
+  }
+
+  if (numa_node.has_value()) {
+    // Keep thread affinity unchanged and move newly allocated pages instead.
+    auto storage_data_ptr = self.storage().data_ptr().get();
+    auto storage_nbytes = self.storage().nbytes();
+    if (storage_data_ptr != nullptr && storage_nbytes > 0) {
+      c10::NUMAMove(storage_data_ptr, storage_nbytes, *numa_node);
+    }
   }
 
   if (src._is_zerotensor()) {

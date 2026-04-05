@@ -447,7 +447,7 @@
   max: where(self > max, grad, at::scalar_tensor(0., grad.options()))
   result: where(self_p <= max_p, self_t, max_t)
 
-- name: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
+- name: clone(Tensor self, *, MemoryFormat? memory_format=None, int? numa_node=None) -> Tensor
   self: grad
   result: auto_linear
 

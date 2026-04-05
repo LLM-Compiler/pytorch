@@ -2716,7 +2716,7 @@ Example::
 add_docstr(
     torch.clone,
     r"""
-clone(input, *, memory_format=torch.preserve_format) -> Tensor
+clone(input, *, memory_format=torch.preserve_format, numa_node=None) -> Tensor
 
 Returns a copy of :attr:`input`.
 
@@ -2731,6 +2731,11 @@ Args:
 
 Keyword args:
     {memory_format}
+    numa_node (int, optional): If not ``None``, requests that the **destination
+        storage** of the clone be placed on the given **NUMA node** (Linux,
+        **CPU**, **dense/strided** tensors only). Requires NUMA to be enabled at
+        build and runtime; invalid values or unsupported layouts/devices raise.
+        Default ``None`` preserves historical behavior. See :doc:`/notes/clone_numa`.
 """.format(**common_args),
 )
 

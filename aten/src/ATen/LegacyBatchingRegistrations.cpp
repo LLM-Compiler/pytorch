@@ -763,7 +763,10 @@ Tensor pow_scalar_Tensor_batching_rule(const Scalar& other, const Tensor& self) 
   return makeBatched(output_physical, BatchDims(old_bdims.begin(), old_bdims.end()));
 }
 
-Tensor clone_batching_rule(const Tensor& self, std::optional<MemoryFormat> memory_format) {
+Tensor clone_batching_rule(
+    const Tensor& self,
+    std::optional<MemoryFormat> memory_format,
+    std::optional<int64_t> numa_node) {
   // Memory format support is a little tricky because vmap is allowed to move
   // around batch dimensions and some memory formats are rank-dependent.
   // Another weird case is:
@@ -788,13 +791,14 @@ Tensor clone_batching_rule(const Tensor& self, std::optional<MemoryFormat> memor
     // make the non-batch dims contiguous? We've chosen the latter because
     // philosophically vmap hides the batch dims and operates on a per-sample level.
     auto physical_view = MultiBatchVmapTransform::logicalToPhysical(self);
-    auto output_physical = at::clone(physical_view.tensor(), memory_format);
+    auto output_physical =
+        at::clone(physical_view.tensor(), memory_format, numa_node);
     return physical_view.getPhysicalToLogicalMap().apply(output_physical);
   }
 
   TORCH_INTERNAL_ASSERT(!memory_format.has_value() || memory_format == MemoryFormat::Preserve);
   auto* self_batched = unsafeGetBatchedImpl(self);
-  auto output_physical = at::clone(self_batched->value(), memory_format);
+  auto output_physical = at::clone(self_batched->value(), memory_format, numa_node);
   auto old_bdims = self_batched->bdims();
   return makeBatched(output_physical, BatchDims(old_bdims.begin(), old_bdims.end()));
 }

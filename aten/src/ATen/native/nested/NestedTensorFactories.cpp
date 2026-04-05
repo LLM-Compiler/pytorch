@@ -131,7 +131,11 @@ Tensor& copy_nested_(Tensor& self, const Tensor& src, bool non_blocking) {
 
 Tensor clone_nested(
     const Tensor& self,
-    std::optional<c10::MemoryFormat> optional_memory_format) {
+    std::optional<c10::MemoryFormat> optional_memory_format,
+    std::optional<int64_t> numa_node) {
+  TORCH_CHECK(
+      !numa_node.has_value(),
+      "clone(..., numa_node=...) is not supported for nested tensors");
   auto memory_format = optional_memory_format.value_or(c10::MemoryFormat::Preserve);
   auto self_ptr = get_nested_tensor_impl(self);
   if (memory_format == c10::MemoryFormat::Preserve ||

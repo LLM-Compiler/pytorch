@@ -1954,8 +1954,15 @@ def where(
 @register_decomposition(aten.clone)
 @out_wrapper()
 def clone(
-    a: TensorLikeType, *, memory_format: torch.memory_format = torch.preserve_format
+    a: TensorLikeType,
+    *,
+    memory_format: torch.memory_format = torch.preserve_format,
+    numa_node: Optional[int] = None,
 ) -> TensorLikeType:
+    if numa_node is not None:
+        raise RuntimeError(
+            "clone(..., numa_node=...) is only supported for dense CPU tensors"
+        )
     result = prims.clone(a, memory_format=memory_format)
     return result
 

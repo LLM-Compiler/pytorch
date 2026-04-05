@@ -874,11 +874,15 @@ const SparseCsrTensor& resize_as_sparse_compressed_(
 
 SparseCsrTensor clone_sparse_compressed(
                                         const SparseCsrTensor& self,
-                                        std::optional<c10::MemoryFormat> optional_memory_format) {
+                                        std::optional<c10::MemoryFormat> optional_memory_format,
+                                        std::optional<int64_t> numa_node) {
   TORCH_CHECK(
       !optional_memory_format.has_value(),
       "unsupported memory format option ",
       optional_memory_format.value());
+  TORCH_CHECK(
+      !numa_node.has_value(),
+      "clone(..., numa_node=...) is not supported for sparse compressed tensors");
   TensorOptions options = self.options();
   auto compressed_indices = AT_DISPATCH_ROW_SPARSE_COMPRESSED_LAYOUTS(self.layout(),
                                                                       "clone_sparse_compressed",

@@ -10,7 +10,10 @@ Tensor mkldnn_view(const Tensor& self, IntArrayRef size);
 
 Tensor mkldnn_view_symint(const Tensor& self, c10::SymIntArrayRef size);
 
-Tensor mkldnn_clone(const Tensor& self);
+Tensor mkldnn_clone(
+    const Tensor& self,
+    std::optional<c10::MemoryFormat> optional_memory_format,
+    std::optional<int64_t> numa_node);
 
 } // namespace native
 } // namespace at

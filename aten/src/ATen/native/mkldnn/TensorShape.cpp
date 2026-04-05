@@ -26,7 +26,10 @@ Tensor mkldnn_reshape(const Tensor& self, IntArrayRef size) {
   TORCH_CHECK(false, "mkldnn_reshape: ATen not compiled with MKLDNN support");
 }
 
-Tensor mkldnn_clone(const Tensor& self, std::optional<c10::MemoryFormat> optional_memory_format) {
+Tensor mkldnn_clone(
+    const Tensor& self,
+    std::optional<c10::MemoryFormat> optional_memory_format,
+    std::optional<int64_t> numa_node) {
   TORCH_CHECK(false, "mkldnn_clone: ATen not compiled with MKLDNN support");
 }
 
@@ -65,11 +68,17 @@ Tensor mkldnn_reshape(const Tensor& self, IntArrayRef size) {
                                  self.options().device_opt());
 }
 
-Tensor mkldnn_clone(const Tensor& self, std::optional<c10::MemoryFormat> optional_memory_format) {
+Tensor mkldnn_clone(
+    const Tensor& self,
+    std::optional<c10::MemoryFormat> optional_memory_format,
+    std::optional<int64_t> numa_node) {
   TORCH_CHECK(
       !optional_memory_format.has_value(),
       "unsupported memory format option ",
       optional_memory_format.value());
+  TORCH_CHECK(
+      !numa_node.has_value(),
+      "clone(..., numa_node=...) is not supported for mkldnn tensors");
   ideep::tensor& src = itensor_from_mkldnn(self);
   ideep::tensor dst;
   ideep::direct_copy::compute(src, dst);

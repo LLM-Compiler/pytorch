@@ -53,7 +53,7 @@ from torch.testing._internal.common_device_type import (
     dtypes, dtypesIfCUDA, dtypesIfCPU, deviceCountAtLeast,
     skipMeta, PYTORCH_CUDA_MEMCHECK, largeTensorTest, onlyNativeDeviceTypes,
     get_all_device_types, skipXLA)
-from typing import Tuple
+from typing import Any, Tuple, cast
 import torch.backends.quantized
 import torch.testing._internal.data
 from torch.testing._internal.common_cuda import (
@@ -3279,6 +3279,246 @@ else:
         y = x.clone()
         # should retain permutation after densification
         self.assertTrue(y.stride() == (1, 4))
+
+    @onlyCPU
+    def test_clone_numa_node_cpu(self, device):
+        x = torch.randn(3, 4, device=device).as_strided((2, 2), (1, 3))
+        y = x.clone()
+        self.assertEqual(x, y)
+
+        try:
+            y_numa = x.clone(numa_node=0)
+        except RuntimeError as error:
+            self.assertRegex(
+                str(error),
+                "requires NUMA support enabled at build/runtime")
+            return
+
+        self.assertEqual(x, y_numa)
+        self.assertEqual(y.stride(), y_numa.stride())
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "expected numa_node in \\[0, .*\\], but got -1"):
+            x.clone(numa_node=-1)
+
+    @onlyNativeDeviceTypes
+    def test_clone_numa_node_non_cpu_errors(self, device):
+        if device == "cpu":
+            return
+        x = torch.randn(2, 3, device=device)
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "only supported for dense CPU tensors"):
+            x.clone(numa_node=0)
+
+    def test_clone_numa_node_meta_errors(self):
+        x = torch.empty((2, 3), device="meta")
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "only supported for dense CPU tensors"):
+            x.clone(numa_node=0)
+
+    @onlyCPU
+    def test_clone_numa_node_sparse_errors(self, device):
+        x = torch.sparse_coo_tensor(
+            indices=torch.tensor([[0, 1], [1, 0]], device=device),
+            values=torch.tensor([1.0, 2.0], device=device),
+            size=(2, 2),
+            device=device)
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "not supported for sparse tensors"):
+            x.clone(numa_node=0)
+
+    def _numa_linux_tensor_page_nodes(self, device, *, min_online_nodes=2):
+        """Linux move_pages(2) query: returns (online NUMA node ids, tensor_page_nodes).
+
+        ``tensor_page_nodes(t)`` returns the NUMA node id per page of ``t``'s storage.
+        """
+        # Linux-only low-level verification using move_pages(2).
+        if sys.platform != "linux":
+            self.skipTest("NUMA page placement check requires Linux")
+
+        cpu_mod = getattr(torch._C, "_cpu", None)
+        if cpu_mod is None or not hasattr(cpu_mod, "_set_numa_enabled"):
+            self.skipTest("NUMA runtime toggle is unavailable")
+        old_numa_enabled = cpu_mod._is_numa_enabled()
+        self.addCleanup(lambda: cpu_mod._set_numa_enabled(old_numa_enabled))
+        cpu_mod._set_numa_enabled(True)
+        if not cpu_mod._is_numa_enabled():
+            self.skipTest("NUMA runtime support is disabled")
+
+        import ctypes
+        import errno
+        from ctypes.util import find_library
+
+        online_nodes_path = "/sys/devices/system/node/online"
+        if not os.path.exists(online_nodes_path):
+            self.skipTest("NUMA sysfs is unavailable")
+
+        def _parse_online_nodes(path):
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            if not text:
+                return []
+            nodes = []
+            for part in text.split(","):
+                if "-" in part:
+                    start, end = part.split("-", 1)
+                    nodes.extend(range(int(start), int(end) + 1))
+                else:
+                    nodes.append(int(part))
+            return sorted(set(nodes))
+
+        numa_nodes = _parse_online_nodes(online_nodes_path)
+        if len(numa_nodes) < min_online_nodes:
+            self.skipTest(
+                f"Need at least {min_online_nodes} NUMA nodes for this test")
+
+        libc_name = find_library("c")
+        if libc_name is None:
+            self.skipTest("libc not found")
+        libc = ctypes.CDLL(libc_name, use_errno=True)
+        # ctypes stubs are static; cast to Any for dynamic symbol probing.
+        libc_any = cast(Any, libc)
+        move_pages = getattr(libc_any, "move_pages", None)
+
+        # Some libc builds do not export move_pages symbol directly.
+        if move_pages is None:
+            syscall = getattr(libc_any, "syscall", None)
+            if syscall is None:
+                self.skipTest("move_pages and syscall are unavailable on this system")
+
+            arch = os.uname().machine
+            move_pages_nr = {
+                "x86_64": 279,
+                "aarch64": 239,
+            }.get(arch)
+            if move_pages_nr is None:
+                self.skipTest(f"move_pages syscall number is unknown on arch={arch}")
+
+            syscall.argtypes = [ctypes.c_long]
+            syscall.restype = ctypes.c_long
+
+            def move_pages(pid, count, pages, nodes, status, flags):
+                return syscall(
+                    move_pages_nr,
+                    ctypes.c_int(pid),
+                    ctypes.c_ulong(count),
+                    pages,
+                    nodes,
+                    status,
+                    ctypes.c_int(flags),
+                )
+        else:
+            move_pages.argtypes = [
+                ctypes.c_int,                   # pid
+                ctypes.c_ulong,                 # count
+                ctypes.POINTER(ctypes.c_void_p),# pages
+                ctypes.POINTER(ctypes.c_int),   # nodes
+                ctypes.POINTER(ctypes.c_int),   # status
+                ctypes.c_int,                   # flags
+            ]
+            move_pages.restype = ctypes.c_long
+
+        page_size = os.sysconf("SC_PAGESIZE")
+
+        def tensor_page_nodes(t):
+            storage = t.untyped_storage()
+            base_ptr = storage.data_ptr()
+            nbytes = storage.nbytes()
+            if nbytes == 0:
+                return []
+            page_count = (nbytes + page_size - 1) // page_size
+            pages = (ctypes.c_void_p * page_count)()
+            for i in range(page_count):
+                pages[i] = ctypes.c_void_p(base_ptr + i * page_size)
+            status = (ctypes.c_int * page_count)()
+            # Query only: nodes == NULL, flags == 0.
+            rc = move_pages(0, page_count, pages, None, status, 0)
+            if rc != 0:
+                err = ctypes.get_errno()
+                if err in (errno.ENOSYS, errno.EPERM, errno.EACCES, errno.EINVAL):
+                    self.skipTest(f"move_pages query unavailable (errno={err})")
+                self.fail(f"move_pages query failed with errno={err}")
+            return [int(status[i]) for i in range(page_count)]
+
+        return numa_nodes, tensor_page_nodes
+
+    @onlyCPU
+    def test_clone_numa_node_page_placement_stability(self, device):
+        numa_nodes, _tensor_page_nodes = self._numa_linux_tensor_page_nodes(
+            device, min_online_nodes=2)
+
+        # Use a page-aligned size and touch memory to ensure pages are mapped.
+        size_bytes = os.sysconf("SC_PAGESIZE") * 1024
+        x = torch.empty(size_bytes, dtype=torch.uint8, device=device)
+        x.fill_(1)
+
+        original_x_nodes = _tensor_page_nodes(x)
+        if not original_x_nodes:
+            self.skipTest("No pages mapped for original tensor")
+
+        node0, node1 = numa_nodes[0], numa_nodes[1]
+
+        y0 = x.clone(numa_node=node0)
+        y0.fill_(2)
+        y0_nodes_initial = _tensor_page_nodes(y0)
+        self.assertTrue(all(n == node0 for n in y0_nodes_initial))
+
+        x_nodes_after_y0 = _tensor_page_nodes(x)
+        self.assertEqual(original_x_nodes, x_nodes_after_y0)
+
+        y1 = x.clone(numa_node=node1)
+        y1.fill_(3)
+        y1_nodes = _tensor_page_nodes(y1)
+        self.assertTrue(all(n == node1 for n in y1_nodes))
+
+        x_nodes_after_y1 = _tensor_page_nodes(x)
+        self.assertEqual(original_x_nodes, x_nodes_after_y1)
+
+        # Ensure first clone remains where it was placed.
+        y0_nodes_after_y1 = _tensor_page_nodes(y0)
+        self.assertEqual(y0_nodes_initial, y0_nodes_after_y1)
+
+    @onlyCPU
+    def test_clone_numa_node_row_column_page_placement(self, device):
+        # 4x4 matrix: row i cloned to NUMA node numa_nodes[i]; column j likewise.
+        # Verifies values and move_pages(2) node ids per destination storage page.
+        numa_nodes, tensor_page_nodes = self._numa_linux_tensor_page_nodes(
+            device, min_online_nodes=4)
+
+
+        x = torch.arange(16, dtype=torch.float32, device=device).reshape(4, 4)
+        original_x_nodes = tensor_page_nodes(x)
+        if not original_x_nodes:
+            self.skipTest("No pages mapped for original tensor")
+
+        for i in range(4):
+            row_clone = x[i].clone(numa_node=numa_nodes[i])
+            self.assertEqual(row_clone, x[i])
+            nodes = tensor_page_nodes(row_clone)
+            self.assertTrue(nodes, msg=f"row {i} clone has no mapped pages")
+            self.assertTrue(
+                all(n == numa_nodes[i] for n in nodes),
+                msg=f"row {i} page nodes {nodes}, expected all {numa_nodes[i]}")
+
+        self.assertEqual(
+            tensor_page_nodes(x), original_x_nodes,
+            msg="source matrix storage must be unchanged after row clones")
+
+        for j in range(4):
+            col_clone = x[:, j].clone(numa_node=numa_nodes[j])
+            self.assertEqual(col_clone, x[:, j])
+            nodes = tensor_page_nodes(col_clone)
+            self.assertTrue(nodes, msg=f"column {j} clone has no mapped pages")
+            self.assertTrue(
+                all(n == numa_nodes[j] for n in nodes),
+                msg=f"column {j} page nodes {nodes}, expected all {numa_nodes[j]}")
+
+        self.assertEqual(
+            tensor_page_nodes(x), original_x_nodes,
+            msg="source matrix storage must be unchanged after column clones")
 
     # FIXME: move to elementwise ternary test suite
     @dtypesIfCUDA(*set(get_all_math_dtypes('cuda')))

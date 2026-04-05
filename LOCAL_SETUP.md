@@ -72,6 +72,34 @@ export USE_XPU=0
 export MAX_JOBS=16
 python -m pip install -r requirements.txt
 python -m pip install -v --no-build-isolation .
+
+# for editable build
+conda activate triton_cpu_integrated
+
+python -m pip uninstall -y torch || true
+rm -rf build .setuptools-cmake-build
+
+unset USE_MKL USE_MKLDNN BLAS MKLROOT MKL_HOME CMAKE_ARGS
+
+export CMAKE_PREFIX_PATH="${CONDA_PREFIX:-}"
+export USE_CUDA=0
+export USE_ROCM=0
+export USE_XPU=0
+export USE_MKL=0
+export USE_MKLDNN=0
+export BLAS=OpenBLAS
+export MAX_JOBS=16
+
+python -m pip install -r requirements.txt
+python -m pip install -e . -v --no-build-isolation \
+  --config-settings=cmake.define.USE_MKL=OFF \
+  --config-settings=cmake.define.USE_MKLDNN=OFF \
+  --config-settings=cmake.define.BLAS=OpenBLAS
+
+
+# To log the build output
+
+{ python -m pip uninstall -y torch || true; rm -rf build .setuptools-cmake-build; unset USE_MKL USE_MKLDNN BLAS MKLROOT MKL_HOME CMAKE_ARGS; export CMAKE_PREFIX_PATH="${CONDA_PREFIX:-}"; export USE_CUDA=0; export USE_ROCM=0; export USE_XPU=0; export USE_MKL=0; export USE_MKLDNN=0; export BLAS=OpenBLAS; export MAX_JOBS=16; python -m pip install -r requirements.txt; python -m pip install -e . -v --no-build-isolation --config-settings=cmake.define.USE_MKL=OFF --config-settings=cmake.define.USE_MKLDNN=OFF --config-settings=cmake.define.BLAS=OpenBLAS; } 2>&1 | tee build_log.txt
 ```
 
 ## Stable benchmark build command (Triton CPU)
@@ -87,6 +115,15 @@ export LLVM_SYSPATH=/home/shavin/llm-cpu-compiler/llvm-project/build
 export LLVM_INCLUDE_DIRS=/home/shavin/llm-cpu-compiler/llvm-project/build/include
 export LLVM_LIBRARY_DIR=/home/shavin/llm-cpu-compiler/llvm-project/build/lib
 export MAX_JOBS=16
+# With `--no-build-isolation`, install PEP 517 build deps yourself (matches python/pyproject.toml).
+python -m pip install "setuptools>=40.8.0" wheel "cmake>=3.18" "ninja>=1.11.1" "pybind11>=2.13.1"
+# Editable: changes under `python/` are used in-place; rebuild when C++/CMake changes.
+python -m pip install -e ./python -v --no-build-isolation
+```
+
+Non-editable wheel-style install (copies artifacts into site-packages). Install the build-deps line above first if you use `--no-build-isolation`.
+
+```bash
 python -m pip install -v --no-build-isolation ./python
 ```
 
@@ -112,3 +149,15 @@ python test/inductor/test_triton_cpu_compile_integration.py
 ```
 
 Requires Triton with the **CPU** backend (`"cpu" in triton.backends.backends`). Skipped otherwise.
+
+## Fork feature: NUMA-aware `clone` (`numa_node`)
+
+- **User docs (Sphinx):** [docs/source/notes/clone_numa.rst](docs/source/notes/clone_numa.rst) — requirements, semantics, runtime enablement.
+- **API docstrings:** [torch/_torch_docs.py](torch/_torch_docs.py) (`torch.clone`), [torch/_tensor_docs.py](torch/_tensor_docs.py) (`Tensor.clone`).
+- **Runtime toggle (internal, tests):** `torch._C._cpu._set_numa_enabled(True)` — see the note above; requires a build that exposes these bindings.
+
+Quick check:
+
+```bash
+python -c "import torch; print(torch._C._cpu._is_numa_enabled())"
+```

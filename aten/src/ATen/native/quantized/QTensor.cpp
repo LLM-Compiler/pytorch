@@ -188,7 +188,11 @@ QScheme qscheme_quant(const Tensor& self) {
 
 Tensor quantized_clone(
     const Tensor& self,
-    std::optional<c10::MemoryFormat> optional_memory_format) {
+    std::optional<c10::MemoryFormat> optional_memory_format,
+    std::optional<int64_t> numa_node) {
+  TORCH_CHECK(
+      !numa_node.has_value(),
+      "clone(..., numa_node=...) is not supported for quantized tensors");
   auto memory_format =
       optional_memory_format.value_or(MemoryFormat::Contiguous);
 

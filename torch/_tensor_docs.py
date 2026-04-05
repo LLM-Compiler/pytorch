@@ -1165,10 +1165,10 @@ Alias for :meth:`~Tensor.clamp_`.
 add_docstr_all(
     "clone",
     r"""
-clone(*, memory_format=torch.preserve_format) -> Tensor
+clone(*, memory_format=torch.preserve_format, numa_node=None) -> Tensor
 
-See :func:`torch.clone`
-""".format(**common_args),
+See :func:`torch.clone`.
+""",
 )
 
 add_docstr_all(

@@ -1,4 +1,5 @@
 #include <ATen/cpu/Utils.h>
+#include <c10/util/numa.h>
 #include <torch/csrc/cpu/Module.h>
 #include <torch/csrc/utils/pybind.h>
 
@@ -16,6 +17,15 @@ void initModule(PyObject* module) {
   cpu.def("_init_amx", at::cpu::init_amx);
   cpu.def("_L1d_cache_size", at::cpu::L1d_cache_size);
   cpu.def("_L2_cache_size", at::cpu::L2_cache_size);
+  cpu.def("_set_numa_enabled", [](bool enabled) {
+    FLAGS_caffe2_cpu_numa_enabled = enabled;
+  });
+  cpu.def("_is_numa_enabled", []() {
+    return c10::IsNUMAEnabled();
+  });
+  cpu.def("_num_numa_nodes", []() {
+    return c10::GetNumNUMANodes();
+  });
 }
 
 } // namespace torch::cpu
