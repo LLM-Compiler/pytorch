@@ -635,20 +635,48 @@ class CachingAutotuner(KernelInterface):
             else get_launch_args_without_kernel_launch_metadata
         )
 
+        def _copy_kernel_metadata_with_numa_args(md, numa_args):
+            if numa_args is None:
+                return md
+
+            class _MetadataProxy:
+                pass
+
+            proxy = _MetadataProxy()
+            # Preserve existing attributes (e.g. num_threads) for CPU launcher.
+            if hasattr(md, "__dict__"):
+                for k, v in md.__dict__.items():
+                    setattr(proxy, k, v)
+            elif hasattr(md, "_asdict"):
+                for k, v in md._asdict().items():
+                    setattr(proxy, k, v)
+            else:
+                # Last-resort: preserve the original object for attribute fallback.
+                setattr(proxy, "_orig_metadata", md)
+            setattr(proxy, "numa_args", numa_args)
+            # Keep common attrs if they exist on original object and were not copied.
+            for attr in ("num_threads",):
+                if not hasattr(proxy, attr) and hasattr(md, attr):
+                    setattr(proxy, attr, getattr(md, attr))
+            return proxy
+
+        scope["copy_kernel_metadata_with_numa_args"] = _copy_kernel_metadata_with_numa_args
+
         scope["runner"] = get_first_attr(binary, "run", "c_wrapper")
 
         exec(
             f"""
-            def launcher({', '.join(def_args)}, grid, stream):
+            def launcher({', '.join(def_args)}, grid, stream, numa_args=None):
                 if callable(grid):
                     grid_0, grid_1, grid_2 = grid(grid_meta)
                 else:
                     grid_0, grid_1, grid_2 = grid
 
                 args = {', '.join(call_args)},
+                kernel_metadata = copy_kernel_metadata_with_numa_args(metadata, numa_args)
                 launch_args = get_launch_args(
                     grid, grid_0, grid_1, grid_2, stream, function,
-                    metadata, bin, launch_enter_hook, launch_exit_hook,
+                    kernel_metadata, bin, launch_enter_hook, launch_exit_hook,
                     num_warps, shared, cta_args, args
                 )
                 runner(*launch_args, *args)

@@ -484,6 +484,9 @@ class PythonWrapperCodegen(CodeGen):
         self.user_defined_kernel_cache: Dict[Tuple[Any, ...], Tuple[str, Any]] = {}
         self.unbacked_symbol_decls: Set[str] = set()  # str of sympy.Symbol
         self.computed_sizes: Set[sympy.Symbol] = set()
+        # Maps a tensor variable name in wrapper code (e.g. "buf1") to a list of
+        # per-NUMA-node tensor variables produced for that logical tensor.
+        self._numa_tensor_cache: Dict[str, List[str]] = {}
 
         # this is used for tracking which GraphLowering instance---parent graph
         # or (nested) subgraph---is currently codegened; the primary use case is
@@ -1681,6 +1684,8 @@ class PythonWrapperCodegen(CodeGen):
         triton_meta=None,
         autotune_configs=None,
         grid_extra_kwargs="",
+        numa_shard_plan: Optional[Dict[str, Any]] = None,
+        numa_role: Optional[str] = None,
     ):
         """
         Generates kernel call code.
@@ -1715,13 +1720,89 @@ class PythonWrapperCodegen(CodeGen):
             if grid_extra_kwargs:
                 grid_str = f"{grid_str}, {grid_extra_kwargs}"
             grid_str = f"{grid_fn}({grid_str})"
+        # Check if this kernel has a NUMA shard plan (set by numa_mlp_tp_pass).
+        # If so, emit per-NUMA-node buffer clones and pass them as numa_args.
+        numa_args_var = None
+        numa_output_clones: Dict[str, List[str]] = {}
+        numa_per_node_call_args: List[str] = []
+        # Fallback: template kernels may lose direct origin-node metadata during
+        # scheduling. If NUMA TP is enabled globally, still emit NUMA args for
+        # tensor pointer arguments.
+        if numa_shard_plan is None and getattr(config, "_numa_mlp_tp", False):
+            full_plan = getattr(config, "_numa_mlp_tp_shard_plan", None)
+            if isinstance(full_plan, dict) and full_plan.get("world_size", 0) >= 2:
+                numa_shard_plan = full_plan
+            else:
+                ws = int(getattr(config, "_numa_mlp_tp_world_size", 0))
+                if ws <= 1:
+                    cpu_mod = getattr(torch._C, "_cpu", None)
+                    if (
+                        cpu_mod is not None
+                        and hasattr(cpu_mod, "_is_numa_enabled")
+                        and hasattr(cpu_mod, "_num_numa_nodes")
+                        and cpu_mod._is_numa_enabled()
+                    ):
+                        ws = int(cpu_mod._num_numa_nodes())
+                if ws >= 2:
+                    numa_shard_plan = {"world_size": ws, "plan_id": 0}
+
+        if (
+            numa_shard_plan is not None
+            and numa_shard_plan.get("world_size", 0) >= 2
+            and arg_types is not None
+        ):
+            (
+                numa_args_var,
+                numa_output_clones,
+                numa_per_node_call_args,
+            ) = self.generate_numa_shard_allocations(
+                numa_shard_plan, call_args, arg_types, triton_meta, numa_role
+            )
+
         # add debug printer code for triton kernel calls at (jit) inductor level
         debug_printer_manager = V.graph.wrapper_code.debug_printer
         debug_printer_manager.set_printer_args(call_args, kernel_name, arg_types, None)
         with debug_printer_manager:
-            self.writeline(
-                f"{kernel_name}.run({call_args_str}, grid={grid_str}, stream={stream_name})"
-            )
+            if numa_args_var is not None:
+                self.writeline(
+                    f"{kernel_name}.run({call_args_str}, grid={grid_str}, "
+                    f"stream={stream_name}, numa_args={numa_args_var})"
+                )
+                # Row-parallel output (z_shard) needs a sum reduction across
+                # per-node partial outputs. Then materialize the reduced result
+                # back into every per-node output clone.
+                should_allreduce_outputs = numa_role == "z_shard"
+                if not should_allreduce_outputs and numa_shard_plan is not None:
+                    b_node = numa_shard_plan.get("b_node")
+                    a_node = numa_shard_plan.get("a_node")
+                    has_b = isinstance(b_node, str) and b_node in call_args
+                    has_a = isinstance(a_node, str) and a_node in call_args
+                    # Fallback for paths that lose role metadata: row-parallel
+                    # linear2 typically consumes B shard but not A shard.
+                    should_allreduce_outputs = has_b and not has_a
+                if should_allreduce_outputs:
+                    for out_arg, per_node_outs in numa_output_clones.items():
+                        if len(per_node_outs) < 2:
+                            continue
+                        reduced = per_node_outs[0]
+                        for ridx, out_name in enumerate(per_node_outs[1:], start=1):
+                            reduced_next = f"_numa_reduce_{out_arg}_{ridx}"
+                            self.writeline(
+                                f"{reduced_next} = torch.ops.aten.add.Tensor({reduced}, {out_name})"
+                            )
+                            reduced = reduced_next
+                        for sid, out_name in enumerate(per_node_outs):
+                            self.writeline(
+                                f"{out_name} = torch.ops.aten.clone.default({reduced}, numa_node={sid})"
+                            )
+                        # Keep logical wrapper tensor and cache in sync so
+                        # downstream non-NUMA paths and graph outputs are valid.
+                        self.writeline(f"{out_arg} = {reduced}")
+                        self._numa_tensor_cache[out_arg] = per_node_outs
+            else:
+                self.writeline(
+                    f"{kernel_name}.run({call_args_str}, grid={grid_str}, stream={stream_name})"
+                )
         if (
             config.triton.autotune_at_compile_time
             and kernel_name not in self.kernel_autotune_names
@@ -1822,6 +1903,208 @@ class PythonWrapperCodegen(CodeGen):
             return dtype_to_string(s)
         else:
             return repr(s)
+
+    # ------------------------------------------------------------------
+    # NUMA-aware buffer allocation helpers
+    # ------------------------------------------------------------------
+    def generate_numa_shard_allocations(
+        self,
+        shard_plan: Dict[str, Any],
+        call_args: List[str],
+        arg_types: List[Any],
+        triton_meta: Optional[Dict[str, Any]] = None,
+        numa_role: Optional[str] = None,
+    ) -> Tuple[Optional[str], Dict[str, List[str]], List[str]]:
+        """
+        If the current kernel is part of a NUMA shard plan, emit per-NUMA-node
+        clone calls for all input/output buffers and return the name of the
+        ``numa_args`` list variable. Returns ``None`` if no plan applies.
+
+        The generated code looks like::
+
+            _numa_x_0 = torch.ops.aten.clone.default(arg1_1, numa_node=0)
+            _numa_x_1 = torch.ops.aten.clone.default(arg1_1, numa_node=1)
+            ...
+            _numa_args = [
+                (_numa_x_0, _numa_a_0, _numa_out_0),
+                (_numa_x_1, _numa_a_1, _numa_out_1),
+                ...
+            ]
+        """
+        world_size = shard_plan.get("world_size", 0)
+        if world_size < 2:
+            return None, {}, []
+
+        plan_id = shard_plan.get("plan_id", 0)
+        prefix = f"_numa_p{plan_id}"
+
+        per_node_arg_names: List[List[str]] = [[] for _ in range(world_size)]
+        # Keep generated per-arg per-sid names so we can cache output tensors.
+        generated_by_arg: Dict[str, List[str]] = {}
+        sig_names: List[str] = []
+        if triton_meta is not None:
+            sig = triton_meta.get("signature", {})
+            if isinstance(sig, dict):
+                sig_names = list(sig.keys())
+        tensor_sig_idx = 0
+
+        x_node = shard_plan.get("x_node")
+        a_node = shard_plan.get("a_node")
+        b_node = shard_plan.get("b_node")
+        b1_node = shard_plan.get("b1_node")
+        b2_node = shard_plan.get("b2_node")
+        shard_d = int(shard_plan.get("shard_d", 0))
+        a_slice_dim = int(shard_plan.get("a_slice_dim", 1))
+        b_slice_dim = int(shard_plan.get("b_slice_dim", 0))
+        b1_slice_dim = int(shard_plan.get("b1_slice_dim", 0))
+        z_shard_like = numa_role == "z_shard"
+        if not z_shard_like:
+            has_b = isinstance(b_node, str) and b_node in call_args
+            has_a = isinstance(a_node, str) and a_node in call_args
+            z_shard_like = has_b and not has_a
+
+        def _emit_replicate(var_name: str, sid: int) -> str:
+            clone_name = f"{prefix}_{var_name}_n{sid}"
+            self.writeline(
+                f"{clone_name} = torch.ops.aten.clone.default({var_name}, numa_node={sid})"
+            )
+            return clone_name
+
+        def _emit_slice_clone(var_name: str, dim: int, sid: int) -> str:
+            start = sid * shard_d
+            end = (sid + 1) * shard_d
+            full_clone_name = f"{prefix}_{var_name}_full_n{sid}"
+            slice_name = f"{prefix}_{var_name}_n{sid}"
+            # Clone full tensor to target NUMA node first, then slice.
+            # This preserves the view stride pattern expected by the already
+            # compiled Triton kernel (slice-then-clone can re-layout data).
+            self.writeline(
+                f"{full_clone_name} = torch.ops.aten.clone.default({var_name}, numa_node={sid})"
+            )
+            self.writeline(
+                f"{slice_name} = torch.ops.aten.slice.Tensor({full_clone_name}, {dim}, {start}, {end}, 1)"
+            )
+            return slice_name
+
+        def _emit_zero_bias_clone(var_name: str, sid: int) -> str:
+            zero_name = f"{prefix}_{var_name}_zero_n{sid}"
+            clone_name = f"{prefix}_{var_name}_n{sid}"
+            self.writeline(f"{zero_name} = torch.ops.aten.zeros_like.default({var_name})")
+            self.writeline(
+                f"{clone_name} = torch.ops.aten.clone.default({zero_name}, numa_node={sid})"
+            )
+            return clone_name
+
+        # Only pointer/tensor arguments should be cloned and forwarded via
+        # numa_args. Scalar/meta args (e.g. xnumel) are not pointers and should
+        # remain in the regular launcher args.
+        for arg_name, arg_type in zip(call_args, arg_types):
+            if not isinstance(arg_name, str):
+                continue
+            if not isinstance(arg_type, torch_dtype):
+                continue
+            sig_name = (
+                sig_names[tensor_sig_idx] if tensor_sig_idx < len(sig_names) else ""
+            )
+            tensor_sig_idx += 1
+            for sid in range(world_size):
+                # Explicit output buffer policy: always materialize per-node output
+                # clones and cache them for downstream kernels.
+                if sig_name.startswith("out_ptr"):
+                    out_name = _emit_replicate(arg_name, sid)
+                    per_node_arg_names[sid].append(out_name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = out_name
+                    continue
+
+                # Reuse per-node outputs from a previous kernel if available.
+                if arg_name in self._numa_tensor_cache:
+                    per_node_arg_names[sid].append(self._numa_tensor_cache[arg_name][sid])
+                    continue
+
+                # Full-plan semantics from FX metadata:
+                # - replicate X and b2
+                # - shard-slice A/B/b1 then clone to target NUMA node
+                if arg_name == x_node:
+                    name = _emit_replicate(arg_name, sid)
+                    per_node_arg_names[sid].append(name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
+                elif arg_name == b2_node:
+                    # For z_shard (row-parallel linear2), per-node outputs are
+                    # all-reduced. Bias must only contribute once globally.
+                    if z_shard_like and sid != 0:
+                        name = _emit_zero_bias_clone(arg_name, sid)
+                    else:
+                        name = _emit_replicate(arg_name, sid)
+                    per_node_arg_names[sid].append(name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
+                elif arg_name == a_node and shard_d > 0:
+                    name = _emit_slice_clone(arg_name, a_slice_dim, sid)
+                    per_node_arg_names[sid].append(name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
+                elif arg_name == b_node and shard_d > 0:
+                    name = _emit_slice_clone(arg_name, b_slice_dim, sid)
+                    per_node_arg_names[sid].append(name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
+                elif b1_node is not None and arg_name == b1_node and shard_d > 0:
+                    name = _emit_slice_clone(arg_name, b1_slice_dim, sid)
+                    per_node_arg_names[sid].append(name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
+                else:
+                    # Conservative fallback: replicate unknown tensor args.
+                    name = _emit_replicate(arg_name, sid)
+                    per_node_arg_names[sid].append(name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
+
+        numa_args_var = f"{prefix}_numa_args"
+        inner = ", ".join(
+            "(" + ", ".join(per_node_arg_names[sid]) + ")"
+            for sid in range(world_size)
+        )
+        self.writeline(f"{numa_args_var} = [{inner}]")
+
+        # Cache output pointer args for downstream kernels.
+        tensor_sig_idx = 0
+        for arg_name, arg_type in zip(call_args, arg_types):
+            if not isinstance(arg_name, str) or not isinstance(arg_type, torch_dtype):
+                continue
+            sig_name = (
+                sig_names[tensor_sig_idx] if tensor_sig_idx < len(sig_names) else ""
+            )
+            tensor_sig_idx += 1
+            if sig_name.startswith("out_ptr"):
+                if arg_name in generated_by_arg:
+                    self._numa_tensor_cache[arg_name] = generated_by_arg[arg_name]
+
+        output_clones: Dict[str, List[str]] = {}
+        tensor_sig_idx = 0
+        for arg_name, arg_type in zip(call_args, arg_types):
+            if not isinstance(arg_name, str) or not isinstance(arg_type, torch_dtype):
+                continue
+            sig_name = (
+                sig_names[tensor_sig_idx] if tensor_sig_idx < len(sig_names) else ""
+            )
+            tensor_sig_idx += 1
+            if sig_name.startswith("out_ptr") and arg_name in generated_by_arg:
+                output_clones[arg_name] = generated_by_arg[arg_name]
+
+        pointer_positions = [
+            idx
+            for idx, (arg_name, arg_type) in enumerate(zip(call_args, arg_types))
+            if isinstance(arg_name, str) and isinstance(arg_type, torch_dtype)
+        ]
+        per_node_call_args: List[str] = []
+        for sid in range(world_size):
+            ptr_i = 0
+            args_for_sid: List[str] = []
+            for pos, arg_name in enumerate(call_args):
+                if pos in pointer_positions:
+                    args_for_sid.append(per_node_arg_names[sid][ptr_i])
+                    ptr_i += 1
+                else:
+                    args_for_sid.append(str(arg_name))
+            per_node_call_args.append(", ".join(args_for_sid))
+
+        return numa_args_var, output_clones, per_node_call_args
 
     # The following methods are for memory management
     def make_buffer_allocation(self, buffer):

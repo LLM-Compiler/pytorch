@@ -560,6 +560,19 @@ _fuse_ddp_communication_passes: List[Union[Callable[..., None], str]] = [
 ]
 
 _micro_pipeline_tp: bool = False
+_numa_mlp_tp: bool = False
+# Test/debug override for NUMA TP shard count. 0 means detect from runtime.
+# ``aten.clone(..., numa_node=i)`` needs a build with USE_NUMA / C10_USE_NUMA, runtime
+# ``torch._C._cpu._set_numa_enabled(True)``, and (for eager) ``i < _num_numa_nodes()``.
+# See docs/source/notes/clone_numa.rst.
+_numa_mlp_tp_world_size: int = 0
+# Which shard id to materialize in the single-shard NUMA MLP TP rewrite.
+_numa_mlp_tp_compute_shard: int = 0
+# Verbose stdout from numa_mlp_tp_pass (graph steps, shard layout, rewires).
+_numa_mlp_tp_debug: bool = False
+# Last full NUMA MLP TP shard plan captured from FX pass. Used as a
+# codegen fallback when kernel-level origin metadata is unavailable.
+_numa_mlp_tp_shard_plan: Optional[Dict[str, Any]] = None
 
 
 def decide_compile_threads() -> int:

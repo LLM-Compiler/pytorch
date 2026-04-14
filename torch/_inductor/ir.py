@@ -4598,7 +4598,22 @@ class ExternKernel(InputsKernel):
                 example_args.append(ir_node_to_tensor(x, guard_shape=True))
 
         new_args, new_kwargs = unflatten_args(example_args, non_tensor_args)
-        example_output = kernel(*new_args, **new_kwargs)
+        # aten.clone(..., numa_node=...) runs the refs/meta path which rejects
+        # FakeTensor; dense CPU outputs match plain clone for shape/stride.
+        if (
+            kernel is aten.clone.default
+            and new_kwargs.get("numa_node", None) is not None
+        ):
+            try:
+                example_output = kernel(*new_args, **new_kwargs)
+            except RuntimeError as e:
+                if "numa_node" not in str(e):
+                    raise
+                meta_kwargs = dict(new_kwargs)
+                meta_kwargs["numa_node"] = None
+                example_output = kernel(*new_args, **meta_kwargs)
+        else:
+            example_output = kernel(*new_args, **new_kwargs)
 
         unbacked_bindings: Optional[Dict[sympy.Symbol, pytree.KeyPath]] = None
         if shape_env := V.fake_mode.shape_env:

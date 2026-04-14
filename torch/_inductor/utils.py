@@ -548,6 +548,7 @@ def get_kernel_metadata(node_schedule, wrapper):
 
     from_node_dict = collections.defaultdict(list)
     original_aten_dict = collections.defaultdict(list)
+    numa_tag_dict = collections.defaultdict(list)
 
     # Attempt to sort `inductor_nodes` topologically. Note that the case
     # where `inductor_nodes` contains nodes from multiple graph instances
@@ -574,6 +575,13 @@ def get_kernel_metadata(node_schedule, wrapper):
         if "from_node" in node.meta:
             key = node.meta["from_node"][0][0]
             from_node_dict[key].append(node.name)
+        if "numa_role" in node.meta:
+            role = node.meta["numa_role"]
+            shard = node.meta.get("numa_shard_id", "?")
+            total = node.meta.get("numa_total_shards", "?")
+            target_node = node.meta.get("numa_target_node", "?")
+            key = f"{role}(shard={shard}/{total},node={target_node})"
+            numa_tag_dict[key].append(node.name)
     sort_str = "Topologically Sorted" if single_graph is not None else "Unsorted"
     metadata = (
         f"{wrapper.comment} {sort_str} Source Nodes: [{', '.join(from_node_dict.keys())}], "
@@ -586,6 +594,10 @@ def get_kernel_metadata(node_schedule, wrapper):
         detailed_metadata.append(
             f"{wrapper.comment}   {original_node} => {', '.join(sorted(nodes))}"
         )
+    if len(numa_tag_dict):
+        detailed_metadata.append(f"{wrapper.comment} NUMA shard tags:")
+        for tag, nodes in sorted(numa_tag_dict.items()):
+            detailed_metadata.append(f"{wrapper.comment}   {tag} => {', '.join(sorted(nodes))}")
 
     # print the aot_autograd graph fragment
     if single_graph is not None:

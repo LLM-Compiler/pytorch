@@ -1960,6 +1960,22 @@ def clone(
     numa_node: Optional[int] = None,
 ) -> TensorLikeType:
     if numa_node is not None:
+        if a.is_sparse:
+            raise RuntimeError(
+                "clone(..., numa_node=...) is not supported for sparse tensors"
+            )
+        from torch._subclasses.fake_tensor import FakeTensor
+
+        # Non-Fake tensors hit eager/native; this decomposition is for tracing only.
+        if isinstance(a, FakeTensor):
+            if a.layout != torch.strided or a.device.type not in ("cpu", "meta"):
+                raise RuntimeError(
+                    "clone(..., numa_node=...) is only supported for dense CPU tensors"
+                )
+            # NUMA affects physical placement, not shape/stride metadata; prims.clone
+            # matches the logical tensor for torch.compile. Inductor falls back to native
+            # aten::clone for runtime NUMA allocation when numa_node is set.
+            return prims.clone(a, memory_format=memory_format)
         raise RuntimeError(
             "clone(..., numa_node=...) is only supported for dense CPU tensors"
         )

@@ -2953,6 +2953,29 @@ class TritonKernel(SIMDKernel):
         grid = wrapper.generate_default_grid(
             name, grid, grid_callable=self._get_grid_fn()
         )
+        numa_shard_plan = None
+        numa_role = None
+        if node is not None:
+            # Prefer FX-origin metadata, but template/lowered nodes can lose
+            # direct origin mapping. Probe a few metadata carriers before
+            # falling back to global NUMA config in wrapper codegen.
+            origin = node.get_origin_node() if hasattr(node, "get_origin_node") else None
+            if origin is not None and hasattr(origin, "meta"):
+                numa_shard_plan = origin.meta.get("numa_shard_plan")
+                numa_role = origin.meta.get("numa_role")
+            if numa_shard_plan is None and hasattr(node, "meta"):
+                numa_shard_plan = node.meta.get("numa_shard_plan")
+            if numa_role is None and hasattr(node, "meta"):
+                numa_role = node.meta.get("numa_role")
+            inner = getattr(node, "node", None)
+            if (
+                numa_shard_plan is None
+                and inner is not None
+                and hasattr(inner, "meta")
+            ):
+                numa_shard_plan = inner.meta.get("numa_shard_plan")
+            if numa_role is None and inner is not None and hasattr(inner, "meta"):
+                numa_role = inner.meta.get("numa_role")
         wrapper.generate_kernel_call(
             name,
             call_args,
@@ -2963,6 +2986,8 @@ class TritonKernel(SIMDKernel):
             arg_types=arg_types,
             grid_fn=self._get_grid_fn_str(),
             triton_meta=self.triton_meta,
+            numa_shard_plan=numa_shard_plan,
+            numa_role=numa_role,
         )
 
         if self.args.workspace_arg is not None:

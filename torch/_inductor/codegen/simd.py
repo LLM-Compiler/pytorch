@@ -1415,7 +1415,25 @@ class SIMDScheduling(BaseScheduling):
                     node.mark_run()
 
         self.codegen_comment(node_schedule)
-        final_kernel.call_kernel(final_kernel.kernel_name)
+        numa_anchor_node = None
+        numa_anchor_role = None
+        for sched_node in node_schedule:
+            if not isinstance(sched_node, scheduler.BaseSchedulerNode):
+                continue
+            ir_node = sched_node.node
+            if ir_node is None:
+                continue
+            origin = ir_node.get_origin_node()
+            if origin is not None and origin.meta.get("numa_shard_plan") is not None:
+                numa_anchor_node = ir_node
+                role = origin.meta.get("numa_role")
+                if numa_anchor_role != "z_shard":
+                    numa_anchor_role = role
+                # Prefer z_shard anchor when present so wrapper can emit
+                # post-kernel all-reduce only for row-parallel outputs.
+                if role == "z_shard":
+                    break
+        final_kernel.call_kernel(final_kernel.kernel_name, numa_anchor_node)
 
         if config.nan_asserts:
             final_kernel.codegen_nan_check()

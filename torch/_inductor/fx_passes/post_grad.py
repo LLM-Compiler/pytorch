@@ -49,6 +49,7 @@ from .b2b_gemm import B2B_GEMM_PASS
 from .ddp_fusion import fuse_ddp_communication
 from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
+from .numa_mlp_tp import numa_mlp_tp_pass
 from .pre_grad import is_same_dict, save_inductor_dict
 from .reinplace import reinplace_inplaceable_ops
 from .split_cat import POST_GRAD_PATTERNS
@@ -120,6 +121,9 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     if config._micro_pipeline_tp:
         micro_pipeline_tp_pass(gm.graph)
+
+    if config._numa_mlp_tp:
+        numa_mlp_tp_pass(gm.graph)
 
     if config._fuse_ddp_communication:
         fuse_ddp_communication(
@@ -738,8 +742,16 @@ def view_noop(arg, size):
 # Note, we also always have a check for identical metadata, which is why these
 # are safe
 @register_noop_decomp([aten.copy], nop_arg=1)
-@register_noop_decomp([aten.alias, aten.clone])
-def true_noop(*args, **kwargs):
+@register_noop_decomp(aten.alias)
+def alias_noop(*args, **kwargs):
+    return True
+
+
+@register_noop_decomp(aten.clone)
+def clone_noop(*args, **kwargs):
+    # NUMA clone must not be erased: it is not equivalent to the input storage.
+    if kwargs.get("numa_node", None) is not None:
+        return False
     return True
 
 

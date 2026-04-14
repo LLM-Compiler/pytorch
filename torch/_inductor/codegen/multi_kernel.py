@@ -155,7 +155,7 @@ class MultiKernel:
         # attribute to decide if it's a non-null kernel.
         self.args = object()
 
-    def call_kernel(self, kernel_name):
+    def call_kernel(self, kernel_name, node=None):
         """
         Collect the union of arguments from all subkernels as the arguments
         for the multi-kernel.
@@ -182,11 +182,34 @@ class MultiKernel:
         )
 
         grid = V.graph.wrapper_code.generate_default_grid(kernel_name, grid)
+        numa_shard_plan = None
+        numa_role = None
+        if node is not None:
+            origin = node.get_origin_node() if hasattr(node, "get_origin_node") else None
+            if origin is not None and hasattr(origin, "meta"):
+                numa_shard_plan = origin.meta.get("numa_shard_plan")
+                numa_role = origin.meta.get("numa_role")
+            if numa_shard_plan is None and hasattr(node, "meta"):
+                numa_shard_plan = node.meta.get("numa_shard_plan")
+            if numa_role is None and hasattr(node, "meta"):
+                numa_role = node.meta.get("numa_role")
+            inner = getattr(node, "node", None)
+            if (
+                numa_shard_plan is None
+                and inner is not None
+                and hasattr(inner, "meta")
+            ):
+                numa_shard_plan = inner.meta.get("numa_shard_plan")
+            if numa_role is None and inner is not None and hasattr(inner, "meta"):
+                numa_role = inner.meta.get("numa_role")
+
         V.graph.wrapper_code.generate_kernel_call(
             kernel_name,
             call_args,
             grid,
             arg_types=arg_types,
+            numa_shard_plan=numa_shard_plan,
+            numa_role=numa_role,
         )
 
     def codegen_nan_check(self):

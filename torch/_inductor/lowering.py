@@ -537,12 +537,22 @@ def make_pointwise(
 
         device = override_device or device
 
-        return Pointwise.create(
+        out = Pointwise.create(
             device=device,
             dtype=dtype,
             inner_fn=inner_fn,
             ranges=ranges,
         )
+        if (
+            V.graph is not None
+            and getattr(V.graph, "current_node", None) is not None
+            and V.graph.current_node.meta is not None
+            and V.graph.current_node.meta.get("numa_isolated_add", False)
+        ):
+            # Keep final NUMA shard-reduction adds as standalone kernels.
+            out.realize()
+            V.graph.no_fuse_buffer_names.add(out.get_name())
+        return out
 
     return inner
 
@@ -2405,7 +2415,20 @@ def copy(self, src, non_blocking=False):
 
 
 @register_lowering(aten.clone)
-def clone(x, *, memory_format=None):
+def clone(x, *, memory_format=None, numa_node=None):
+    # NUMA placement is implemented only in native aten::clone; Inductor's
+    # pointwise lowering cannot express it. Fall back for shape inference and
+    # for runtime (see ir.FallbackKernel FakeTensor handling for numa_node).
+    if numa_node is not None:
+        return pytree.tree_map(
+            TensorBox.create,
+            ir.FallbackKernel.create(
+                aten.clone.default,
+                x,
+                memory_format=memory_format,
+                numa_node=numa_node,
+            ),
+        )
     # TODO(jansel): memory format
     return Pointwise.create(
         device=x.get_device(),
