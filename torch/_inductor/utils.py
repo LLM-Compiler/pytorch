@@ -100,6 +100,27 @@ def _align(nbytes):
     return (nbytes + ALIGN_BYTES - 1) & -ALIGN_BYTES
 
 
+def empty_strided_cpu_numa(
+    size: Sequence[Union[int, torch.SymInt]],
+    stride: Sequence[Union[int, torch.SymInt]],
+    dtype: torch.dtype,
+    numa_node: int,
+) -> torch.Tensor:
+    """Allocate an uninitialized CPU tensor and bind its storage to ``numa_node``.
+
+    This is the NUMA-aware counterpart of ``torch.empty_strided`` for cases
+    where the caller will fully overwrite the buffer (e.g. MM kernel output).
+    It avoids the ``clone + copy`` detour that ``aten.clone(..., numa_node=)``
+    would otherwise incur for uninitialized output tensors.
+    """
+    t = torch.empty_strided(size, stride, dtype=dtype, device="cpu")
+    cpu_mod = getattr(torch._C, "_cpu", None)
+    numa_move = getattr(cpu_mod, "_numa_move", None) if cpu_mod is not None else None
+    if callable(numa_move):
+        numa_move(t, int(numa_node))
+    return t
+
+
 def _is_aligned(v: sympy.Expr):
     """v can be statically proven to be a multiple of ALIGN_BYTES"""
     if isinstance(v, (sympy.Add, sympy.Max)):

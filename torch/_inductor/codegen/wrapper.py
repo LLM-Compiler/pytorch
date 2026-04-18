@@ -47,6 +47,7 @@ from ..runtime import triton_heuristics
 from ..runtime.hints import DeviceProperties
 from ..utils import (
     cache_on_self,
+    DeferredLineBase,
     get_benchmark_name,
     LineContext,
     sympy_product,
@@ -55,6 +56,26 @@ from ..utils import (
 from ..virtualized import V
 from .aoti_hipify_utils import maybe_hipify_code_wrapper
 from .common import CodeGen, DeferredLine, IndentedBuffer, PythonPrinter
+
+
+class _NumaReCloneLine(DeferredLineBase):
+    """Emit a post-all-reduce per-node re-clone only if a downstream kernel
+    actually consumed this tensor name. Tracking lives on the owning wrapper
+    codegen via ``_numa_reclone_consumed``; names added there at emission
+    time are kept, names never added are elided at flush time (saving a full
+    tensor ``clone`` per socket per dead reduce output).
+    """
+
+    def __init__(self, line: str, name: str, consumed_set: "Set[str]") -> None:
+        super().__init__(line)
+        self.name = name
+        self._consumed_set = consumed_set
+
+    def __call__(self) -> Optional[str]:
+        return self.line if self.name in self._consumed_set else None
+
+    def _new_line(self, line: str) -> "_NumaReCloneLine":
+        return _NumaReCloneLine(line, self.name, self._consumed_set)
 from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
 
 
@@ -487,6 +508,12 @@ class PythonWrapperCodegen(CodeGen):
         # Maps a tensor variable name in wrapper code (e.g. "buf1") to a list of
         # per-NUMA-node tensor variables produced for that logical tensor.
         self._numa_tensor_cache: Dict[str, List[str]] = {}
+        # Per-NUMA-node tensor variables whose post-all-reduce re-clone is
+        # actually consumed by a downstream kernel. Names added here cause
+        # the corresponding deferred re-clone line to be emitted at flush
+        # time; names absent at flush time stay "unwritten". This elides
+        # dead re-clone copies when the row-parallel output is terminal.
+        self._numa_reclone_consumed: Set[str] = set()
 
         # this is used for tracking which GraphLowering instance---parent graph
         # or (nested) subgraph---is currently codegened; the primary use case is
@@ -582,6 +609,7 @@ class PythonWrapperCodegen(CodeGen):
                 from math import inf, nan
                 from torch._inductor.hooks import run_intermediate_hooks
                 from torch._inductor.utils import maybe_profile
+                from torch._inductor.utils import empty_strided_cpu_numa
                 from torch._inductor.codegen.memory_planning import _align as align
                 from torch import device, empty_strided
                 from {async_compile.__name__} import AsyncCompile
@@ -1792,8 +1820,16 @@ class PythonWrapperCodegen(CodeGen):
                             )
                             reduced = reduced_next
                         for sid, out_name in enumerate(per_node_outs):
+                            # Defer emission: only keep this re-clone if a
+                            # downstream kernel actually consumes the per-node
+                            # name. Terminal reduces (e.g. final MLP output)
+                            # leave these lines unwritten at flush time.
                             self.writeline(
-                                f"{out_name} = torch.ops.aten.clone.default({reduced}, numa_node={sid})"
+                                _NumaReCloneLine(
+                                    f"{out_name} = torch.ops.aten.clone.default({reduced}, numa_node={sid})",
+                                    out_name,
+                                    self._numa_reclone_consumed,
+                                )
                             )
                         # Keep logical wrapper tensor and cache in sync so
                         # downstream non-NUMA paths and graph outputs are valid.
@@ -1973,11 +2009,37 @@ class PythonWrapperCodegen(CodeGen):
         def _emit_slice_clone(var_name: str, dim: int, sid: int) -> str:
             start = sid * shard_d
             end = (sid + 1) * shard_d
+            # Stride-safety rule: Inductor's MM template bakes the IR buffer's
+            # strides as Python constants (``stride_bk = {{stride("B", 0)}}``
+            # etc.). For a ``SliceView`` of a C-contiguous parent, the IR
+            # layout keeps the parent's strides; only the size along ``dim``
+            # shrinks. A compact clone of the view has a DIFFERENT stride
+            # pattern unless ``dim == 0``, because slicing the leading dim
+            # preserves inner strides while slicing any non-leading dim
+            # changes the leading stride from ``parent_size[-1]`` down to
+            # ``shard_size``. Handing a compact tensor to a kernel specialized
+            # against the parent stride causes out-of-bounds reads.
+            #
+            # - dim == 0 (row slice of 2D, or any 1D slice): slice-then-clone
+            #   yields a compact per-node buffer whose stride pattern matches
+            #   the baked constants. This avoids materializing the full tensor
+            #   per node (-50% RSS for this weight).
+            # - dim != 0 (column slice of 2D): fall back to clone-full-then-
+            #   slice so the per-node tensor remains a view of a full clone
+            #   with the parent's stride, matching the baked kernel.
+            if dim == 0:
+                view_name = f"{prefix}_{var_name}_view_n{sid}"
+                shard_name = f"{prefix}_{var_name}_n{sid}"
+                self.writeline(
+                    f"{view_name} = torch.ops.aten.slice.Tensor({var_name}, {dim}, {start}, {end}, 1)"
+                )
+                self.writeline(
+                    f"{shard_name} = torch.ops.aten.clone.default({view_name}, numa_node={sid})"
+                )
+                return shard_name
+
             full_clone_name = f"{prefix}_{var_name}_full_n{sid}"
             slice_name = f"{prefix}_{var_name}_n{sid}"
-            # Clone full tensor to target NUMA node first, then slice.
-            # This preserves the view stride pattern expected by the already
-            # compiled Triton kernel (slice-then-clone can re-layout data).
             self.writeline(
                 f"{full_clone_name} = torch.ops.aten.clone.default({var_name}, numa_node={sid})"
             )
@@ -1995,6 +2057,22 @@ class PythonWrapperCodegen(CodeGen):
             )
             return clone_name
 
+        def _emit_numa_empty_strided(var_name: str, sid: int) -> str:
+            """Allocate an uninitialized per-node output buffer directly on the
+            target NUMA socket. This replaces ``clone(var, numa_node=sid)`` for
+            kernel output pointers where the data is undefined (will be
+            overwritten by the kernel), avoiding a redundant ``copy_`` of
+            garbage bytes and the associated first-touch page faults on the
+            wrong socket.
+            """
+            out_name = f"{prefix}_{var_name}_n{sid}"
+            self.writeline(
+                f"{out_name} = empty_strided_cpu_numa("
+                f"{var_name}.size(), {var_name}.stride(), {var_name}.dtype, "
+                f"numa_node={sid})"
+            )
+            return out_name
+
         # Only pointer/tensor arguments should be cloned and forwarded via
         # numa_args. Scalar/meta args (e.g. xnumel) are not pointers and should
         # remain in the regular launcher args.
@@ -2008,17 +2086,24 @@ class PythonWrapperCodegen(CodeGen):
             )
             tensor_sig_idx += 1
             for sid in range(world_size):
-                # Explicit output buffer policy: always materialize per-node output
-                # clones and cache them for downstream kernels.
+                # Explicit output buffer policy: allocate per-node output
+                # tensors directly on the target NUMA node (uninitialized).
+                # The kernel fully overwrites these, so skip the wasteful
+                # ``clone + copy`` of undefined bytes that _emit_replicate
+                # would do.
                 if sig_name.startswith("out_ptr"):
-                    out_name = _emit_replicate(arg_name, sid)
+                    out_name = _emit_numa_empty_strided(arg_name, sid)
                     per_node_arg_names[sid].append(out_name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = out_name
                     continue
 
                 # Reuse per-node outputs from a previous kernel if available.
                 if arg_name in self._numa_tensor_cache:
-                    per_node_arg_names[sid].append(self._numa_tensor_cache[arg_name][sid])
+                    cached_name = self._numa_tensor_cache[arg_name][sid]
+                    per_node_arg_names[sid].append(cached_name)
+                    # Downstream consumption: mark the matching re-clone live
+                    # so the deferred emission is kept at flush time.
+                    self._numa_reclone_consumed.add(cached_name)
                     continue
 
                 # Full-plan semantics from FX metadata:

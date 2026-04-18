@@ -100,6 +100,40 @@ python -m pip install -e . -v --no-build-isolation \
 # To log the build output
 
 { python -m pip uninstall -y torch || true; rm -rf build .setuptools-cmake-build; unset USE_MKL USE_MKLDNN BLAS MKLROOT MKL_HOME CMAKE_ARGS; export CMAKE_PREFIX_PATH="${CONDA_PREFIX:-}"; export USE_CUDA=0; export USE_ROCM=0; export USE_XPU=0; export USE_MKL=0; export USE_MKLDNN=0; export BLAS=OpenBLAS; export MAX_JOBS=16; python -m pip install -r requirements.txt; python -m pip install -e . -v --no-build-isolation --config-settings=cmake.define.USE_MKL=OFF --config-settings=cmake.define.USE_MKLDNN=OFF --config-settings=cmake.define.BLAS=OpenBLAS; } 2>&1 | tee build_log.txt
+
+
+# feature-numa-fx-pass-mlp numa build (latest)
+python -m pip install "cmake==3.31.10"
+export CMAKE_PREFIX_PATH="${CONDA_PREFIX}/lib/python3.9/site-packages;${CONDA_PREFIX}"
+export CMAKE_INCLUDE_PATH="${CONDA_PREFIX}/include"
+export LIBRARY_PATH="${CONDA_PREFIX}/lib"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+export USE_CUDA=0
+export USE_ROCM=0
+export USE_XPU=0
+export USE_MKL=0
+export USE_MKLDNN=0
+export BLAS=OpenBLAS
+export USE_NUMA=1
+
+rm -rf build .setuptools-cmake-build
+
+cd /path/to/pytorch-private
+python -m pip install -e . -v --no-build-isolation \
+  --config-settings=cmake.define.USE_MKL=OFF \
+  --config-settings=cmake.define.USE_MKLDNN=OFF \
+  --config-settings=cmake.define.BLAS=OpenBLAS \
+  --config-settings=cmake.define.USE_NUMA=ON
+
+# Verify NUMA hooks after rebuild
+
+cd /tmp
+python -c "import torch; cpu=getattr(torch._C,'_cpu',None); print(torch._C.__file__); print(hasattr(cpu,'_set_numa_enabled') if cpu else False, hasattr(cpu,'_is_numa_enabled') if cpu else False, hasattr(cpu,'_num_numa_nodes') if cpu else False)"
+
+Expect: True True True.
+
+
+
 ```
 
 ## Stable benchmark build command (Triton CPU)

@@ -1,4 +1,6 @@
 #include <ATen/cpu/Utils.h>
+#include <ATen/core/Tensor.h>
+#include <c10/util/Exception.h>
 #include <c10/util/numa.h>
 #include <torch/csrc/cpu/Module.h>
 #include <torch/csrc/utils/pybind.h>
@@ -25,6 +27,35 @@ void initModule(PyObject* module) {
   });
   cpu.def("_num_numa_nodes", []() {
     return c10::GetNumNUMANodes();
+  });
+  // Move the pages backing a dense CPU tensor's storage to a specific NUMA
+  // node in-place. This is the primitive used by NUMA-aware allocators to
+  // place freshly-allocated (uninitialized) buffers directly on the target
+  // socket, avoiding the `clone + copy` detour when the caller will overwrite
+  // the data anyway (e.g. MM kernel outputs).
+  cpu.def("_numa_move", [](const at::Tensor& tensor, int64_t numa_node_id) {
+    TORCH_CHECK(
+        tensor.device().is_cpu() && tensor.layout() == c10::kStrided,
+        "_numa_move is only supported for dense CPU tensors");
+    TORCH_CHECK(
+        c10::IsNUMAEnabled(),
+        "_numa_move requires NUMA support enabled at build/runtime");
+    const auto num_numa_nodes = c10::GetNumNUMANodes();
+    TORCH_CHECK(
+        num_numa_nodes > 0,
+        "_numa_move could not determine NUMA node count");
+    TORCH_CHECK(
+        numa_node_id >= 0 && numa_node_id < num_numa_nodes,
+        "_numa_move expected numa_node in [0, ",
+        num_numa_nodes - 1,
+        "], but got ",
+        numa_node_id);
+    auto storage_data_ptr = tensor.storage().data_ptr().get();
+    auto storage_nbytes = tensor.storage().nbytes();
+    if (storage_data_ptr != nullptr && storage_nbytes > 0) {
+      c10::NUMAMove(
+          storage_data_ptr, storage_nbytes, static_cast<int>(numa_node_id));
+    }
   });
 }
 

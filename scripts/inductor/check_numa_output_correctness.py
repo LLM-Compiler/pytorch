@@ -61,12 +61,32 @@ def _enable_numa() -> Tuple[object, bool]:
     return cpu_mod, prev_enabled
 
 
-def _make_call_with_debug(module_globals: dict) -> Tuple[callable, List[str]]:
+def _make_call_with_debug(module_globals: dict) -> Tuple[callable, List[str], bool]:
+    """Returns (call_with_debug, buf_names, per_node_matches_reduced).
+
+    ``per_node_matches_reduced`` is True when the generated wrapper emits the
+    post-all-reduce per-node re-clone loop (so each ``_numa_p*_buf2_n*``
+    tensor is expected to equal the reduced result). When the wrapper elides
+    those re-clones for a terminal output (current optimization), per-node
+    tensors hold raw partial sums and are expected to add up to ``buf2``.
+    """
     call_fn = module_globals["call"]
     src = textwrap.dedent(inspect.getsource(call_fn))
     buf_names = sorted(set(re.findall(r"_numa_p\d+_buf2_n\d+", src)))
     if not buf_names:
         raise RuntimeError("No _numa_p*_buf2_n* buffers found in generated call().")
+
+    # Detect whether the wrapper emitted post-all-reduce re-clones of the
+    # reduced result onto the per-node names. The deferred-line mechanism
+    # drops these lines when no in-graph consumer needs them (e.g. terminal
+    # row-parallel output), so we must compare accordingly.
+    per_node_matches_reduced = bool(
+        re.search(
+            r"_numa_p\d+_buf2_n\d+\s*=\s*torch\.ops\.aten\.clone\.default\("
+            r"\s*_numa_reduce_",
+            src,
+        )
+    )
 
     ret_match = re.search(r"^\s*return\s+\(buf2,\s*\)\s*$", src, flags=re.MULTILINE)
     if ret_match is None:
@@ -76,7 +96,7 @@ def _make_call_with_debug(module_globals: dict) -> Tuple[callable, List[str]]:
     src = src.replace(ret_match.group(0), replacement)
     src = src.replace("def call(", "def call_with_debug(", 1)
     exec(src, module_globals)  # noqa: S102
-    return module_globals["call_with_debug"], buf_names
+    return module_globals["call_with_debug"], buf_names, per_node_matches_reduced
 
 
 def _reference_from_call_order(args: List[torch.Tensor]) -> torch.Tensor:
@@ -148,7 +168,7 @@ def main() -> int:
         # Avoid forwarding this script's CLI args into generated argparse.
         sys.argv = [str(output_code)]
         mod = runpy.run_path(str(output_code), run_name="__numa_check__")
-        call_with_debug, buf_names = _make_call_with_debug(mod)
+        call_with_debug, buf_names, per_node_matches_reduced = _make_call_with_debug(mod)
         call_src = textwrap.dedent(inspect.getsource(mod["call"]))
         expected = _parse_expected_inputs(call_src)
         dims_specified = (
@@ -188,21 +208,47 @@ def main() -> int:
         if args.dump_max_error:
             max_abs, max_rel = _max_error_metrics(buf2, ref)
             print(f"  buf2 max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}")
-        for name, t in zip(buf_names, numa_bufs):
-            ok = torch.allclose(t, ref, atol=args.atol, rtol=args.rtol)
-            ok_all = ok_all and ok
-            print(f"reference vs {name}: {ok}")
+
+        if per_node_matches_reduced:
+            # Wrapper emitted the per-node re-clone of the reduced result, so
+            # each per-node buffer should match the reference directly.
+            for name, t in zip(buf_names, numa_bufs):
+                ok = torch.allclose(t, ref, atol=args.atol, rtol=args.rtol)
+                ok_all = ok_all and ok
+                print(f"reference vs {name}: {ok}")
+                if args.dump_max_error:
+                    max_abs, max_rel = _max_error_metrics(t, ref)
+                    print(
+                        f"  {name} max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
+                    )
+        else:
+            # Terminal row-parallel output: the wrapper's dead re-clones were
+            # correctly elided. Per-node tensors now hold raw partial sums
+            # (one contribution per NUMA node). Validate that they reduce to
+            # ``buf2`` — the actual correctness contract of the parallel plan.
+            partial_sum = torch.zeros_like(buf2)
+            for t in numa_bufs:
+                partial_sum = partial_sum + t
+            ok_partials = torch.allclose(
+                partial_sum, buf2, atol=args.atol, rtol=args.rtol
+            )
+            ok_all = ok_all and ok_partials
+            print(
+                f"sum(_numa_p*_buf2_n*) vs buf2: {ok_partials}  "
+                "(re-clones elided as terminal output)"
+            )
             if args.dump_max_error:
-                max_abs, max_rel = _max_error_metrics(t, ref)
+                max_abs, max_rel = _max_error_metrics(partial_sum, buf2)
                 print(
-                    f"  {name} max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
+                    f"  partial_sum vs buf2 max_abs_diff={max_abs:.6e} "
+                    f"max_rel_diff={max_rel:.6e}"
                 )
 
         if not ok_all:
             print("[FAIL] mismatch found in NUMA output correctness check.", file=sys.stderr)
             return 2
 
-        print("[PASS] buf2 and all _numa_p*_buf2_n* match standard reference.")
+        print("[PASS] buf2 matches reference and NUMA per-node buffers are consistent.")
         return 0
     finally:
         sys.argv = prev_argv

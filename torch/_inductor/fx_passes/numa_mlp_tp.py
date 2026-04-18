@@ -482,6 +482,13 @@ def numa_mlp_tp_pass(graph: torch.fx.Graph) -> None:
                     aten.slice.Tensor,
                     args=(a, 1, start, end, 1),
                 )
+                # ``SliceView.create`` derives the sharded shape and the
+                # parent-tensor strides directly from the slice-op args, so
+                # Inductor's MM lowering already sees N = shard_d with
+                # stride_bk = parent row stride. The slice node's meta is
+                # only a fallback for shape-prop consumers; keep it as a
+                # plain clone of the source meta to avoid surprising any
+                # downstream FX pass that reads it.
                 _clone_meta(a_slice, a)
                 _set_numa_meta(
                     a_slice,
@@ -567,6 +574,11 @@ def numa_mlp_tp_pass(graph: torch.fx.Graph) -> None:
         # Persist latest full plan so wrapper codegen can recover semantics even
         # if a backend path drops direct origin-node metadata.
         setattr(config, "_numa_mlp_tp_shard_plan", dict(shard_plan))
+
+        # Propagate the shard plan to all per-shard slice nodes so downstream
+        # passes and wrapper codegen can recover the layout from any of them.
+        for slice_node in itertools.chain(a_slices, b_slices, b1_slices):
+            slice_node.meta["numa_shard_plan"] = shard_plan
 
         # Rewire existing linear1 to use compute-shard sliced operands directly.
         a_shard = a_slices[shard_id]
