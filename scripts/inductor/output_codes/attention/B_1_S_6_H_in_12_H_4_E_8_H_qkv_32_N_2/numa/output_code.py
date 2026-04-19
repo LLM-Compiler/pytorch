@@ -36,7 +36,7 @@ alloc_from_pool = torch.ops.inductor._alloc_from_pool
 async_compile = AsyncCompile()
 
 
-# kernel path: /tmp/torchinductor_kumara/p7/cp7tahxx32aip5knahxuhdmoiulp4k6xbwrkroaq3xmnmgnnzu2i.py
+# kernel path: /tmp/torchinductor_kumara/3z/c3zypip3cvirdeg6nnqevoffwdich6n3qabn74zp3mn2b62o2lru.py
 # Topologically Sorted Source Nodes: [addmm], Original ATen: [aten.addmm]
 # Source node to ATen node mapping:
 #   addmm => addmm
@@ -53,7 +53,7 @@ from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
 from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, instance_descriptor, DeviceProperties
 
 @triton_heuristics.template(
-    num_stages=4,
+    num_stages=2,
     num_warps=1,
     triton_meta={'signature': {'in_ptr0': '*fp32', 'arg_A': '*fp32', 'arg_B': '*fp32', 'out_ptr0': '*fp32'}, 'device': DeviceProperties(type='cpu', index=None, cc='', major=None, regs_per_multiprocessor=None, max_threads_per_multi_processor=None, multi_processor_count=None, warp_size=None), 'constants': {}, 'configs': [instance_descriptor(divisible_by_16=(3,), equal_to_1=(), ids_of_folded_args=(), divisible_by_8=())]},
     inductor_meta={'kernel_name': 'triton_tem_fused_addmm_0', 'backend_hash': 'F62E01E27927831DD211807EEB30CA3E85443518C78A4F492A904AA8BCD314BD', 'are_deterministic_algorithms_enabled': False, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': False, 'dynamic_scale_rblock': True, 'max_autotune': True, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False},
@@ -539,7 +539,7 @@ def triton_poi_fused__safe_softmax_7(in_out_ptr0, in_ptr0, in_ptr1, xnumel, XBLO
 ''', device_str='cpu')
 
 
-# kernel path: /tmp/torchinductor_kumara/sq/csqzebuvlk5wwd3exibbmmrnfsrvl37cqocpca5kmdyu2boq7nyi.py
+# kernel path: /tmp/torchinductor_kumara/k3/ck3to6cbeshsxbpzs5oxnrxjasyih63maspxlviaayy2l2ulko4m.py
 # Topologically Sorted Source Nodes: [y], Original ATen: [aten.bmm]
 # Source node to ATen node mapping:
 #   y => bmm_1
@@ -556,7 +556,7 @@ from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
 from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, instance_descriptor, DeviceProperties
 
 @triton_heuristics.template(
-    num_stages=3,
+    num_stages=2,
     num_warps=1,
     triton_meta={'signature': {'arg_A': '*fp32', 'arg_B': '*fp32', 'out_ptr0': '*fp32'}, 'device': DeviceProperties(type='cpu', index=None, cc='', major=None, regs_per_multiprocessor=None, max_threads_per_multi_processor=None, multi_processor_count=None, warp_size=None), 'constants': {}, 'configs': [instance_descriptor(divisible_by_16=(0, 1, 2), equal_to_1=(), ids_of_folded_args=(), divisible_by_8=())]},
     inductor_meta={'kernel_name': 'triton_tem_fused_bmm_8', 'backend_hash': 'F62E01E27927831DD211807EEB30CA3E85443518C78A4F492A904AA8BCD314BD', 'are_deterministic_algorithms_enabled': False, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': False, 'dynamic_scale_rblock': True, 'max_autotune': True, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False},
@@ -680,7 +680,7 @@ def triton_poi_fused_clone_9(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
 ''', device_str='cpu')
 
 
-# kernel path: /tmp/torchinductor_kumara/e2/ce2lukoleyudrwlwbnvsytwtr2d7tytovvc4jcvdxppc4giksqd4.py
+# kernel path: /tmp/torchinductor_kumara/uh/cuhg3qmtj2of3midrxw7e54jsppxunj2psjd4owaj2ddwerrafps.py
 # Topologically Sorted Source Nodes: [addmm_3], Original ATen: [aten.addmm]
 # Source node to ATen node mapping:
 #   addmm_3 => addmm_3
@@ -697,7 +697,7 @@ from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
 from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, instance_descriptor, DeviceProperties
 
 @triton_heuristics.template(
-    num_stages=2,
+    num_stages=1,
     num_warps=1,
     triton_meta={'signature': {'in_ptr0': '*fp32', 'arg_A': '*fp32', 'arg_B': '*fp32', 'out_ptr0': '*fp32'}, 'device': DeviceProperties(type='cpu', index=None, cc='', major=None, regs_per_multiprocessor=None, max_threads_per_multi_processor=None, multi_processor_count=None, warp_size=None), 'constants': {}, 'configs': [instance_descriptor(divisible_by_16=(1, 3), equal_to_1=(), ids_of_folded_args=(), divisible_by_8=())]},
     inductor_meta={'kernel_name': 'triton_tem_fused_addmm_10', 'backend_hash': 'F62E01E27927831DD211807EEB30CA3E85443518C78A4F492A904AA8BCD314BD', 'are_deterministic_algorithms_enabled': False, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': False, 'dynamic_scale_rblock': True, 'max_autotune': True, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False},
