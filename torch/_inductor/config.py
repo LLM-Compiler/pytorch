@@ -574,6 +574,21 @@ _numa_mlp_tp_debug: bool = False
 # codegen fallback when kernel-level origin metadata is unavailable.
 _numa_mlp_tp_shard_plan: Optional[Dict[str, Any]] = None
 
+# Megatron-style NUMA tensor-parallel pass for attention blocks:
+# column-parallel Q/K/V projections + socket-local SDPA (via SDPBackend.MATH
+# decomposition into bmm + softmax + bmm) + row-parallel output projection.
+# Requires the same build/runtime hooks as ``_numa_mlp_tp``.
+_numa_attention_tp: bool = False
+# Test/debug override for NUMA attention TP shard count. 0 means detect from runtime.
+_numa_attention_tp_world_size: int = 0
+# Which shard id to materialize in the single-shard NUMA attention TP rewrite.
+_numa_attention_tp_compute_shard: int = 0
+# Verbose stdout from numa_attention_tp_pass (graph steps, shard layout, rewires).
+_numa_attention_tp_debug: bool = False
+# Last full NUMA attention TP shard plan captured from FX pass. Used as a
+# codegen fallback when kernel-level origin metadata is unavailable.
+_numa_attention_tp_shard_plan: Optional[Dict[str, Any]] = None
+
 
 def decide_compile_threads() -> int:
     """

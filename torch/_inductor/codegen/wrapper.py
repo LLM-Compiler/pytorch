@@ -1756,12 +1756,19 @@ class PythonWrapperCodegen(CodeGen):
         # Fallback: template kernels may lose direct origin-node metadata during
         # scheduling. If NUMA TP is enabled globally, still emit NUMA args for
         # tensor pointer arguments.
-        if numa_shard_plan is None and getattr(config, "_numa_mlp_tp", False):
-            full_plan = getattr(config, "_numa_mlp_tp_shard_plan", None)
+        if numa_shard_plan is None and (
+            getattr(config, "_numa_mlp_tp", False)
+            or getattr(config, "_numa_attention_tp", False)
+        ):
+            full_plan = getattr(config, "_numa_attention_tp_shard_plan", None)
+            if not (isinstance(full_plan, dict) and full_plan.get("world_size", 0) >= 2):
+                full_plan = getattr(config, "_numa_mlp_tp_shard_plan", None)
             if isinstance(full_plan, dict) and full_plan.get("world_size", 0) >= 2:
                 numa_shard_plan = full_plan
             else:
                 ws = int(getattr(config, "_numa_mlp_tp_world_size", 0))
+                if ws <= 1:
+                    ws = int(getattr(config, "_numa_attention_tp_world_size", 0))
                 if ws <= 1:
                     cpu_mod = getattr(torch._C, "_cpu", None)
                     if (
@@ -1801,13 +1808,21 @@ class PythonWrapperCodegen(CodeGen):
                 # back into every per-node output clone.
                 should_allreduce_outputs = numa_role == "z_shard"
                 if not should_allreduce_outputs and numa_shard_plan is not None:
-                    b_node = numa_shard_plan.get("b_node")
-                    a_node = numa_shard_plan.get("a_node")
-                    has_b = isinstance(b_node, str) and b_node in call_args
-                    has_a = isinstance(a_node, str) and a_node in call_args
                     # Fallback for paths that lose role metadata: row-parallel
-                    # linear2 typically consumes B shard but not A shard.
-                    should_allreduce_outputs = has_b and not has_a
+                    # output kernels consume a row-parallel weight tensor and
+                    # do NOT consume any column-parallel tensor. Check both the
+                    # legacy ``a_node``/``b_node`` fields and the generalized
+                    # ``column_parallel_nodes`` / ``row_parallel_nodes`` lists.
+                    from torch._inductor.fx_passes.numa_tp_common import (
+                        ensure_generalized_lists,
+                    )
+
+                    ngen = ensure_generalized_lists(numa_shard_plan)
+                    col_names = {n for n, _ in ngen.get("column_parallel_nodes", [])}
+                    row_names = {n for n, _ in ngen.get("row_parallel_nodes", [])}
+                    has_row = any(n in call_args for n in row_names)
+                    has_col = any(n in call_args for n in col_names)
+                    should_allreduce_outputs = has_row and not has_col
                 if should_allreduce_outputs:
                     for out_arg, per_node_outs in numa_output_clones.items():
                         if len(per_node_outs) < 2:
@@ -1984,20 +1999,32 @@ class PythonWrapperCodegen(CodeGen):
                 sig_names = list(sig.keys())
         tensor_sig_idx = 0
 
-        x_node = shard_plan.get("x_node")
-        a_node = shard_plan.get("a_node")
-        b_node = shard_plan.get("b_node")
-        b1_node = shard_plan.get("b1_node")
-        b2_node = shard_plan.get("b2_node")
-        shard_d = int(shard_plan.get("shard_d", 0))
-        a_slice_dim = int(shard_plan.get("a_slice_dim", 1))
-        b_slice_dim = int(shard_plan.get("b_slice_dim", 0))
-        b1_slice_dim = int(shard_plan.get("b1_slice_dim", 0))
+        # Normalize plan to generalized lists (column_parallel_nodes,
+        # row_parallel_nodes, replicated_nodes, zero_on_nonzero_nodes). Plans
+        # emitted by the legacy MLP pass (``a_node``/``b_node``/``b1_node``/
+        # ``b2_node`` fields) are auto-converted by ``ensure_generalized_lists``.
+        from torch._inductor.fx_passes.numa_tp_common import (
+            ensure_generalized_lists,
+        )
+
+        normalized_plan = ensure_generalized_lists(shard_plan)
+        x_node = normalized_plan.get("x_node")
+        shard_d = int(normalized_plan.get("shard_d", 0))
+
+        column_parallel_map: Dict[str, int] = {
+            n: int(d) for n, d in normalized_plan.get("column_parallel_nodes", [])
+        }
+        row_parallel_map: Dict[str, int] = {
+            n: int(d) for n, d in normalized_plan.get("row_parallel_nodes", [])
+        }
+        replicated_set = set(normalized_plan.get("replicated_nodes", []))
+        zero_on_nonzero_set = set(normalized_plan.get("zero_on_nonzero_nodes", []))
+
         z_shard_like = numa_role == "z_shard"
         if not z_shard_like:
-            has_b = isinstance(b_node, str) and b_node in call_args
-            has_a = isinstance(a_node, str) and a_node in call_args
-            z_shard_like = has_b and not has_a
+            has_row = any(n in call_args for n in row_parallel_map)
+            has_col = any(n in call_args for n in column_parallel_map)
+            z_shard_like = has_row and not has_col
 
         def _emit_replicate(var_name: str, sid: int) -> str:
             clone_name = f"{prefix}_{var_name}_n{sid}"
@@ -2085,19 +2112,15 @@ class PythonWrapperCodegen(CodeGen):
                 sig_names[tensor_sig_idx] if tensor_sig_idx < len(sig_names) else ""
             )
             tensor_sig_idx += 1
+            is_out_only = sig_name.startswith("out_ptr")
+            is_in_out = sig_name.startswith("in_out_ptr")
             for sid in range(world_size):
-                # Explicit output buffer policy: allocate per-node output
-                # tensors directly on the target NUMA node (uninitialized).
-                # The kernel fully overwrites these, so skip the wasteful
-                # ``clone + copy`` of undefined bytes that _emit_replicate
-                # would do.
-                if sig_name.startswith("out_ptr"):
-                    out_name = _emit_numa_empty_strided(arg_name, sid)
-                    per_node_arg_names[sid].append(out_name)
-                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = out_name
-                    continue
-
                 # Reuse per-node outputs from a previous kernel if available.
+                # Critical for multi-stage kernels like softmax where an
+                # intermediate buffer is both READ and WRITTEN (``in_out_ptr``)
+                # across successive kernel invocations — we must keep the
+                # socket-local copy from the previous stage rather than
+                # cloning the uninitialized shared Python buffer.
                 if arg_name in self._numa_tensor_cache:
                     cached_name = self._numa_tensor_cache[arg_name][sid]
                     per_node_arg_names[sid].append(cached_name)
@@ -2106,32 +2129,44 @@ class PythonWrapperCodegen(CodeGen):
                     self._numa_reclone_consumed.add(cached_name)
                     continue
 
-                # Full-plan semantics from FX metadata:
-                # - replicate X and b2
-                # - shard-slice A/B/b1 then clone to target NUMA node
+                # Explicit output buffer policy: allocate per-node output
+                # tensors directly on the target NUMA node (uninitialized).
+                # The kernel fully overwrites these, so skip the wasteful
+                # ``clone + copy`` of undefined bytes that _emit_replicate
+                # would do. Applied to pure-output args and also to the
+                # first occurrence of an in_out_ptr arg (no cache hit).
+                if is_out_only or is_in_out:
+                    out_name = _emit_numa_empty_strided(arg_name, sid)
+                    per_node_arg_names[sid].append(out_name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = out_name
+                    continue
+
+                # Generalized plan semantics:
+                # - replicate X and any tensor in ``replicated_nodes``
+                #   (zero-on-nonzero-socket when in ``zero_on_nonzero_nodes``
+                #   AND the kernel is row-parallel output ``z_shard``)
+                # - shard-slice tensors in column_parallel_nodes / row_parallel_nodes
                 if arg_name == x_node:
                     name = _emit_replicate(arg_name, sid)
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
-                elif arg_name == b2_node:
-                    # For z_shard (row-parallel linear2), per-node outputs are
-                    # all-reduced. Bias must only contribute once globally.
-                    if z_shard_like and sid != 0:
+                elif arg_name in replicated_set:
+                    if (
+                        arg_name in zero_on_nonzero_set
+                        and z_shard_like
+                        and sid != 0
+                    ):
                         name = _emit_zero_bias_clone(arg_name, sid)
                     else:
                         name = _emit_replicate(arg_name, sid)
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
-                elif arg_name == a_node and shard_d > 0:
-                    name = _emit_slice_clone(arg_name, a_slice_dim, sid)
+                elif arg_name in column_parallel_map and shard_d > 0:
+                    name = _emit_slice_clone(arg_name, column_parallel_map[arg_name], sid)
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
-                elif arg_name == b_node and shard_d > 0:
-                    name = _emit_slice_clone(arg_name, b_slice_dim, sid)
-                    per_node_arg_names[sid].append(name)
-                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
-                elif b1_node is not None and arg_name == b1_node and shard_d > 0:
-                    name = _emit_slice_clone(arg_name, b1_slice_dim, sid)
+                elif arg_name in row_parallel_map and shard_d > 0:
+                    name = _emit_slice_clone(arg_name, row_parallel_map[arg_name], sid)
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
                 else:
@@ -2156,7 +2191,9 @@ class PythonWrapperCodegen(CodeGen):
                 sig_names[tensor_sig_idx] if tensor_sig_idx < len(sig_names) else ""
             )
             tensor_sig_idx += 1
-            if sig_name.startswith("out_ptr"):
+            if (
+                sig_name.startswith("out_ptr") or sig_name.startswith("in_out_ptr")
+            ):
                 if arg_name in generated_by_arg:
                     self._numa_tensor_cache[arg_name] = generated_by_arg[arg_name]
 
@@ -2169,7 +2206,9 @@ class PythonWrapperCodegen(CodeGen):
                 sig_names[tensor_sig_idx] if tensor_sig_idx < len(sig_names) else ""
             )
             tensor_sig_idx += 1
-            if sig_name.startswith("out_ptr") and arg_name in generated_by_arg:
+            if (
+                sig_name.startswith("out_ptr") or sig_name.startswith("in_out_ptr")
+            ) and arg_name in generated_by_arg:
                 output_clones[arg_name] = generated_by_arg[arg_name]
 
         pointer_positions = [
@@ -2228,6 +2267,36 @@ class PythonWrapperCodegen(CodeGen):
     def codegen_exact_buffer_reuse(self, old_name: str, new_name: str, del_line: str):
         return f"{self.declare_maybe_reference}{new_name} = {old_name}{del_line}{self.ending}  {self.comment} reuse"
 
+    def _numa_propagate_buffer_alias(
+        self,
+        old_name: str,
+        new_name: str,
+        new_size: Any,
+        new_stride: Any,
+        exact: bool,
+    ) -> None:
+        """When a buffer is reused / reinterpreted, propagate the per-NUMA-node
+        alias from ``old_name`` to ``new_name`` so that downstream kernels
+        looking up ``new_name`` in the ``_numa_tensor_cache`` find the right
+        socket-local storage (same underlying memory, new logical layout)."""
+        cache = getattr(self, "_numa_tensor_cache", None)
+        if not cache or old_name not in cache:
+            return
+        per_node_old = cache[old_name]
+        per_node_new: List[str] = []
+        for sid, old_n in enumerate(per_node_old):
+            alias = f"{old_n}_as_{new_name}"
+            if exact:
+                self.writeline(f"{alias} = {old_n}")
+            else:
+                size_str = self.codegen_shape_tuple(new_size)
+                stride_str = self.codegen_shape_tuple(new_stride)
+                self.writeline(
+                    f"{alias} = reinterpret_tensor({old_n}, {size_str}, {stride_str}, 0)"
+                )
+            per_node_new.append(alias)
+        cache[new_name] = per_node_new
+
     def make_buffer_reuse(self, old: ir.Buffer, new: ir.Buffer, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()
         old_name = old.get_name()
@@ -2236,7 +2305,22 @@ class PythonWrapperCodegen(CodeGen):
         if old_name not in V.graph.get_output_names() and delete_old:
             del_line = f"; {self.make_buffer_free(old)}"
 
-        if old.get_size() == new.get_size() and old.get_stride() == new.get_stride():
+        exact = (
+            old.get_size() == new.get_size()
+            and old.get_stride() == new.get_stride()
+        )
+
+        # Propagate NUMA aliases so ``new_name`` resolves to socket-local
+        # storage for kernels that read ``in_out_ptr*`` / in-place args.
+        try:
+            self._numa_propagate_buffer_alias(
+                old_name, new_name, new.get_size(), new.get_stride(), exact
+            )
+        except Exception:
+            # Defensive: never fail compilation for NUMA alias propagation.
+            pass
+
+        if exact:
             return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
 
         reinterpret_view = self.codegen_reinterpret_view(

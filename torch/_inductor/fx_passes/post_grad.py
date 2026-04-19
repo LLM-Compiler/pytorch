@@ -49,6 +49,7 @@ from .b2b_gemm import B2B_GEMM_PASS
 from .ddp_fusion import fuse_ddp_communication
 from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
+from .numa_attention_tp import numa_attention_tp_pass
 from .numa_mlp_tp import numa_mlp_tp_pass
 from .pre_grad import is_same_dict, save_inductor_dict
 from .reinplace import reinplace_inplaceable_ops
@@ -124,6 +125,9 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     if config._numa_mlp_tp:
         numa_mlp_tp_pass(gm.graph)
+
+    if config._numa_attention_tp:
+        numa_attention_tp_pass(gm.graph)
 
     if config._fuse_ddp_communication:
         fuse_ddp_communication(
