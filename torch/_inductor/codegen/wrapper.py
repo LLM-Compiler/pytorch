@@ -76,6 +76,29 @@ class _NumaReCloneLine(DeferredLineBase):
 
     def _new_line(self, line: str) -> "_NumaReCloneLine":
         return _NumaReCloneLine(line, self.name, self._consumed_set)
+
+
+class _NUMAFreshAllocLine(DeferredLineBase):
+    """Emit a per-NUMA-node empty_strided allocation only if it was NOT
+    superseded by a reinterpret alias propagated from a buffer-reuse chain.
+
+    When ``wrapper._numa_suppressed_allocs`` contains ``name``, the allocation
+    is skipped and the caller is responsible for having written an equivalent
+    definition (a ``reinterpret_tensor`` alias) earlier in the output.
+    """
+
+    def __init__(self, line: str, name: str, suppressed_set: "Set[str]") -> None:
+        super().__init__(line)
+        self.name = name
+        self._suppressed_set = suppressed_set
+
+    def __call__(self) -> Optional[str]:
+        return None if self.name in self._suppressed_set else self.line
+
+    def _new_line(self, line: str) -> "_NUMAFreshAllocLine":
+        return _NUMAFreshAllocLine(line, self.name, self._suppressed_set)
+
+
 from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
 
 
@@ -457,7 +480,9 @@ class ReuseLine(MemoryPlanningLine):
         assert self.node.get_name() not in V.graph.removed_buffers
         assert self.reused_as.get_name() not in V.graph.removed_buffers
         code.writeline(
-            self.wrapper.make_buffer_reuse(self.node, self.reused_as, self.delete_old)
+            self.wrapper.make_buffer_reuse(
+                self.node, self.reused_as, self.delete_old, code=code
+            )
         )
 
 
@@ -514,6 +539,11 @@ class PythonWrapperCodegen(CodeGen):
         # time; names absent at flush time stay "unwritten". This elides
         # dead re-clone copies when the row-parallel output is terminal.
         self._numa_reclone_consumed: Set[str] = set()
+        # Per-NUMA-node allocation variable names that have been superseded by
+        # a reinterpret alias from a buffer-reuse chain. When a name appears
+        # here, the corresponding _NUMAFreshAllocLine is suppressed at flush
+        # time, preventing uninitialized memory from overriding the alias.
+        self._numa_suppressed_allocs: Set[str] = set()
 
         # this is used for tracking which GraphLowering instance---parent graph
         # or (nested) subgraph---is currently codegened; the primary use case is
@@ -2028,8 +2058,16 @@ class PythonWrapperCodegen(CodeGen):
 
         def _emit_replicate(var_name: str, sid: int) -> str:
             clone_name = f"{prefix}_{var_name}_n{sid}"
+            # Use _NUMAFreshAllocLine so this clone can be suppressed at flush
+            # time when a buffer-reuse alias already defines clone_name (e.g.
+            # when the buffer memory was reused from an earlier per-node output
+            # and _numa_propagate_buffer_alias emits the correct alias).
             self.writeline(
-                f"{clone_name} = torch.ops.aten.clone.default({var_name}, numa_node={sid})"
+                _NUMAFreshAllocLine(
+                    f"{clone_name} = torch.ops.aten.clone.default({var_name}, numa_node={sid})",
+                    clone_name,
+                    self._numa_suppressed_allocs,
+                )
             )
             return clone_name
 
@@ -2091,12 +2129,21 @@ class PythonWrapperCodegen(CodeGen):
             overwritten by the kernel), avoiding a redundant ``copy_`` of
             garbage bytes and the associated first-touch page faults on the
             wrong socket.
+
+            The resulting line is wrapped in ``_NUMAFreshAllocLine`` so that it
+            can be suppressed at flush time when a buffer-reuse chain produces
+            a reinterpret alias for the same variable name (see
+            ``_numa_propagate_buffer_alias``).
             """
             out_name = f"{prefix}_{var_name}_n{sid}"
             self.writeline(
-                f"{out_name} = empty_strided_cpu_numa("
-                f"{var_name}.size(), {var_name}.stride(), {var_name}.dtype, "
-                f"numa_node={sid})"
+                _NUMAFreshAllocLine(
+                    f"{out_name} = empty_strided_cpu_numa("
+                    f"{var_name}.size(), {var_name}.stride(), {var_name}.dtype, "
+                    f"numa_node={sid})",
+                    out_name,
+                    self._numa_suppressed_allocs,
+                )
             )
             return out_name
 
@@ -2182,7 +2229,8 @@ class PythonWrapperCodegen(CodeGen):
         )
         self.writeline(f"{numa_args_var} = [{inner}]")
 
-        # Cache output pointer args for downstream kernels.
+        # Cache output pointer args for downstream kernels (always override,
+        # since the kernel just wrote new data to these buffers).
         tensor_sig_idx = 0
         for arg_name, arg_type in zip(call_args, arg_types):
             if not isinstance(arg_name, str) or not isinstance(arg_type, torch_dtype):
@@ -2196,6 +2244,15 @@ class PythonWrapperCodegen(CodeGen):
             ):
                 if arg_name in generated_by_arg:
                     self._numa_tensor_cache[arg_name] = generated_by_arg[arg_name]
+
+        # Cache input (replicated / sliced) args too, using setdefault so we
+        # never override an existing output-derived entry.  This enables
+        # ``_numa_propagate_buffer_alias`` to resolve buffer-reuse chains where
+        # the old buffer was first touched as an *input* (e.g. bmm output
+        # replicated for softmax, then reinterpreted for the next softmax).
+        for arg_name, per_node in generated_by_arg.items():
+            if arg_name not in self._numa_tensor_cache and all(per_node):
+                self._numa_tensor_cache[arg_name] = per_node
 
         output_clones: Dict[str, List[str]] = {}
         tensor_sig_idx = 0
@@ -2274,30 +2331,71 @@ class PythonWrapperCodegen(CodeGen):
         new_size: Any,
         new_stride: Any,
         exact: bool,
+        code: "Optional[IndentedBuffer]" = None,
     ) -> None:
         """When a buffer is reused / reinterpreted, propagate the per-NUMA-node
         alias from ``old_name`` to ``new_name`` so that downstream kernels
         looking up ``new_name`` in the ``_numa_tensor_cache`` find the right
-        socket-local storage (same underlying memory, new logical layout)."""
+        socket-local storage (same underlying memory, new logical layout).
+
+        ``code``: alias lines are written into this ``IndentedBuffer`` so they
+        appear inline with the reuse line (before the kernel that reads the
+        buffer). The alias variable names use the same flat convention as
+        ``generate_numa_shard_allocations`` (``{prefix}_{new_name}_n{sid}``),
+        and the corresponding ``_NUMAFreshAllocLine`` entries are added to
+        ``_numa_suppressed_allocs`` so the stale ``empty_strided_cpu_numa``
+        allocations are suppressed at flush time.
+        """
         cache = getattr(self, "_numa_tensor_cache", None)
         if not cache or old_name not in cache:
             return
         per_node_old = cache[old_name]
+        if not per_node_old:
+            return
+
+        # Extract the naming prefix (e.g. "_numa_p0") from the first cached
+        # entry so alias names match what generate_numa_shard_allocations
+        # already emitted as _NUMAFreshAllocLine placeholders.
+        expected_suffix_0 = f"_{old_name}_n0"
+        if per_node_old[0].endswith(expected_suffix_0):
+            prefix = per_node_old[0][: -len(expected_suffix_0)]
+        else:
+            prefix = None  # unusual naming; fall back to _as_ style
+
         per_node_new: List[str] = []
+        writer = code if code is not None else self
+        suppressed = getattr(self, "_numa_suppressed_allocs", None)
+
+        size_str = self.codegen_shape_tuple(new_size) if not exact else None
+        stride_str = self.codegen_shape_tuple(new_stride) if not exact else None
+
         for sid, old_n in enumerate(per_node_old):
-            alias = f"{old_n}_as_{new_name}"
-            if exact:
-                self.writeline(f"{alias} = {old_n}")
+            if prefix is not None:
+                # Flat naming: same variable name as the placeholder alloc.
+                alias = f"{prefix}_{new_name}_n{sid}"
+                if suppressed is not None:
+                    suppressed.add(alias)
             else:
-                size_str = self.codegen_shape_tuple(new_size)
-                stride_str = self.codegen_shape_tuple(new_stride)
-                self.writeline(
+                # Fallback: compound _as_ naming (no suppression needed since
+                # there is no matching placeholder allocation in this case).
+                alias = f"{old_n}_as_{new_name}"
+
+            if exact:
+                writer.writeline(f"{alias} = {old_n}")
+            else:
+                writer.writeline(
                     f"{alias} = reinterpret_tensor({old_n}, {size_str}, {stride_str}, 0)"
                 )
             per_node_new.append(alias)
         cache[new_name] = per_node_new
 
-    def make_buffer_reuse(self, old: ir.Buffer, new: ir.Buffer, delete_old: bool):
+    def make_buffer_reuse(
+        self,
+        old: ir.Buffer,
+        new: ir.Buffer,
+        delete_old: bool,
+        code: "Optional[IndentedBuffer]" = None,
+    ):
         assert old.get_dtype() == new.get_dtype()
         old_name = old.get_name()
         new_name = new.get_name()
@@ -2312,9 +2410,12 @@ class PythonWrapperCodegen(CodeGen):
 
         # Propagate NUMA aliases so ``new_name`` resolves to socket-local
         # storage for kernels that read ``in_out_ptr*`` / in-place args.
+        # Pass ``code`` so that alias lines are emitted inline (before the
+        # reuse line) rather than deferred to the end of ``call()``.
         try:
             self._numa_propagate_buffer_alias(
-                old_name, new_name, new.get_size(), new.get_stride(), exact
+                old_name, new_name, new.get_size(), new.get_stride(), exact,
+                code=code,
             )
         except Exception:
             # Defensive: never fail compilation for NUMA alias propagation.

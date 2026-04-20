@@ -1,0 +1,79 @@
+# Claude ignore — pytorch-private
+# Keeps context focused on the NUMA TP / Triton CPU feature.
+# Large PyTorch subsystems unrelated to this work are excluded.
+
+# -----------------------------------------------------------------------
+# GPU / accelerator backends (not relevant — CPU-only target)
+# -----------------------------------------------------------------------
+torch/csrc/cuda/
+torch/csrc/hip/
+torch/csrc/xpu/
+aten/src/ATen/cuda/
+aten/src/ATen/hip/
+aten/src/ATen/xpu/
+aten/src/ATen/native/cuda/
+aten/src/ATen/native/hip/
+aten/src/ATen/native/xpu/
+caffe2/
+torch/backends/cuda/
+torch/backends/hip/
+torch/backends/xpu/
+
+# -----------------------------------------------------------------------
+# Large generated / third-party / binary artefacts
+# -----------------------------------------------------------------------
+third_party/
+build/
+build_log.txt
+run_output.txt
+*.egg-info/
+dist/
+.setuptools-cmake-build/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.a
+*.o
+
+# -----------------------------------------------------------------------
+# Distributed / RPC / comms (not used in this CPU-local feature)
+# -----------------------------------------------------------------------
+torch/distributed/
+torch/csrc/distributed/
+torch/_C/_distributed_*.pyi
+test/distributed/
+
+# -----------------------------------------------------------------------
+# Mobile / lite interpreter
+# -----------------------------------------------------------------------
+torch/csrc/jit/mobile/
+torch/csrc/lite_interpreter/
+torch/lite_interpreter_/
+
+# -----------------------------------------------------------------------
+# Large docs / notebooks
+# -----------------------------------------------------------------------
+docs/
+benchmarks/
+tools/onnx/
+test/onnx/
+*.ipynb
+
+# -----------------------------------------------------------------------
+# Captured output_code snapshots (reference only — not edited directly)
+# -----------------------------------------------------------------------
+scripts/inductor/output_codes/
+
+# -----------------------------------------------------------------------
+# Other large test suites unrelated to Inductor / NUMA
+# -----------------------------------------------------------------------
+test/quantization/
+test/ao/
+test/profiler/
+test/jit/
+test/mobile/
+test/distributed/
+test/export/
+test/dynamo/
+test/functorch/

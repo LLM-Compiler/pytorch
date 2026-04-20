@@ -78,8 +78,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-tp-shards",
         type=int,
-        default=NUM_TP_SHARDS,
-        help="NUMA TP shard/world size",
+        default=None,
+        help=(
+            "NUMA TP shard/world size "
+            f"(default: min({NUM_TP_SHARDS}, num NUMA nodes))"
+        ),
     )
     return parser.parse_args()
 
@@ -89,8 +92,6 @@ def main() -> None:
     torch.manual_seed(0)
     device = torch.device("cpu")
     s, h, d, hout = args.s, args.h, args.d, args.hout
-    num_tp_shards = args.num_tp_shards
-    assert d % num_tp_shards == 0, "d must be divisible by NUM_TP_SHARDS for numa_mlp_tp_pass"
 
     x = torch.randn(s, h, device=device) # [2, 4]
     a = torch.randn(h, d, device=device) # [4, 8]
@@ -116,11 +117,22 @@ def main() -> None:
     if not cpu_mod._is_numa_enabled():
         raise RuntimeError("Failed to enable NUMA runtime via torch._C._cpu._set_numa_enabled(True)")
     n_nodes = int(cpu_mod._num_numa_nodes())
-    if n_nodes < num_tp_shards:
-        raise RuntimeError(
-            f"Need at least {num_tp_shards} NUMA nodes, but runtime reports {n_nodes}. "
-            "Lower num-tp-shards or run on a machine with more NUMA nodes."
+    if args.num_tp_shards is None:
+        num_tp_shards = min(NUM_TP_SHARDS, max(1, n_nodes))
+        print(
+            f"num-tp-shards not set; using min({NUM_TP_SHARDS}, NUMA nodes) = {num_tp_shards}"
         )
+    else:
+        num_tp_shards = args.num_tp_shards
+        if n_nodes < num_tp_shards:
+            raise RuntimeError(
+                f"Need at least {num_tp_shards} NUMA nodes, but runtime reports {n_nodes}. "
+                "Lower num-tp-shards or run on a machine with more NUMA nodes."
+            )
+
+    assert d % num_tp_shards == 0, (
+        "d must be divisible by num_tp_shards for numa_mlp_tp_pass"
+    )
 
     try:
         with inductor_config.patch(
