@@ -28,14 +28,18 @@ For Inductor graph/code logging:
 Custom dims / shard count:
   python scripts/inductor/mlp_block_torch_compile_demo.py --s 2 --h 4 --d 8 --hout 3 --num-tp-shards 4
 
-Gemma-1B-like MLP dims:
-  python scripts/inductor/mlp_block_torch_compile_demo.py --s 2 --h 1152 --d 6912 --hout 1152 --num-tp-shards 4
+Gemma-1B-like MLP dims (h → d → hout); omit ``--num-tp-shards`` to use min(4, NUMA nodes):
+  python scripts/inductor/mlp_block_torch_compile_demo.py --s 2 --h 1152 --d 6912 --hout 1152
+
+Timing:
+  python scripts/inductor/mlp_block_torch_compile_demo.py --s 2 --h 1152 --d 6912 --hout 1152 --warmup 5 --iters 50
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -84,7 +88,32 @@ def _parse_args() -> argparse.Namespace:
             f"(default: min({NUM_TP_SHARDS}, num NUMA nodes))"
         ),
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Warmup forward passes before timing (not counted).",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Timed forward passes; mean time is reported over this many runs.",
+    )
     return parser.parse_args()
+
+
+def _mean_forward_seconds(fn, *, warmup: int, iters: int) -> float:
+    for _ in range(warmup):
+        fn()
+    if iters <= 0:
+        return float("nan")
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    return (time.perf_counter() - t0) / iters
 
 
 def main() -> None:
@@ -145,10 +174,22 @@ def main() -> None:
             compiled = torch.compile(model)
             y = compiled(x, a, b1, b, b2)
             y = compiled(x, a, b1, b, b2)
+
+            def run_compiled() -> None:
+                nonlocal y
+                y = compiled(x, a, b1, b, b2)
+
+            compiled_mean_s = _mean_forward_seconds(
+                run_compiled, warmup=args.warmup, iters=args.iters
+            )
     finally:
         cpu_mod._set_numa_enabled(old_numa_enabled)
 
     print("MLPBlock (addmm → gelu → addmm) output shape:", tuple(y.shape))
+    print(
+        f"Mean forward time (warmup={args.warmup}, iters={args.iters}): "
+        f"compiled {compiled_mean_s * 1e3:.4f} ms/iter"
+    )
     print(
         "Inductor: _numa_mlp_tp=True, "
         f"_numa_mlp_tp_world_size={num_tp_shards}, _numa_mlp_tp_compute_shard=0"

@@ -1,0 +1,649 @@
+# Analysis: Kernel-Level vs LLM-Level NUMA TP Architecture
+
+## Current Implementation (Kernel-Level)
+
+### Architecture Overview
+The current approach operates **per-kernel** during the Inductor post-grad pass:
+
+```
+torch.compile(model)
+  ↓
+Dynamo trace → AOT Autograd → post-grad FX graph
+  ↓
+numa_mlp_tp_pass / numa_attention_tp_pass (kernel-level)
+  • Pattern match: linear→gelu→linear (MLP) or Q/K/V+SDPA+out (attention)
+  • Insert per-shard slice nodes (aten.slice.Tensor)
+  • Annotate with numa_shard_plan metadata
+  • Rewrite kernel operands to sliced versions
+  ↓
+Inductor lowering → scheduling → kernel emission
+  ↓
+PythonWrapperCodegen._emit_numa_kernel_call()
+  • Read numa_shard_plan from kernel metadata
+  • Emit per-NUMA clone calls: clone(tensor, numa_node=sid)
+  • Build numa_args=[[n0_ptrs], [n1_ptrs], ...]
+  ↓
+aten.slice + clone execution happens **per kernel invocation**
+  ↓
+Triton CPU launcher reads numa_args → pins threads → runs kernel
+```
+
+### Key Characteristics
+1. **Distributed cloning**: Each kernel independently clones its inputs/outputs
+2. **Metadata-driven**: `numa_shard_plan` dict (generalized schema):
+   - `column_parallel_nodes`: [(name, dim), ...] — slice along dim
+   - `row_parallel_nodes`: [(name, dim), ...] — slice along dim
+   - `replicated_nodes`: [name, ...] — full clone
+   - `zero_on_nonzero_nodes`: [name, ...] — replicated but zeroed on non-zero sockets
+3. **Graph-level rewriting**: Slices inserted in FX graph, but actual clones only in wrapper codegen
+4. **Caching**: `_numa_tensor_cache` reuses per-node outputs across kernels
+
+### Current Limitations
+- **Redundant cloning**: Same weight tensor may be cloned multiple times if used by multiple kernels
+- **SDPA decomposition dependency**: Attention pass assumes `SDPBackend.MATH` (primitive ops visible)
+- **Stride complexity**: Column-parallel slices require full clone-then-slice for dim≠0 to preserve kernel's baked strides
+- **No global weight categorization**: Pass doesn't know global importance or priority of weights
+
+---
+
+## Proposed: LLM-Level Unified Pass
+
+### Architecture Overview
+Operate **once at module entry** before any kernel dispatch:
+
+```
+torch.compile(llm_module)
+  ↓
+Dynamo trace → AOT Autograd → post-grad FX graph
+  ↓
+numa_llm_tp_pass (NEW: module-level, runs once)
+  1. Traverse full graph; categorize ALL weights:
+     • Fully replicated (x, attention biases, layer norms)
+     • Column-parallel (Q/K/V/MLP.w_in matrices + their biases)
+     • Row-parallel (Attention.Wo, MLP.w_out matrices)
+  2. Extract weight tensor nodes + dtypes
+  3. Build global clone plan:
+     {
+       "replicated": {
+         "layer_norm.weight": {
+           "full_size": (d_model,),
+           "clone_vars": [cloned_var0, cloned_var1, ...]
+         },
+         ...
+       },
+       "column_parallel": {
+         "attn.Wq": {
+           "full_size": (d_qkv, d_model),
+           "shard_d": d_qkv / world_size,
+           "slice_dim": 1,
+           "clones_per_node": [
+             [(node0_clone0, slice(0:d/2, :)), ...],
+             [(node1_clone0, slice(d/2:d, :)), ...],
+           ]
+         },
+         ...
+       },
+       "row_parallel": { ... }
+     }
+  4. Emit pre-execution cloning code (Python, not in graph):
+     ```python
+     # Replicated
+     _llm_ln_weight_n0 = torch.ops.aten.clone.default(ln.weight, numa_node=0)
+     _llm_ln_weight_n1 = torch.ops.aten.clone.default(ln.weight, numa_node=1)
+     
+     # Column-parallel
+     _llm_Wq_n0_shard = torch.ops.aten.slice.Tensor(Wq, 1, 0, 512, 1)
+     _llm_Wq_n0 = torch.ops.aten.clone.default(_llm_Wq_n0_shard, numa_node=0)
+     _llm_Wq_n1_shard = torch.ops.aten.slice.Tensor(Wq, 1, 512, 1024, 1)
+     _llm_Wq_n1 = torch.ops.aten.clone.default(_llm_Wq_n1_shard, numa_node=1)
+     ...
+     ```
+  5. Return cloned tensor dict + metadata
+  ↓
+Kernel-level passes become **metadata only** (register cloned vars + reference metadata)
+  ↓
+Kernels read pre-cloned tensors directly from module state
+  • numa_shard_plan still guides which args need all-reduce, but no clone emission
+  ↓
+Execution: weights already on sockets, just run kernels
+```
+
+### Advantages
+1. **Single cloning pass**: Each weight cloned exactly once, upfront
+2. **Full-graph context**: Categorize all weights together (replicated vs col/row parallel)
+3. **Memory efficiency**: Column-parallel can use true slice-then-clone (dim=0 strategy) because strides are NOT baked by this point
+4. **Stride safety**: Cloning happens before kernel specialization, so the cloned tensor can be compact
+5. **Module fusion**: Weights stay in the model class as buffers (optional), or return as context dict
+6. **Cleaner kernel passes**: MLP/attention passes become thin wrappers that just register pre-cloned operands
+7. **Debuggability**: All clones emitted in one place; easier to profile memory usage
+
+### Design Questions
+1. **Where does the pre-cloning code live?**
+   - Option A: Wrap in a context manager / initializer called before `forward()`
+   - Option B: Emit as setup function + update all kernel dispatch to read from shared dict
+   - Option C: Register cloned buffers on the module itself (`self._numa_wq_n0`, etc.)
+   
+2. **How to handle dynamic batch sizes / sequence lengths?**
+   - Activations (x) must still be cloned per-kernel (batch-dependent)
+   - Only static weights pre-clone
+
+3. **Attention pattern matching**: still need to detect Q/K/V, but just to annotate, not to rewrite?
+
+4. **Integration with existing wrapper codegen?**
+   - Fall back to current path if no LLM-level clones available
+   - Or require both passes (llm-level mandatory, kernel-level optional metadata)
+
+---
+
+## Comparative Analysis
+
+| Aspect | Current (Kernel-Level) | Proposed (LLM-Level) |
+|--------|------------------------|----------------------|
+| **Cloning overhead** | Per-kernel × num_kernels | Once per model |
+| **Memory spike** | Local per kernel | Global upfront |
+| **Stride handling** | Clone-full-then-slice for dim≠0 | Slice-then-clone (true per-node) |
+| **Pattern matching** | MLP + attention (limited) | Any pattern (full graph context) |
+| **Debuggability** | Clones spread across kernel codegen | Centralized pre-cloning pass |
+| **Backward compat** | Works with any kernel | Requires new wrapper integration |
+| **Complexity** | Medium | High (initial), simpler downstream |
+| **Memory profile** | Unpredictable (per-kernel) | Predictable (one alloc phase) |
+
+---
+
+## Recommendation
+
+### Best Path Forward: **Hybrid Approach**
+
+1. **Phase 1**: Keep current kernel-level passes (MLP + attention).
+   - Proven, works with existing codegen.
+   - Reduced cloning via `_numa_tensor_cache`.
+
+2. **Phase 2**: Add optional LLM-level pre-cloning pass.
+   - Triggered by config flag: `config._numa_llm_tp_preclone = True`.
+   - Emits weight cloning upfront (replicated + col/row parallel).
+   - Kernel passes fall back to metadata-only (register cloned operands, no clone emission).
+   - Activations still cloned per-kernel (batch-dependent).
+
+3. **Phase 3**: Profile & measure.
+   - Compare memory usage, latency, stride correctness.
+   - Decide if LLM-level becomes default or stays optional.
+
+### Why Hybrid?
+- **Lower risk**: Current path still works; LLM-level is additive.
+- **Incremental gains**: Reduce weight-cloning redundancy without full rewrite.
+- **Experimental**: Can A/B test on real models (LLaMA, Mistral, etc.).
+- **Cleaner backward compat**: Old passes can be deprecated gradually.
+
+---
+
+## Implementation Sketch for LLM-Level Pass
+
+```python
+# torch/_inductor/fx_passes/numa_llm_tp.py
+
+def numa_llm_tp_preclone_pass(graph: torch.fx.Graph, module) -> Dict[str, Any]:
+    """
+    Single pass before any kernel dispatch. Returns a dict of pre-cloned tensors.
+    
+    Returns:
+    {
+        "replicated": {
+            "layer_norm.weight": [clone_node0, clone_node1, ...],
+            ...
+        },
+        "column_parallel": {
+            "attn.Wq": [
+                [shard_node0, shard_node1, ...],  # per node shards
+                ...
+            ],
+            ...
+        },
+        "row_parallel": { ... },
+        "metadata": {
+            "world_size": 2,
+            "shard_d_by_weight": { ... },
+            ...
+        }
+    }
+    """
+    world_size = get_numa_world_size()
+    if world_size < 2:
+        return {}
+    
+    # Step 1: Traverse graph, categorize weights
+    weight_catalog = {
+        "replicated": {},
+        "column_parallel": {},
+        "row_parallel": {},
+    }
+    
+    # Scan for patterns: layer norms (replicated), Q/K/V (col), Wo/fc2 (row)
+    for node in graph.nodes:
+        if is_layer_norm_weight(node):
+            weight_catalog["replicated"][node.name] = node
+        elif is_qkv_weight(node):
+            weight_catalog["column_parallel"][node.name] = node
+        elif is_output_weight(node):
+            weight_catalog["row_parallel"][node.name] = node
+    
+    # Step 2: Build clone plan (replicated + col/row)
+    # ... (detail elided)
+    
+    # Step 3: Emit cloning code
+    clones_by_role = {}
+    for role, weights in weight_catalog.items():
+        clones_by_role[role] = _emit_clones_for_role(
+            graph, weights, world_size, role
+        )
+    
+    return clones_by_role
+```
+
+---
+
+## Risk Assessment
+
+### High Risk
+- **Graph structure**: Inserting/removing clone nodes requires careful handling of FX node insertion points
+- **Activation cloning**: Still per-kernel, so "pre-clone everything" claim is false for activations
+
+### Medium Risk
+- **Pattern detection**: Categorizing all weights correctly requires robust heuristics
+- **Buffer tracking**: Ensuring no double-cloning of intermediate activations
+
+### Low Risk
+- **Backward compat**: Can coexist with current passes behind a config flag
+- **Correctness**: Cloning is idempotent; wrong categorization is safer than current stride issues
+
+---
+
+## Conclusion
+
+The **LLM-level unified pass is architecturally cleaner and more efficient**, but:
+
+1. **Current kernel-level passes already work** with reduced overhead via caching.
+2. **Hybrid approach is safest**: Add LLM-level as optional, measure impact.
+3. **Key benefit**: Stride safety + single cloning phase (especially for weights).
+4. **Key challenge**: Activations remain per-kernel (batch-dependent); can't truly eliminate this.
+
+**Recommended next step**: Prototype LLM-level pass with a few weights (layer norms), measure cloning overhead reduction, then expand to attention/MLP weights.
+# NUMA Tensor Caching Mechanism — Deep Dive
+
+## Overview
+
+The caching mechanism in `wrapper.py` (`_numa_tensor_cache`) is a **deduplication system** that prevents cloning the same tensor multiple times across sequential NUMA kernels. This is critical for multi-stage operations like softmax decomposition where intermediate tensors are produced by one kernel and consumed by the next.
+
+---
+
+## The Cache Data Structure
+
+### Definition (wrapper.py:535)
+```python
+self._numa_tensor_cache: Dict[str, List[str]] = {}
+```
+
+**Structure:**
+```
+{
+  "buf1": ["_numa_p0_buf1_n0", "_numa_p0_buf1_n1"],  # per-NUMA-node cloned var names
+  "buf2": ["_numa_p1_buf2_n0", "_numa_p1_buf2_n1"],
+  ...
+}
+```
+
+**Key**: Logical buffer name (e.g., `"buf1"`, `"arg1_1"`)  
+**Value**: List of per-NUMA-node tensor variable names produced for that buffer
+
+---
+
+## Problem It Solves: Softmax Decomposition Example
+
+### Scenario: Softmax in Attention Block
+
+```
+Kernel 1 (bmm_sum_kernel):      input: query  → output: qk_sum  (all threads write)
+                                 ↓
+Kernel 2 (softmax_kernel):      input: qk_sum → output: softmax_out  (read existing, write)
+                                                                ↑
+                                 This is an "in_out_ptr" (both read AND write)
+```
+
+Under NUMA TP:
+- **Kernel 1**: Produces per-node copies of `qk_sum`
+  - `_numa_p0_qk_sum_n0`, `_numa_p0_qk_sum_n1` (one per socket)
+- **Kernel 2**: Needs to read the SAME per-node copies from Kernel 1
+  - Must reuse `_numa_p0_qk_sum_n0`, `_numa_p0_qk_sum_n1`
+  - **NOT** clone the shared buffer again!
+
+### Without Caching (Incorrect Behavior)
+```python
+# Kernel 1 output
+_numa_p0_qk_sum_n0 = empty_strided(...)    # allocate on socket 0
+_numa_p0_qk_sum_n1 = empty_strided(...)    # allocate on socket 1
+kernel1.run(..., _numa_p0_qk_sum_n0, _numa_p0_qk_sum_n1, ...)
+
+# Kernel 2 input — WITHOUT CACHE
+_numa_p1_qk_sum_n0 = clone(qk_sum, numa_node=0)  # WRONG! Clones shared buffer again
+_numa_p1_qk_sum_n1 = clone(qk_sum, numa_node=1)  # Wastes memory, uses stale data
+kernel2.run(..., _numa_p1_qk_sum_n0, _numa_p1_qk_sum_n1, ...)
+
+# Result: kernel2 reads from wrong memory (shared buffer), not per-node updates from kernel1
+```
+
+### With Caching (Correct Behavior)
+```python
+# Kernel 1 output
+_numa_p0_qk_sum_n0 = empty_strided(...)
+_numa_p0_qk_sum_n1 = empty_strided(...)
+kernel1.run(..., _numa_p0_qk_sum_n0, _numa_p0_qk_sum_n1, ...)
+
+# Cache stores per-node var names
+_numa_tensor_cache["qk_sum"] = ["_numa_p0_qk_sum_n0", "_numa_p0_qk_sum_n1"]
+
+# Kernel 2 input — WITH CACHE
+# Check: is "qk_sum" in cache?
+if "qk_sum" in _numa_tensor_cache:
+    # YES! Reuse the per-node names
+    cached_n0 = _numa_tensor_cache["qk_sum"][0]  # "_numa_p0_qk_sum_n0"
+    cached_n1 = _numa_tensor_cache["qk_sum"][1]  # "_numa_p0_qk_sum_n1"
+    kernel2.run(..., cached_n0, cached_n1, ...)  # Read from correct per-node buffers
+
+# Result: kernel2 reads from socket-local copies updated by kernel1
+```
+
+---
+
+## Caching Workflow: Step-by-Step
+
+### Context: Multi-Kernel Execution
+
+```
+Compiled Function (single wrapper.py file)
+  ├─ def forward(arg_0_1, arg_1_1, ...):  ← shared Python buffers
+  │    self._numa_tensor_cache = {}  ← cleared on entry
+  │
+  ├─ Kernel 1 (Q projection)
+  │   ├─ Check: is input "X" in cache? NO
+  │   ├─ Clone: _numa_p0_X_n0, _numa_p0_X_n1
+  │   ├─ Run kernel with per-node args
+  │   └─ Cache output: _numa_tensor_cache["qk_out"] = [_numa_p0_qk_out_n0, ...]
+  │
+  ├─ Kernel 2 (softmax)
+  │   ├─ Check: is input "qk_out" in cache? YES ✓
+  │   ├─ Reuse: _numa_p0_qk_out_n0, _numa_p0_qk_out_n1 (from kernel 1)
+  │   ├─ Run kernel with same per-node args
+  │   └─ Cache output: _numa_tensor_cache["softmax_out"] = [...]
+  │
+  └─ Kernel 3 (V projection × output)
+      ├─ Check: is input "softmax_out" in cache? YES ✓
+      ├─ Reuse: [per-node names from kernel 2]
+      ├─ Run kernel
+      └─ Cache output: _numa_tensor_cache["attn_out"] = [...]
+```
+
+---
+
+## Cache Population Logic (wrapper.py:2232–2255)
+
+### Step 1: Cache Outputs (wrapper.py:2242–2246)
+```python
+# After a kernel runs, cache its output pointers for reuse by next kernel
+if (sig_name.startswith("out_ptr") or sig_name.startswith("in_out_ptr")):
+    if arg_name in generated_by_arg:
+        # Store per-node variable names
+        self._numa_tensor_cache[arg_name] = generated_by_arg[arg_name]
+```
+
+**Effect**: Every kernel output (or in_out buffer) is stored with its per-NUMA-node variable names.
+
+### Step 2: Cache Inputs (wrapper.py:2248–2255)
+```python
+# Also cache input args (replicated/sliced) for potential buffer-reuse scenarios
+for arg_name, per_node in generated_by_arg.items():
+    if arg_name not in self._numa_tensor_cache and all(per_node):
+        self._numa_tensor_cache[arg_name] = per_node
+```
+
+**Effect**: Replicated or sliced inputs are cached in case they're outputs from a *previous* kernel and get reinterpreted (buffer-reuse optimization).
+
+---
+
+## Cache Lookup Logic (wrapper.py:2164–2177)
+
+### When Processing Next Kernel's Args
+```python
+for arg_name, arg_type in zip(call_args, arg_types):
+    if not isinstance(arg_name, str) or not isinstance(arg_type, torch_dtype):
+        continue
+    
+    for sid in range(world_size):
+        # **CACHE HIT**: Check if this arg was produced by a previous kernel
+        if arg_name in self._numa_tensor_cache:
+            cached_name = self._numa_tensor_cache[arg_name][sid]
+            per_node_arg_names[sid].append(cached_name)
+            self._numa_reclone_consumed.add(cached_name)
+            continue  # ← SKIP cloning; reuse the cached per-node variable
+        
+        # CACHE MISS: Clone the tensor (default behavior)
+        # ... clone logic (emit_replicate, emit_slice_clone, etc.)
+```
+
+**Key behavior:**
+- **Cache hit** → Reuse per-node variable names (no clone)
+- **Cache miss** → Generate fresh clones
+
+---
+
+## Concrete Example: Attention with QKV + SDPA + Out
+
+### Generated Python Code
+
+```python
+def forward(arg_0_1, arg_1_1, arg_2_1, arg_3_1):
+    # arg_0_1 = input X
+    # arg_1_1 = Wq
+    # arg_2_1 = intermediate (QK matmul output)
+    # arg_3_1 = attention output
+    
+    # ============================================================
+    # Kernel 1: Q projection (addmm)
+    # ============================================================
+    def run_q_proj(...):
+        # Input X is replicated → clone both sockets
+        _numa_p0_arg0_n0 = torch.ops.aten.clone.default(arg_0_1, numa_node=0)
+        _numa_p0_arg0_n1 = torch.ops.aten.clone.default(arg_0_1, numa_node=1)
+        
+        # Wq is column-parallel → clone-then-slice
+        _numa_p0_arg1_full_n0 = torch.ops.aten.clone.default(arg_1_1, numa_node=0)
+        _numa_p0_arg1_n0 = torch.ops.aten.slice.Tensor(_numa_p0_arg1_full_n0, 1, 0, 512, 1)
+        
+        _numa_p0_arg1_full_n1 = torch.ops.aten.clone.default(arg_1_1, numa_node=1)
+        _numa_p0_arg1_n1 = torch.ops.aten.slice.Tensor(_numa_p0_arg1_full_n1, 1, 512, 1024, 1)
+        
+        # Output Q is in_out (will be read by softmax)
+        _numa_p0_q_out_n0 = empty_strided_cpu_numa(...)  # allocate on socket 0
+        _numa_p0_q_out_n1 = empty_strided_cpu_numa(...)  # allocate on socket 1
+        
+        _numa_p0_numa_args = [
+            (_numa_p0_arg0_n0, _numa_p0_arg1_n0, _numa_p0_q_out_n0),
+            (_numa_p0_arg0_n1, _numa_p0_arg1_n1, _numa_p0_q_out_n1),
+        ]
+        q_proj_kernel.run(..., numa_args=_numa_p0_numa_args, ...)
+        
+        # CACHE OUTPUT Q
+        _numa_tensor_cache["q_proj_out"] = ["_numa_p0_q_out_n0", "_numa_p0_q_out_n1"]
+    
+    run_q_proj()
+    
+    # ============================================================
+    # Kernel 2: Softmax (takes Q as input, produces softmax_out)
+    # ============================================================
+    def run_softmax(...):
+        # Input Q: CHECK CACHE
+        if "q_proj_out" in _numa_tensor_cache:
+            # CACHE HIT! Reuse per-node Q from kernel 1
+            q_input_n0 = _numa_tensor_cache["q_proj_out"][0]  # "_numa_p0_q_out_n0"
+            q_input_n1 = _numa_tensor_cache["q_proj_out"][1]  # "_numa_p0_q_out_n1"
+        else:
+            # CACHE MISS (shouldn't happen)
+            q_input_n0 = torch.ops.aten.clone.default(q_proj_out, numa_node=0)
+            q_input_n1 = torch.ops.aten.clone.default(q_proj_out, numa_node=1)
+        
+        # Output: softmax result (new buffer)
+        _numa_p1_softmax_out_n0 = empty_strided_cpu_numa(...)
+        _numa_p1_softmax_out_n1 = empty_strided_cpu_numa(...)
+        
+        _numa_p1_numa_args = [
+            (q_input_n0, _numa_p1_softmax_out_n0),
+            (q_input_n1, _numa_p1_softmax_out_n1),
+        ]
+        softmax_kernel.run(..., numa_args=_numa_p1_numa_args, ...)
+        
+        # CACHE OUTPUT softmax
+        _numa_tensor_cache["softmax_out"] = ["_numa_p1_softmax_out_n0", "_numa_p1_softmax_out_n1"]
+    
+    run_softmax()
+    
+    # ============================================================
+    # Kernel 3: Output linear (row-parallel)
+    # ============================================================
+    def run_out_linear(...):
+        # Input softmax: CHECK CACHE
+        if "softmax_out" in _numa_tensor_cache:
+            # CACHE HIT! Reuse per-node softmax from kernel 2
+            softmax_input_n0 = _numa_tensor_cache["softmax_out"][0]
+            softmax_input_n1 = _numa_tensor_cache["softmax_out"][1]
+        else:
+            softmax_input_n0 = torch.ops.aten.clone.default(softmax_out, numa_node=0)
+            softmax_input_n1 = torch.ops.aten.clone.default(softmax_out, numa_node=1)
+        
+        # Wo is row-parallel (reduce dimension)
+        _numa_p2_wo_n0 = torch.ops.aten.slice.Tensor(Wo, 0, 0, d_model//2, 1)
+        _numa_p2_wo_n0_clone = torch.ops.aten.clone.default(_numa_p2_wo_n0, numa_node=0)
+        
+        _numa_p2_wo_n1 = torch.ops.aten.slice.Tensor(Wo, 0, d_model//2, d_model, 1)
+        _numa_p2_wo_n1_clone = torch.ops.aten.clone.default(_numa_p2_wo_n1, numa_node=1)
+        
+        _numa_p2_out_n0 = empty_strided_cpu_numa(...)
+        _numa_p2_out_n1 = empty_strided_cpu_numa(...)
+        
+        _numa_p2_numa_args = [
+            (softmax_input_n0, _numa_p2_wo_n0_clone, _numa_p2_out_n0),
+            (softmax_input_n1, _numa_p2_wo_n1_clone, _numa_p2_out_n1),
+        ]
+        out_linear_kernel.run(..., numa_args=_numa_p2_numa_args, ...)
+        
+        # Final output (may be all-reduced and re-cloned for non-TP consumption)
+        attn_out_n0 = all_reduce(_numa_p2_out_n0)
+        attn_out_n1 = all_reduce(_numa_p2_out_n1)
+        
+        # CACHE OUTPUT
+        _numa_tensor_cache["attn_final_out"] = [attn_out_n0, attn_out_n1]
+```
+
+---
+
+## Memory Impact Analysis
+
+### Without Cache (Redundant Cloning)
+```
+Kernel 1 output: clone Q twice (inputs + outputs for K, V, softmax, etc.)
+Kernel 2 input:  clone Q AGAIN from shared buffer
+Kernel 3 input:  clone softmax AGAIN from shared buffer
+
+Total clones ∝ (num_kernels × num_buffers)
+```
+
+### With Cache (Deduplication)
+```
+Kernel 1 output: clone Q once → cache
+Kernel 2 input:  REUSE Q from cache (no clone) ✓
+Kernel 3 input:  REUSE softmax from cache (no clone) ✓
+
+Total clones ∝ (num_unique_buffers)  // Much smaller!
+```
+
+### Example: Softmax Decomposition (4 kernels)
+```
+Kernel 1: bmm_sum         → produces qk_sum
+Kernel 2: scale_softmax   → reads qk_sum (CACHE HIT), outputs softmax_out
+Kernel 3: bmm_attn        → reads softmax_out (CACHE HIT)
+Kernel 4: output_linear   → reads attn_out (CACHE HIT)
+
+Without cache: clone 4 buffers × 4 kernels = 16 clone calls
+With cache:    clone 4 buffers × 1 kernel  = 4 clone calls  ✓ 4× reduction
+```
+
+---
+
+## Cache Invalidation & Scope
+
+### Cache Lifetime: Single Forward Pass
+```python
+class PythonWrapperCodegen:
+    def __init__(self):
+        self._numa_tensor_cache = {}  # Created per wrapper instance
+```
+
+The cache is **local to a single compiled function's execution**, not global:
+- Fresh cache per forward pass
+- No cross-call pollution
+- Handles different batch sizes automatically (activations re-cloned per batch)
+
+### Cache Invalidation Scenarios
+1. **Buffer reuse**: If Inductor reuses memory for a different tensor, the cache entry is cleared (see `_numa_propagate_buffer_alias`)
+2. **Terminal outputs**: Final outputs are re-cloned for non-NUMA paths (via `_NumaReCloneLine` deferred logic)
+3. **All-reduce**: After row-parallel reduction, outputs are re-cloned for next-layer consumption
+
+---
+
+## Related Mechanisms
+
+### 1. `_numa_reclone_consumed` (wrapper.py:541)
+```python
+self._numa_reclone_consumed: Set[str] = set()
+```
+Tracks which post-all-reduce re-clones are actually used. Eliminates dead re-clone code at flush time.
+
+### 2. `_numa_suppressed_allocs` (wrapper.py:546)
+```python
+self._numa_suppressed_allocs: Set[str] = set()
+```
+Suppresses `empty_strided` allocations that are superseded by buffer-reuse aliases.
+
+### 3. `_NUMAFreshAllocLine` (wrapper.py:81–99)
+A deferred line that only emits if the allocation isn't suppressed (buffer wasn't reused).
+
+---
+
+## Summary
+
+| Aspect | Details |
+|--------|---------|
+| **Purpose** | Deduplicate NUMA cloning across sequential kernels |
+| **Data structure** | `Dict[tensor_name] → List[per_node_var_names]` |
+| **Scope** | Single forward pass (fresh per call) |
+| **Lookup** | Before cloning, check cache for per-node tensor names |
+| **Hit** | Reuse names (no clone); mark as consumed |
+| **Miss** | Generate fresh clones |
+| **Benefit** | 4–10× reduction in clone calls for softmax/multi-kernel ops |
+| **Critical for** | Softmax decomposition, multi-stage kernels with in_out_ptr args |
+
+---
+
+## Why This Matters for Your LLM-Level Pass
+
+In the **LLM-level pre-cloning approach**, you wouldn't need this caching because:
+- All weights are cloned **once upfront**, not per-kernel
+- Activations (batch-dependent) are still cloned per-kernel (where caching helps)
+
+However, **activations** benefit hugely from caching:
+- Q/K/V outputs from attention → softmax inputs (cache hit)
+- Softmax outputs → attention weights (cache hit)
+- MLP intermediate (gelu output) → linear2 input (cache hit)
+
+So your **hybrid approach** would:
+1. **Pre-clone weights** (no kernel-level cloning for weights)
+2. **Keep activation caching** (per-kernel cloning for x, intermediate activations)
+3. Reduce overall clone overhead by ~50–70%
+

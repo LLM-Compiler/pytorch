@@ -16,13 +16,17 @@ Run:
 Custom dims:
   python scripts/inductor/mlp_block_pytorch_demo.py --s 2 --h 4 --d 8 --hout 3
 
-Gemma-1B-like MLP dims:
+Gemma-1B-like MLP dims (h → d → hout):
   python scripts/inductor/mlp_block_pytorch_demo.py --s 2 --h 1152 --d 6912 --hout 1152
+
+Timing:
+  python scripts/inductor/mlp_block_pytorch_demo.py --s 2 --h 1152 --d 6912 --hout 1152 --warmup 5 --iters 50
 """
 
 from __future__ import annotations
 
 import argparse
+import time
 
 import torch
 import torch.nn as nn
@@ -59,7 +63,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--h", type=int, default=4, help="Input hidden dimension")
     parser.add_argument("--d", type=int, default=8, help="MLP intermediate dimension")
     parser.add_argument("--hout", type=int, default=3, help="Output hidden dimension")
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Warmup forward passes before timing (not counted).",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Timed forward passes; mean time is reported over this many runs.",
+    )
     return parser.parse_args()
+
+
+def _mean_forward_seconds(fn, *, warmup: int, iters: int) -> float:
+    for _ in range(warmup):
+        fn()
+    if iters <= 0:
+        return float("nan")
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    return (time.perf_counter() - t0) / iters
 
 
 def main() -> None:
@@ -76,6 +105,14 @@ def main() -> None:
 
     model = MLPBlock().to(device)
 
+    def run_eager() -> None:
+        nonlocal y_eager
+        y_eager = model(x, a, b1, b, b2)
+
+    def run_compiled() -> None:
+        nonlocal y_compiled
+        y_compiled = compiled_model(x, a, b1, b, b2)
+
     # Eager execution
     y_eager = model(x, a, b1, b, b2)
     y_eager = model(x, a, b1, b, b2)
@@ -85,13 +122,17 @@ def main() -> None:
     y_compiled = compiled_model(x, a, b1, b, b2)
     y_compiled = compiled_model(x, a, b1, b, b2)
 
+    eager_mean_s = _mean_forward_seconds(run_eager, warmup=args.warmup, iters=args.iters)
+    compiled_mean_s = _mean_forward_seconds(run_compiled, warmup=args.warmup, iters=args.iters)
+
     print("MLPBlock (addmm -> gelu -> addmm) output shape:", tuple(y_eager.shape))
     print("Mode: eager + torch.compile")
-    print("Eager output tensor:")
-    print(y_eager)
-    print("Compiled output tensor:")
-    print(y_compiled)
     print("allclose(eager, compiled):", torch.allclose(y_eager, y_compiled, atol=1e-5, rtol=1e-5))
+    print(
+        f"Mean forward time (warmup={args.warmup}, iters={args.iters}): "
+        f"eager {eager_mean_s * 1e3:.4f} ms/iter, "
+        f"compiled {compiled_mean_s * 1e3:.4f} ms/iter"
+    )
 
 
 if __name__ == "__main__":

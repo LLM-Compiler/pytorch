@@ -78,6 +78,26 @@ class _NumaReCloneLine(DeferredLineBase):
         return _NumaReCloneLine(line, self.name, self._consumed_set)
 
 
+class _NumaReassembleLine(DeferredLineBase):
+    """Emit a per-socket M-shard ``copy_`` line only if ``out_arg`` was
+    actually read by a non-NUMA consumer. Tracking lives on the owning
+    wrapper via ``_numa_reassemble_consumed``; names added there during
+    ``writeline`` are kept at flush time. Names absent at flush time are
+    elided (saving a per-row-parallel-kernel full-output-size memcpy).
+    """
+
+    def __init__(self, line: str, name: str, consumed_set: "Set[str]") -> None:
+        super().__init__(line)
+        self.name = name
+        self._consumed_set = consumed_set
+
+    def __call__(self) -> Optional[str]:
+        return self.line if self.name in self._consumed_set else None
+
+    def _new_line(self, line: str) -> "_NumaReassembleLine":
+        return _NumaReassembleLine(line, self.name, self._consumed_set)
+
+
 class _NUMAFreshAllocLine(DeferredLineBase):
     """Emit a per-NUMA-node empty_strided allocation only if it was NOT
     superseded by a reinterpret alias propagated from a buffer-reuse chain.
@@ -97,6 +117,32 @@ class _NUMAFreshAllocLine(DeferredLineBase):
 
     def _new_line(self, line: str) -> "_NUMAFreshAllocLine":
         return _NUMAFreshAllocLine(line, self.name, self._suppressed_set)
+
+
+def _emit_numa_weight_cache(
+    wrapper: "PythonWrapperCodegen",
+    key: str,
+    init_expr: str,
+    var_name: str,
+    suppressed_set: "Set[str]",
+) -> None:
+    """Emit a cache-guarded NUMA weight clone / output alloc as two
+    independent single-line deferred writelines (so each is prefixed
+    exactly once by ``IndentedBuffer.writeline``). If ``var_name`` is
+    superseded by a buffer-reuse alias, both lines are suppressed.
+
+    Emits::
+
+        if '<key>' not in _numa_weight_cache: _numa_weight_cache['<key>'] = <init_expr>
+        <var_name> = _numa_weight_cache['<key>']
+    """
+    line1 = (
+        f"if {key!r} not in _numa_weight_cache:"
+        f" _numa_weight_cache[{key!r}] = {init_expr}"
+    )
+    line2 = f"{var_name} = _numa_weight_cache[{key!r}]"
+    wrapper.writeline(_NUMAFreshAllocLine(line1, var_name, suppressed_set))
+    wrapper.writeline(_NUMAFreshAllocLine(line2, var_name, suppressed_set))
 
 
 from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
@@ -544,6 +590,19 @@ class PythonWrapperCodegen(CodeGen):
         # here, the corresponding _NUMAFreshAllocLine is suppressed at flush
         # time, preventing uninitialized memory from overriding the alias.
         self._numa_suppressed_allocs: Set[str] = set()
+        # Row-parallel reassembly elision: candidates are ``out_arg`` names
+        # whose per-socket M-shard copies are deferred pending a non-NUMA
+        # consumer. When a later ``writeline`` references ``out_arg`` in a
+        # non-NUMA context (any str line that does not contain the NUMA
+        # kernel-call marker ``numa_args=``), the name is moved into
+        # ``_numa_reassemble_consumed`` and the deferred copy_ lines are
+        # kept at flush time. Names that stay absent cause the copies to
+        # be elided entirely.
+        self._numa_reassemble_candidates: Set[str] = set()
+        self._numa_reassemble_consumed: Set[str] = set()
+        # Whether the module-level ``_numa_weight_cache = {}`` dict has been
+        # emitted to self.header yet. Set to True on first emit.
+        self._numa_weight_cache_header_written: bool = False
 
         # this is used for tracking which GraphLowering instance---parent graph
         # or (nested) subgraph---is currently codegened; the primary use case is
@@ -1728,6 +1787,14 @@ class PythonWrapperCodegen(CodeGen):
         else:
             return pexpr(grid_per_dim)
 
+    def _ensure_numa_weight_cache_header(self) -> None:
+        """Emit a module-level ``_numa_weight_cache = {}`` dict once per
+        compiled graph. Shared across all forward calls to cache per-NUMA-node
+        weight clones and pre-allocated intermediate buffers."""
+        if not self._numa_weight_cache_header_written:
+            self.header.writeline("_numa_weight_cache = {}")
+            self._numa_weight_cache_header_written = True
+
     def generate_kernel_call(
         self,
         kernel_name,
@@ -1857,28 +1924,54 @@ class PythonWrapperCodegen(CodeGen):
                     for out_arg, per_node_outs in numa_output_clones.items():
                         if len(per_node_outs) < 2:
                             continue
-                        reduced = per_node_outs[0]
-                        for ridx, out_name in enumerate(per_node_outs[1:], start=1):
-                            reduced_next = f"_numa_reduce_{out_arg}_{ridx}"
-                            self.writeline(
-                                f"{reduced_next} = torch.ops.aten.add.Tensor({reduced}, {out_name})"
+                        ws = len(per_node_outs)
+                        # M-split reassembly: the Triton-CPU launcher splits the
+                        # kernel grid linearly across sockets in row-major
+                        # (M-major) tile order.  Socket ``i`` therefore owns the
+                        # contiguous row shard [i * M//W : (i+1) * M//W] of every
+                        # output buffer.  Rather than summing per-socket outputs
+                        # (which would double-count rows), we concatenate the
+                        # valid shard from each socket along dim-0 to reconstruct
+                        # the full output tensor.
+                        #
+                        # The per-socket kernel outputs stay in _numa_tensor_cache
+                        # so downstream NUMA kernels still access their own
+                        # M-shard directly — no broadcast clone needed.
+                        split_var = f"_numa_msplit_{out_arg}"
+                        first_out = per_node_outs[0]
+                        # In-place reassembly into the already-allocated
+                        # out_arg buffer: each socket copies its M-shard
+                        # into the corresponding slice. Avoids the per-
+                        # forward allocation that ``torch.cat`` would do.
+                        # Wrapped in ``_NumaReassembleLine`` so the whole
+                        # reassembly is elided when ``out_arg`` has no
+                        # non-NUMA consumer (downstream NUMA kernels read
+                        # per-socket M-shards from ``_numa_tensor_cache``
+                        # directly and never reference ``out_arg`` as a
+                        # plain Python var).
+                        self._numa_reassemble_candidates.add(out_arg)
+                        consumed_set = self._numa_reassemble_consumed
+                        self.writeline(
+                            _NumaReassembleLine(
+                                f"{split_var} = {first_out}.shape[0] // {ws}",
+                                out_arg,
+                                consumed_set,
                             )
-                            reduced = reduced_next
-                        for sid, out_name in enumerate(per_node_outs):
-                            # Defer emission: only keep this re-clone if a
-                            # downstream kernel actually consumes the per-node
-                            # name. Terminal reduces (e.g. final MLP output)
-                            # leave these lines unwritten at flush time.
+                        )
+                        for sid in range(ws):
+                            start_s = f"{split_var}*{sid}" if sid > 0 else ""
+                            end_s = f"{split_var}*{sid + 1}" if sid < ws - 1 else ""
                             self.writeline(
-                                _NumaReCloneLine(
-                                    f"{out_name} = torch.ops.aten.clone.default({reduced}, numa_node={sid})",
-                                    out_name,
-                                    self._numa_reclone_consumed,
+                                _NumaReassembleLine(
+                                    f"{out_arg}[{start_s}:{end_s}].copy_("
+                                    f"{per_node_outs[sid]}[{start_s}:{end_s}])",
+                                    out_arg,
+                                    consumed_set,
                                 )
                             )
-                        # Keep logical wrapper tensor and cache in sync so
-                        # downstream non-NUMA paths and graph outputs are valid.
-                        self.writeline(f"{out_arg} = {reduced}")
+                        # Keep per-socket kernel outputs in cache so downstream
+                        # NUMA kernels receive their correct M-shard without
+                        # an extra clone or re-broadcast.
                         self._numa_tensor_cache[out_arg] = per_node_outs
             else:
                 self.writeline(
@@ -1947,6 +2040,20 @@ class PythonWrapperCodegen(CodeGen):
             self.kernel_autotune_names.add(kernel_name)
 
     def writeline(self, line):
+        # Row-parallel reassembly elision: any str writeline that
+        # references a candidate ``out_arg`` and is NOT a NUMA kernel
+        # call (those contain ``numa_args=`` and are satisfied entirely
+        # from ``_numa_tensor_cache`` per-socket names, not the plain
+        # ``out_arg`` var) marks the candidate as consumed so the
+        # deferred ``_NumaReassembleLine`` entries are kept at flush.
+        candidates = self._numa_reassemble_candidates
+        if candidates and isinstance(line, str) and "numa_args=" not in line:
+            consumed = self._numa_reassemble_consumed
+            for cand in candidates:
+                if cand in consumed:
+                    continue
+                if re.search(rf"\b{re.escape(cand)}\b", line):
+                    consumed.add(cand)
         self.lines.append(line)
 
     def writelines(self, lines):
@@ -2056,19 +2163,26 @@ class PythonWrapperCodegen(CodeGen):
             has_col = any(n in call_args for n in column_parallel_map)
             z_shard_like = has_row and not has_col
 
-        def _emit_replicate(var_name: str, sid: int) -> str:
+        def _emit_replicate(var_name: str, sid: int, cache: bool = True) -> str:
             clone_name = f"{prefix}_{var_name}_n{sid}"
-            # Use _NUMAFreshAllocLine so this clone can be suppressed at flush
-            # time when a buffer-reuse alias already defines clone_name (e.g.
-            # when the buffer memory was reused from an earlier per-node output
-            # and _numa_propagate_buffer_alias emits the correct alias).
-            self.writeline(
-                _NUMAFreshAllocLine(
-                    f"{clone_name} = torch.ops.aten.clone.default({var_name}, numa_node={sid})",
-                    clone_name,
+            init_expr = f"torch.ops.aten.clone.default({var_name}, numa_node={sid})"
+            if cache:
+                # Weight/bias: static between forwards — hoist behind a
+                # module-level dict so the clone runs only once per compiled graph.
+                self._ensure_numa_weight_cache_header()
+                _emit_numa_weight_cache(
+                    self, clone_name, init_expr, clone_name,
                     self._numa_suppressed_allocs,
                 )
-            )
+            else:
+                # Activation input: changes every forward — must re-clone.
+                self.writeline(
+                    _NUMAFreshAllocLine(
+                        f"{clone_name} = {init_expr}",
+                        clone_name,
+                        self._numa_suppressed_allocs,
+                    )
+                )
             return clone_name
 
         def _emit_slice_clone(var_name: str, dim: int, sid: int) -> str:
@@ -2087,38 +2201,55 @@ class PythonWrapperCodegen(CodeGen):
             #
             # - dim == 0 (row slice of 2D, or any 1D slice): slice-then-clone
             #   yields a compact per-node buffer whose stride pattern matches
-            #   the baked constants. This avoids materializing the full tensor
-            #   per node (-50% RSS for this weight).
-            # - dim != 0 (column slice of 2D): fall back to clone-full-then-
-            #   slice so the per-node tensor remains a view of a full clone
-            #   with the parent's stride, matching the baked kernel.
+            #   the baked constants. The clone is hoisted behind _numa_weight_cache.
+            # - dim != 0 (column slice of 2D): clone-full-then-slice; only the
+            #   full clone is expensive and cached. The view re-creation per
+            #   forward is O(1) (just pointer + strides, no memcpy).
+            self._ensure_numa_weight_cache_header()
             if dim == 0:
-                view_name = f"{prefix}_{var_name}_view_n{sid}"
                 shard_name = f"{prefix}_{var_name}_n{sid}"
-                self.writeline(
-                    f"{view_name} = torch.ops.aten.slice.Tensor({var_name}, {dim}, {start}, {end}, 1)"
+                key = shard_name
+                # Inline slice into the cache initialiser to avoid a dangling
+                # view_name variable in the generated module.
+                init_expr = (
+                    f"torch.ops.aten.clone.default("
+                    f"torch.ops.aten.slice.Tensor({var_name}, {dim}, {start}, {end}, 1),"
+                    f" numa_node={sid})"
                 )
-                self.writeline(
-                    f"{shard_name} = torch.ops.aten.clone.default({view_name}, numa_node={sid})"
+                _emit_numa_weight_cache(
+                    self, key, init_expr, shard_name,
+                    self._numa_suppressed_allocs,
                 )
                 return shard_name
 
             full_clone_name = f"{prefix}_{var_name}_full_n{sid}"
             slice_name = f"{prefix}_{var_name}_n{sid}"
-            self.writeline(
-                f"{full_clone_name} = torch.ops.aten.clone.default({var_name}, numa_node={sid})"
+            # Cache the full clone (malloc + memcpy) so it runs only once.
+            key = full_clone_name
+            init_expr = f"torch.ops.aten.clone.default({var_name}, numa_node={sid})"
+            _emit_numa_weight_cache(
+                self, key, init_expr, full_clone_name,
+                self._numa_suppressed_allocs,
             )
+            # The slice view is O(1) to re-create each forward (no memcpy).
             self.writeline(
                 f"{slice_name} = torch.ops.aten.slice.Tensor({full_clone_name}, {dim}, {start}, {end}, 1)"
             )
             return slice_name
 
         def _emit_zero_bias_clone(var_name: str, sid: int) -> str:
-            zero_name = f"{prefix}_{var_name}_zero_n{sid}"
             clone_name = f"{prefix}_{var_name}_n{sid}"
-            self.writeline(f"{zero_name} = torch.ops.aten.zeros_like.default({var_name})")
-            self.writeline(
-                f"{clone_name} = torch.ops.aten.clone.default({zero_name}, numa_node={sid})"
+            # A zero bias is identical every forward — cache it like a weight clone.
+            self._ensure_numa_weight_cache_header()
+            key = clone_name
+            # Inline zeros_like into the cache init to avoid a dangling intermediate.
+            init_expr = (
+                f"torch.ops.aten.clone.default("
+                f"torch.ops.aten.zeros_like.default({var_name}), numa_node={sid})"
+            )
+            _emit_numa_weight_cache(
+                self, key, init_expr, clone_name,
+                self._numa_suppressed_allocs,
             )
             return clone_name
 
@@ -2130,20 +2261,22 @@ class PythonWrapperCodegen(CodeGen):
             garbage bytes and the associated first-touch page faults on the
             wrong socket.
 
-            The resulting line is wrapped in ``_NUMAFreshAllocLine`` so that it
-            can be suppressed at flush time when a buffer-reuse chain produces
-            a reinterpret alias for the same variable name (see
-            ``_numa_propagate_buffer_alias``).
+            The buffer is cached in ``_numa_weight_cache`` so the malloc runs
+            only on the first forward call. Subsequent calls reuse the same
+            memory region (the kernel fully overwrites it each time, so
+            stale data is never read).
             """
             out_name = f"{prefix}_{var_name}_n{sid}"
-            self.writeline(
-                _NUMAFreshAllocLine(
-                    f"{out_name} = empty_strided_cpu_numa("
-                    f"{var_name}.size(), {var_name}.stride(), {var_name}.dtype, "
-                    f"numa_node={sid})",
-                    out_name,
-                    self._numa_suppressed_allocs,
-                )
+            self._ensure_numa_weight_cache_header()
+            key = out_name
+            init_expr = (
+                f"empty_strided_cpu_numa("
+                f"{var_name}.size(), {var_name}.stride(), {var_name}.dtype, "
+                f"numa_node={sid})"
+            )
+            _emit_numa_weight_cache(
+                self, key, init_expr, out_name,
+                self._numa_suppressed_allocs,
             )
             return out_name
 
@@ -2194,7 +2327,8 @@ class PythonWrapperCodegen(CodeGen):
                 #   AND the kernel is row-parallel output ``z_shard``)
                 # - shard-slice tensors in column_parallel_nodes / row_parallel_nodes
                 if arg_name == x_node:
-                    name = _emit_replicate(arg_name, sid)
+                    # Activation changes every forward: do NOT cache.
+                    name = _emit_replicate(arg_name, sid, cache=False)
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
                 elif arg_name in replicated_set:
@@ -2205,7 +2339,7 @@ class PythonWrapperCodegen(CodeGen):
                     ):
                         name = _emit_zero_bias_clone(arg_name, sid)
                     else:
-                        name = _emit_replicate(arg_name, sid)
+                        name = _emit_replicate(arg_name, sid)  # cache=True (default)
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
                 elif arg_name in column_parallel_map and shard_d > 0:

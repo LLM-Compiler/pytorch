@@ -18,12 +18,21 @@ Run:
 Custom dims:
   python scripts/inductor/attention_block_pytorch_demo.py \
       --batch 1 --seq 6 --h-in 12 --num-heads 4 --head-dim 8
+
+Timing (mean forward per iteration after warmup):
+  python scripts/inductor/attention_block_pytorch_demo.py --warmup 5 --iters 50
+
+Gemma 3 1B attention (``google/gemma-3-1b-it``): ``hidden_size=1152``, ``num_attention_heads=4``,
+  ``head_dim=256`` → ``H_qkv = 4 * 256 = 1024`` (not ``1152 / 4``; FFN 6912 is unrelated):
+  python scripts/inductor/attention_block_pytorch_demo.py \\
+      --batch 1 --seq 512 --h-in 1152 --num-heads 4 --head-dim 256
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -85,7 +94,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--h-in", type=int, default=12, help="Input hidden dim H_in")
     parser.add_argument("--num-heads", type=int, default=4, help="Number of heads H")
     parser.add_argument("--head-dim", type=int, default=8, help="Per-head dim E")
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Warmup forward passes before timing (not counted).",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Timed forward passes; mean time is reported over this many runs.",
+    )
     return parser.parse_args()
+
+
+def _mean_forward_seconds(fn, *, warmup: int, iters: int) -> float:
+    for _ in range(warmup):
+        fn()
+    if iters <= 0:
+        return float("nan")
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    return (time.perf_counter() - t0) / iters
 
 
 def main() -> None:
@@ -112,6 +146,14 @@ def main() -> None:
 
     model = AttentionBlock(B, S, H, E).to(device)
 
+    def run_eager() -> None:
+        nonlocal y_eager
+        y_eager = model(x, Wq, Wk, Wv, bq, bk, bv, Wo, bo)
+
+    def run_compiled() -> None:
+        nonlocal y_compiled
+        y_compiled = compiled(x, Wq, Wk, Wv, bq, bk, bv, Wo, bo)
+
     # Eager
     y_eager = model(x, Wq, Wk, Wv, bq, bk, bv, Wo, bo)
     y_eager = model(x, Wq, Wk, Wv, bq, bk, bv, Wo, bo)
@@ -121,11 +163,19 @@ def main() -> None:
     y_compiled = compiled(x, Wq, Wk, Wv, bq, bk, bv, Wo, bo)
     y_compiled = compiled(x, Wq, Wk, Wv, bq, bk, bv, Wo, bo)
 
+    eager_mean_s = _mean_forward_seconds(run_eager, warmup=args.warmup, iters=args.iters)
+    compiled_mean_s = _mean_forward_seconds(run_compiled, warmup=args.warmup, iters=args.iters)
+
     print(f"AttentionBlock (B={B}, S={S}, H_in={H_in}, H={H}, E={E}, H_qkv={H_qkv})")
     print(f"Output shape: {tuple(y_eager.shape)}")
     print(f"scale used (1/sqrt(E)): {1.0 / math.sqrt(E):.6f}")
     print("allclose(eager, compiled):",
           torch.allclose(y_eager, y_compiled, atol=1e-5, rtol=1e-5))
+    print(
+        f"Mean forward time (warmup={args.warmup}, iters={args.iters}): "
+        f"eager {eager_mean_s * 1e3:.4f} ms/iter, "
+        f"compiled {compiled_mean_s * 1e3:.4f} ms/iter"
+    )
 
 
 if __name__ == "__main__":

@@ -132,60 +132,67 @@ def _match_decomposed_tanh_gelu(
 
     Returns ``(gelu_output_node, ordered_chain_for_shape_meta)``.
     """
-    users = list(linear1.users)
-    if len(users) != 2:
-        return None
-
-    pair: List[Tuple[torch.fx.Node, float]] = []
-    for u in users:
-        c = _mul_tensor_tensor_and_scalar(u, linear1)
-        if c is None:
-            return None
-        pair.append((u, c))
-
+    # AOTAutograd joint forward+backward saves ``linear1`` as a backward
+    # activation, so ``linear1.users`` may include extra consumers beyond the
+    # two decomposed GELU muls. Accept any user set that contains exactly one
+    # ``* 0.5`` and one ``* 1/sqrt(2)`` scalar-mul of ``linear1``; non-mul or
+    # other-constant users are tolerated (they don't invalidate the pattern).
     mul_half: Optional[torch.fx.Node] = None
     mul_inv: Optional[torch.fx.Node] = None
-    for u, c in pair:
+    for u in linear1.users:
+        c = _mul_tensor_tensor_and_scalar(u, linear1)
+        if c is None:
+            continue
         if math.isclose(c, _GELU_TANH_HALF, rel_tol=1e-5, abs_tol=1e-6):
+            if mul_half is not None:
+                return None
             mul_half = u
         elif math.isclose(c, _GELU_TANH_INV_SQRT2, rel_tol=1e-4, abs_tol=1e-5):
+            if mul_inv is not None:
+                return None
             mul_inv = u
     if mul_half is None or mul_inv is None:
         return None
 
-    inv_users = list(mul_inv.users)
-    if len(inv_users) != 1:
-        return None
-    erf_n = inv_users[0]
-    if (
-        erf_n.op != "call_function"
-        or erf_n.target is not aten.erf.default
-        or len(erf_n.args) < 1
-        or erf_n.args[0] is not mul_inv
-    ):
-        return None
-
-    erf_users = list(erf_n.users)
-    if len(erf_users) != 1:
-        return None
-    add_n = erf_users[0]
-    if not _add_tensor_plus_one(add_n, erf_n):
+    # AOTAutograd may save intermediate nodes (mul_inv, erf, add, mul_half) as
+    # backward activations, giving them extra users beyond the next forward
+    # consumer. Match by finding the expected downstream op among users, not
+    # by requiring a single user.
+    erf_n: Optional[torch.fx.Node] = None
+    for u in mul_inv.users:
+        if (
+            u.op == "call_function"
+            and u.target is aten.erf.default
+            and len(u.args) >= 1
+            and u.args[0] is mul_inv
+        ):
+            erf_n = u
+            break
+    if erf_n is None:
         return None
 
-    add_users = list(add_n.users)
-    if len(add_users) != 1:
-        return None
-    mul_out = add_users[0]
-    if mul_out.op != "call_function" or not _target_is_mul_tensor(mul_out.target):
-        return None
-    m0, m1 = mul_out.args[0], mul_out.args[1]
-    if not (
-        (m0 is mul_half and m1 is add_n) or (m0 is add_n and m1 is mul_half)
-    ):
+    add_n: Optional[torch.fx.Node] = None
+    for u in erf_n.users:
+        if _add_tensor_plus_one(u, erf_n):
+            add_n = u
+            break
+    if add_n is None:
         return None
 
-    half_users = list(mul_half.users)
-    if len(half_users) != 1 or half_users[0] is not mul_out:
+    mul_out: Optional[torch.fx.Node] = None
+    for u in add_n.users:
+        if u.op != "call_function" or not _target_is_mul_tensor(u.target):
+            continue
+        if len(u.args) < 2:
+            continue
+        m0, m1 = u.args[0], u.args[1]
+        if (m0 is mul_half and m1 is add_n) or (m0 is add_n and m1 is mul_half):
+            mul_out = u
+            break
+    if mul_out is None:
+        return None
+
+    if mul_out not in mul_half.users:
         return None
 
     chain = [mul_half, mul_inv, erf_n, add_n, mul_out]

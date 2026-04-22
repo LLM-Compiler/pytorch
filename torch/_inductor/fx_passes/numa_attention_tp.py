@@ -235,10 +235,20 @@ def _collect_chain_and_out_linear(
             if u not in reachable:
                 frontier.append(u)
 
-    # Look for a candidate out_linear: a call_function mm/addmm whose mat1 is
-    # in reachable and whose mat2 is a fresh input (not in reachable).
+    # Look for the FIRST candidate out_linear in topological order: a
+    # call_function mm/addmm whose mat1 is in reachable and whose mat2 is a
+    # fresh input (not in reachable). Iterating the reachable set directly is
+    # incorrect — Python sets have no guaranteed iteration order, so a
+    # downstream linear whose mat2 happens to hash earlier (e.g. an MLP's
+    # weight slice inserted by an earlier post-grad pass) can be picked
+    # before the real Wo, causing a size mismatch and silent skip. Walk
+    # graph.nodes so the attention-output linear (closest to Q/K/V) always
+    # wins.
+    graph_obj = qkv_linears[0].graph
     out_linear: Optional[torch.fx.Node] = None
-    for node in reachable:
+    for node in graph_obj.nodes:
+        if node not in reachable:
+            continue
         if node in qkv_linears:
             continue
         if not _is_linear_node(node):
