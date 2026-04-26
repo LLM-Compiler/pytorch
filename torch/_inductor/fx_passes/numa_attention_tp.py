@@ -264,9 +264,28 @@ def _collect_chain_and_out_linear(
     if out_linear is None:
         return None
 
+    # Restrict chain to nodes that are BOTH forward-reachable from QKV AND
+    # backward-reachable from out_linear (i.e. strictly between them). The
+    # raw forward closure also contains everything downstream of out_linear
+    # — residual add, MLP, and subsequent transformer layers — and rewriting
+    # shapes/meta on those would corrupt later attention groups whose own
+    # QKV linears have not yet been sharded.
+    ancestors: Set[torch.fx.Node] = set()
+    back_frontier: List[torch.fx.Node] = [out_linear]
+    while back_frontier:
+        n = back_frontier.pop()
+        if n in ancestors:
+            continue
+        ancestors.add(n)
+        for a in n.all_input_nodes:
+            if a in reachable and a not in ancestors:
+                back_frontier.append(a)
+
     chain: Set[torch.fx.Node] = set()
     for n in reachable:
         if n in qkv_linears or n is out_linear:
+            continue
+        if n not in ancestors:
             continue
         chain.add(n)
 
