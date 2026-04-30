@@ -1,0 +1,26 @@
+\section{Methodology}
+\label{sec:methodology}
+
+Our approach to achieving efficient CPU-only Tensor Parallelism (TP) over Non-Uniform Memory Access (NUMA) architectures is centered around a novel intermediate representation (IR) transformation pipeline. We integrate custom graph-rewrite passes within the PyTorch Inductor compilation stack, specifically targeting the post-autograd FX graph. This methodology bridges high-level model definitions with low-level, NUMA-aware code generation utilizing the Triton CPU backend, entirely circumventing the need for user-level code modification.
+
+\subsection{Graph IR Transformations}
+
+Rather than explicitly distributing execution engines across multiple cooperating processes, our compiler-based approach logically shards the computation at the graph level. We introduce two specialized FX passes: \textit{NUMA Attention TP} and \textit{NUMA MLP TP}. These passes traverse the computational graph to identify characteristic subgraph patterns corresponding to Attention and Multi-Layer Perceptron (MLP) blocks. 
+
+For Attention blocks, the pattern matcher identifies parallel linear projections (Query, Key, and Value) that share a common input tensor, along with their corresponding output projection. The pass modifies the graph by replacing the full parameter weights with per-shard \texttt{aten.slice} operations. Specifically, column-parallel slicing is applied to the Query, Key, and Value weight matrices, while row-parallel slicing is applied to the subsequent output projection. 
+
+Similarly, the MLP pass isolates subgraphs matching the \texttt{linear $\rightarrow$ activation (e.g., GELU) $\rightarrow$ linear} paradigm. The weights of the first linear layer are sliced along the column dimension, and the second linear layer is sliced along the row dimension. Bias terms in row-parallel configurations are handled carefully: they are replicated across shards but zeroed-out on non-zero NUMA nodes to prevent duplicate summations during post-kernel all-reduce accumulations.
+
+\subsection{Metadata Propagation and Shape Re-inference}
+
+A critical challenge in graph-level tensor parallelism is maintaining structural validity after topological modification. When weight tensors are logically sliced, the dependent intermediate tensors (e.g., activation outputs, softmax intermediate buffers) must immediately reflect the sharded dimensions. 
+
+Our compiler passes execute a comprehensive shape refresh phase utilizing \texttt{FakeTensor} propagation. To decouple the physical allocation strategy from the logical graph, we tag locally modified nodes with an explicit \texttt{numa\_shard\_plan} metadata footprint. This schema explicitly encodes the parallelization strategy, identifying the sharded dimensions, the world size (total NUMA sockets available), and the targeted compute shard. The meta-propagation ensures that downstream Inductor lowering phases interact with a consistent, sharded subgraph, avoiding dimension mismatches during implicit broadcasting.
+
+\subsection{NUMA-Aware Code Generation and Execution Substrate}
+
+The final step of our methodology translates the logically sharded graph into NUMA-pinned machine execution. We extended the compiler's code-generation wrapper to intercede and interpret the \texttt{numa\_shard\_plan} metadata during the code emission phase.
+
+Instead of inserting physical memory allocations directly into the intermediate FX graph, the wrapper code generator synthesizes initialization code that issues per-NUMA-node \texttt{clone()} operations, utilizing a custom backend placement API (\texttt{c10::NUMAMove}). This guarantees that each tensor shard is physically mapped to pages governed by its respective NUMA socket. The codegen further constructs an ordered layout of tensor pointers (\texttt{numa\_args}) mapped to their respective NUMA nodes, appending them to the kernel launch metadata.
+
+At runtime, an extended C++ execution driver leverages this kernel metadata to instantiate distinct \texttt{std::thread} groups. Each thread group is strictly pinned to the CPU processing elements of a specific NUMA socket via fine-grained process affinity interfaces (\texttt{pthread\_setaffinity\_np}). Consequently, the generated Triton CPU kernels operate exclusively on localized memory shards, drastically mitigating cross-socket interconnect latency bottlenecks pervasive in Large Language Model (LLM) inference tasks.
