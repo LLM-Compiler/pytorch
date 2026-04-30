@@ -1,5 +1,6 @@
 # mypy: allow-untyped-defs
 import functools
+import itertools
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -172,7 +173,12 @@ def tuned_mm(mat1, mat2, *, layout=None):
     )
     static_shape, is_nonzero = _is_static_problem([mat1, mat2], layout)
     if is_nonzero and use_triton_template(layout):
-        for config in mm_configs(m, n, k):
+        configs = mm_configs(m, n, k)
+        if not use_max_autotune():
+            # Without autotuning, only the first (default) config is ever selected;
+            # avoid precompiling the rest.
+            configs = list(itertools.islice(configs, 1))
+        for config in configs:
             mm_template.maybe_append_choice(
                 choices,
                 input_nodes=(mat1, mat2),
@@ -326,7 +332,7 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
     ordered_kwargs_for_cpp_kernel = ("beta", "alpha")
     m, n, k, layout, mat1, mat2, inp_expanded = mm_args(mat1, mat2, inp, layout=layout)
     static_shape, is_nonzero = _is_static_problem([inp, mat1, mat2], layout)
-    if (not is_nonzero) or (not use_max_autotune()):
+    if (not is_nonzero) or (not use_max_autotune() and use_aten_gemm_kernels()):
         # Use a FlexibleLayout if we are not autotuning.
         # This allows padding strides for the output.
         from torch._inductor.ir import FixedLayout, FlexibleLayout
@@ -377,7 +383,10 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
         )
 
     if is_nonzero and use_triton_template(layout):
-        for config in mm_configs(m, n, k):
+        configs = mm_configs(m, n, k)
+        if not use_max_autotune():
+            configs = list(itertools.islice(configs, 1))
+        for config in configs:
             mm_template.maybe_append_choice(
                 choices,
                 input_nodes=(inp_expanded, mat1, mat2),

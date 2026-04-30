@@ -1316,7 +1316,12 @@ def use_cpp_packed_gemm_template(layout, mat1, mat2, mat2_transposed=False):
 
 
 def use_aten_gemm_kernels():
-    return not use_max_autotune() or _use_autotune_backend("ATEN")
+    # Honor `max_autotune_gemm_backends` even when autotuning is disabled, so that a
+    # user who sets backends="TRITON" gets Triton kernels for GEMM (with the first /
+    # default tiling config selected without benchmarking) instead of falling through
+    # to ATen extern calls. The default backend list "ATEN,TRITON,CPP" still includes
+    # ATEN, so behavior is unchanged for users who did not narrow the backend list.
+    return _use_autotune_backend("ATEN")
 
 
 class DebugDirManager:

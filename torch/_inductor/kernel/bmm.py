@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+import itertools
 import logging
 
 import torch
@@ -13,6 +14,7 @@ from ..utils import (
     ceildiv as cdiv,
     use_aten_gemm_kernels,
     use_cutlass_template,
+    use_max_autotune,
     use_triton_template,
 )
 from ..virtualized import V
@@ -147,7 +149,12 @@ def tuned_bmm(mat1, mat2, *, layout=None):
     # options to tune from
     choices = [aten_bmm.bind((mat1, mat2), layout)] if use_aten_gemm_kernels() else []
     if use_triton_template(layout):
-        for config in mm_configs(m, n, k):
+        # When autotuning is disabled, emit only the first (default) tiling config to
+        # avoid wasted precompilation — without timings, choices[0] is selected anyway.
+        configs = mm_configs(m, n, k)
+        if not use_max_autotune():
+            configs = list(itertools.islice(configs, 1))
+        for config in configs:
             bmm_template.maybe_append_choice(
                 choices,
                 input_nodes=(mat1, mat2),
