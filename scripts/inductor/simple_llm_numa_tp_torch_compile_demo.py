@@ -56,7 +56,7 @@ from torch._inductor import config as inductor_config
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 inductor_config.max_autotune_gemm_backends = "TRITON"
-inductor_config.max_autotune = True
+#inductor_config.max_autotune = True
 
 
 def _auto_num_tp_shards(num_heads: int, num_numa_nodes: int) -> int:
