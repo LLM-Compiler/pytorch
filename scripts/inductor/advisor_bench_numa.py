@@ -41,18 +41,38 @@ inductor_config.max_autotune_gemm_backends = "TRITON"
 # paused; we resume it only around the measurement loop.  Outside Advisor, the
 # dlopen fails and these become no-ops.
 _ADVISOR_HOME = os.environ.get("ADVISOR_HOME", "/opt/intel/oneapi/advisor/2023.1.0")
-_ITT_LIB_PATH = os.path.join(_ADVISOR_HOME, "lib64", "runtime", "libittnotify_collector.so")
+
+def _itt_lib_candidates():
+    paths = []
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                if "libittnotify" in line and ".so" in line:
+                    parts = line.split()
+                    if len(parts) >= 6 and parts[-1] not in paths:
+                        paths.append(parts[-1])
+    except OSError:
+        pass
+    paths.append(os.path.join(_ADVISOR_HOME, "lib64", "runtime", "libittnotify.so"))
+    paths.append(os.path.join(_ADVISOR_HOME, "lib64", "runtime", "libittnotify_collector.so"))
+    return paths
 
 def _load_itt():
-    if not os.path.exists(_ITT_LIB_PATH):
-        return None, None
-    try:
-        lib = ctypes.CDLL(_ITT_LIB_PATH, mode=ctypes.RTLD_GLOBAL)
-        return getattr(lib, "__itt_resume"), getattr(lib, "__itt_pause")
-    except (OSError, AttributeError):
-        return None, None
+    # Bind to the libittnotify*.so already mapped by Advisor/Pin so __itt_resume
+    # reaches the active collector (survey OR tripcounts).  See standard bench
+    # for the long-form rationale.
+    for path in _itt_lib_candidates():
+        if not os.path.exists(path):
+            continue
+        try:
+            lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            return getattr(lib, "__itt_resume"), getattr(lib, "__itt_pause"), path
+        except (OSError, AttributeError):
+            continue
+    return None, None, None
 
-_itt_resume_fn, _itt_pause_fn = _load_itt()
+_itt_resume_fn, _itt_pause_fn, _itt_lib_used = _load_itt()
+print(f"[itt] bound to: {_itt_lib_used}", flush=True)
 
 def itt_resume():
     if _itt_resume_fn is not None:
@@ -69,8 +89,9 @@ H_IN        = int(os.environ.get("ADVISOR_BENCH_H_IN",       1152))
 NUM_HEADS   = int(os.environ.get("ADVISOR_BENCH_NUM_HEADS",      4))
 HEAD_DIM    = int(os.environ.get("ADVISOR_BENCH_HEAD_DIM",     256))
 MLP_HIDDEN  = int(os.environ.get("ADVISOR_BENCH_MLP_HIDDEN", 6912))
-WARMUP      = int(os.environ.get("ADVISOR_BENCH_WARMUP",        1))
-ITERS       = int(os.environ.get("ADVISOR_BENCH_ITERS",        1))
+# Defaults match run_advisor_roofline.sh (overridable via env).
+WARMUP      = int(os.environ.get("ADVISOR_BENCH_WARMUP",        2))
+ITERS       = int(os.environ.get("ADVISOR_BENCH_ITERS",        20))
 TP_SHARDS   = int(os.environ.get("ADVISOR_BENCH_TP_SHARDS",     4))  # match NUMA nodes
 # ─────────────────────────────────────────────────────────────────────────────
 

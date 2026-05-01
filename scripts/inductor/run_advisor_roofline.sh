@@ -43,7 +43,7 @@
 #   ADVISOR_BENCH_B          batch size            (default 1)
 #   ADVISOR_BENCH_S          sequence length       (default 512)
 #   ADVISOR_BENCH_TP_SHARDS  NUMA TP world size    (default 4, = num NUMA nodes)
-#   ADVISOR_BENCH_WARMUP     warmup iters (paused) (default 8)
+#   ADVISOR_BENCH_WARMUP     warmup iters (paused) (default 2)
 #   ADVISOR_BENCH_ITERS      measured iterations   (default 20)
 #   ADVISOR_MODULE_FILTER    comma-separated module basenames to exclude
 #                            (default skips gcc/ld/binutils/Python-crypto noise)
@@ -133,8 +133,8 @@ fi
 ADVISOR_PAUSE_FLAGS=(--start-paused)
 
 # Pass through measurement controls so the bench's "warmup outside, measure inside"
-# split is honored (matches the new defaults in advisor_bench_*.py).
-export ADVISOR_BENCH_WARMUP="${ADVISOR_BENCH_WARMUP:-8}"
+# split is honored.
+export ADVISOR_BENCH_WARMUP="${ADVISOR_BENCH_WARMUP:-2}"
 export ADVISOR_BENCH_ITERS="${ADVISOR_BENCH_ITERS:-20}"
 export ADVISOR_HOME
 

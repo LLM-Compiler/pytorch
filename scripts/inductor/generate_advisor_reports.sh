@@ -6,11 +6,15 @@
 # directories created by run_advisor_roofline.sh.
 #
 # Outputs (under advisor_projects/reports/):
-#   roofline_standard.csv   — per-loop AI + time for standard path
-#   roofline_numa.csv       — per-loop AI + time for NUMA-TP path
-#   survey_standard.txt     — human-readable survey report (standard)
-#   survey_numa.txt         — human-readable survey report (NUMA-TP)
-#   roofline_comparison.txt — side-by-side summary printed to terminal
+#   roofline_standard.html   — interactive cache-aware roofline chart (standard)
+#   roofline_numa.html       — interactive cache-aware roofline chart (NUMA-TP)
+#   topdown_standard.csv     — per-loop self-time + AI + GFLOPs/s (standard)
+#   topdown_numa.csv         — per-loop self-time + AI + GFLOPs/s (NUMA-TP)
+#   tripcounts_standard.csv  — per-loop trip counts + FLOP / byte traffic (standard)
+#   tripcounts_numa.csv      — per-loop trip counts + FLOP / byte traffic (NUMA-TP)
+#   survey_standard.txt      — human-readable survey report (standard)
+#   survey_numa.txt          — human-readable survey report (NUMA-TP)
+#   roofline_comparison.txt  — side-by-side summary printed to terminal
 #
 # Open the full interactive roofline charts in the Advisor GUI:
 #   advixe-gui advisor_projects/standard
@@ -36,46 +40,68 @@ source "${ADVISOR_HOME}/advisor-vars.sh" 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: generate reports for one project
-# Usage: gen_reports <project_dir> <label> <csv_out> <survey_txt_out>
+# Usage: gen_reports <project_dir> <label>
+#
+# Produces, under REPORT_DIR:
+#   roofline_<label>.html    standalone interactive chart (--report=roofline)
+#   topdown_<label>.csv      per-loop self-time + AI + GFLOPs (--report=top-down)
+#   tripcounts_<label>.csv   per-loop trip counts + FLOP / byte traffic
+#   survey_<label>.txt       text survey report
+#
+# NOTE on --format: `--report=roofline` ALWAYS writes an HTML chart and ignores
+# --format.  For machine-readable per-loop data, use --report=top-down or
+# --report=tripcounts with --format=csv.
 # ─────────────────────────────────────────────────────────────────────────────
 gen_reports() {
     local proj="$1"
     local label="$2"
-    local csv_out="$3"
-    local txt_out="$4"
+
+    local html_out="${REPORT_DIR}/roofline_${label}.html"
+    local topdown_out="${REPORT_DIR}/topdown_${label}.csv"
+    local trip_out="${REPORT_DIR}/tripcounts_${label}.csv"
+    local survey_out="${REPORT_DIR}/survey_${label}.txt"
 
     echo ""
     echo "── Generating reports: ${label} ──"
 
-    # Roofline CSV: loop name, time %, self-time, AI (FLOPs/Byte),
-    # GFLOPs/s achieved, cache simulation traffic per memory level.
+    # Interactive HTML roofline chart.
     "${ADVISOR_BIN}" \
         --report=roofline \
         --project-dir="${proj}" \
-        --report-output="${csv_out}" \
+        --report-output="${html_out}" \
+        2>&1 | tail -5
+    echo "  Roofline HTML  → ${html_out}"
+
+    # Per-loop top-down CSV: ID, function/loop, self-time%, AI, GFLOPs achieved.
+    "${ADVISOR_BIN}" \
+        --report=top-down \
+        --project-dir="${proj}" \
+        --report-output="${topdown_out}" \
         --format=csv \
         2>&1 | tail -5
+    echo "  Top-down CSV   → ${topdown_out}"
 
-    echo "  Roofline CSV  → ${csv_out}"
+    # Per-loop trip counts + FLOP + cache-simulated byte traffic.
+    "${ADVISOR_BIN}" \
+        --report=tripcounts \
+        --project-dir="${proj}" \
+        --report-output="${trip_out}" \
+        --format=csv \
+        2>&1 | tail -5
+    echo "  Tripcounts CSV → ${trip_out}"
 
-    # Survey text report: hot loops ranked by self-time.
+    # Human-readable survey: hot loops ranked by self-time.
     "${ADVISOR_BIN}" \
         --report=survey \
         --project-dir="${proj}" \
-        --report-output="${txt_out}" \
+        --report-output="${survey_out}" \
         --format=text \
         2>&1 | tail -5
-
-    echo "  Survey text   → ${txt_out}"
+    echo "  Survey text    → ${survey_out}"
 }
 
-gen_reports "${PROJ_STD}"  "standard" \
-    "${REPORT_DIR}/roofline_standard.csv" \
-    "${REPORT_DIR}/survey_standard.txt"
-
-gen_reports "${PROJ_NUMA}" "numa_tp" \
-    "${REPORT_DIR}/roofline_numa.csv" \
-    "${REPORT_DIR}/survey_numa.txt"
+gen_reports "${PROJ_STD}"  "standard"
+gen_reports "${PROJ_NUMA}" "numa"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Quick comparison: extract top-10 loops from each CSV and print side by side
@@ -88,13 +114,13 @@ COMP="${REPORT_DIR}/roofline_comparison.txt"
     echo "======================================================================"
     echo ""
     echo "=== TOP LOOPS — STANDARD (no NUMA) ==="
-    # Print header + first 10 data rows of the CSV
-    head -1  "${REPORT_DIR}/roofline_standard.csv"
-    tail -n +2 "${REPORT_DIR}/roofline_standard.csv" | head -10
+    # Print header + first 10 data rows of the top-down CSV
+    head -1  "${REPORT_DIR}/topdown_standard.csv"
+    tail -n +2 "${REPORT_DIR}/topdown_standard.csv" | head -10
     echo ""
     echo "=== TOP LOOPS — NUMA-TP ==="
-    head -1  "${REPORT_DIR}/roofline_numa.csv"
-    tail -n +2 "${REPORT_DIR}/roofline_numa.csv" | head -10
+    head -1  "${REPORT_DIR}/topdown_numa.csv"
+    tail -n +2 "${REPORT_DIR}/topdown_numa.csv" | head -10
     echo ""
     echo "How to read the roofline:"
     echo "  - Low AI  + near DRAM BW ceiling  → DRAM-bound (remote DRAM = bad)"
