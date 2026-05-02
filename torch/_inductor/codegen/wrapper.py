@@ -2357,8 +2357,10 @@ class PythonWrapperCodegen(CodeGen):
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
 
         numa_args_var = f"{prefix}_numa_args"
+        # Trailing comma so length-1 entries become 1-tuples rather than
+        # parenthesized expressions (the launcher requires a sequence per socket).
         inner = ", ".join(
-            "(" + ", ".join(per_node_arg_names[sid]) + ")"
+            "(" + ", ".join(per_node_arg_names[sid]) + ",)"
             for sid in range(world_size)
         )
         self.writeline(f"{numa_args_var} = [{inner}]")
