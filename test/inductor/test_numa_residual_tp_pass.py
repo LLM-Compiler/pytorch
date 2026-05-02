@@ -2,8 +2,10 @@
 import math
 
 import torch
+import torch.nn.functional as F
 from torch._inductor import config
 from torch._inductor.fx_passes.numa_attention_tp import numa_attention_tp_pass
+from torch._inductor.fx_passes.numa_layer_norm_tp import numa_layer_norm_tp_pass
 from torch._inductor.fx_passes.numa_mlp_tp import numa_mlp_tp_pass
 from torch._inductor.fx_passes.numa_residual_tp import numa_residual_tp_pass
 from torch._inductor.test_case import run_tests, TestCase
@@ -194,6 +196,106 @@ class TestNumaResidualTpPass(TestCase):
             a for a in adds
             if isinstance(a.meta.get("numa_shard_plan"), dict)
             and a.meta["numa_shard_plan"].get("kind") == "residual_add"
+        ]
+        self.assertEqual(len(residual_adds), 1)
+
+    # ------------------------------------------------------------------
+    # Pre-LN cases (residual operand is the LN's INPUT, not the LN output).
+    # ------------------------------------------------------------------
+    def test_preLN_attention_residual_tagged(self):
+        if not HAS_CPU:
+            self.skipTest("CPU-only test")
+        B, S, H_in, H, E = (
+            _ATTN_DIMS["B"], _ATTN_DIMS["S"], _ATTN_DIMS["H_in"],
+            _ATTN_DIMS["H"], _ATTN_DIMS["E"],
+        )
+        H_qkv = H * E
+        ws = 2
+
+        def fn(x, w_ln, b_ln, Wq, Wk, Wv, bq, bk, bv, Wo, bo):
+            residual = x
+            xn = F.layer_norm(x, (H_in,), w_ln, b_ln, 1e-5)
+            q = torch.addmm(bq, xn, Wq).view(B, S, H, E).transpose(1, 2)
+            k = torch.addmm(bk, xn, Wk).view(B, S, H, E).transpose(1, 2)
+            v = torch.addmm(bv, xn, Wv).view(B, S, H, E).transpose(1, 2)
+            scale = 1.0 / math.sqrt(E)
+            scores = torch.matmul(q * scale, k.transpose(-2, -1))
+            attn = torch.softmax(scores, dim=-1)
+            y = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B * S, H_qkv)
+            z = torch.addmm(bo, y, Wo)
+            return z + residual
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(B * S, H_in), torch.randn(H_in), torch.randn(H_in),
+        ) + _attn_inputs(B, S, H_in, H, E)[1:]
+        gm = self._trace(fn, args)
+        with config.patch(
+            {
+                "_numa_layer_norm_tp": True,
+                "_numa_layer_norm_tp_world_size": ws,
+                "_numa_attention_tp_world_size": ws,
+                "_numa_residual_tp": True,
+            }
+        ):
+            numa_layer_norm_tp_pass(gm.graph)
+            numa_attention_tp_pass(gm.graph)
+            numa_residual_tp_pass(gm.graph)
+        gm.recompile()
+
+        residual_adds = [
+            n
+            for n in gm.graph.nodes
+            if n.target is torch.ops.aten.add.Tensor
+            and isinstance(n.meta.get("numa_shard_plan"), dict)
+            and n.meta["numa_shard_plan"].get("kind") == "residual_add"
+        ]
+        self.assertEqual(len(residual_adds), 1)
+        # The matched residual operand must be the LN's input, NOT the LN's output.
+        plan = residual_adds[0].meta["numa_shard_plan"]
+        # x_node on the residual plan now records the actual residual operand.
+        self.assertNotIn("layer_norm", plan["x_node"])
+
+    def test_preLN_mlp_residual_tagged(self):
+        if not HAS_CPU:
+            self.skipTest("CPU-only test")
+        ws = 2
+        H_in, D = 16, 32
+
+        def fn(x, w_ln, b_ln, A, b1, B_, b2):
+            residual = x
+            xn = F.layer_norm(x, (H_in,), w_ln, b_ln, 1e-5)
+            h = torch.addmm(b1, xn, A)
+            h = F.gelu(h)
+            z = torch.addmm(b2, h, B_)
+            return z + residual
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(8, H_in), torch.randn(H_in), torch.randn(H_in),
+            torch.randn(H_in, D), torch.randn(D),
+            torch.randn(D, H_in), torch.randn(H_in),
+        )
+        gm = self._trace(fn, args)
+        with config.patch(
+            {
+                "_numa_layer_norm_tp": True,
+                "_numa_layer_norm_tp_world_size": ws,
+                "_numa_mlp_tp_world_size": ws,
+                "_numa_residual_tp": True,
+            }
+        ):
+            numa_layer_norm_tp_pass(gm.graph)
+            numa_mlp_tp_pass(gm.graph)
+            numa_residual_tp_pass(gm.graph)
+        gm.recompile()
+
+        residual_adds = [
+            n
+            for n in gm.graph.nodes
+            if n.target is torch.ops.aten.add.Tensor
+            and isinstance(n.meta.get("numa_shard_plan"), dict)
+            and n.meta["numa_shard_plan"].get("kind") == "residual_add"
         ]
         self.assertEqual(len(residual_adds), 1)
 

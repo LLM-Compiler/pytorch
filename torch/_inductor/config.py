@@ -597,6 +597,18 @@ _numa_residual_tp: bool = False
 # Verbose stdout from numa_residual_tp_pass (matched adds, propagated metadata).
 _numa_residual_tp_debug: bool = False
 
+# LayerNorm NUMA tensor-parallel pass: tags ``aten.native_layer_norm`` nodes
+# with a shard plan so the kernel runs M-split across sockets with replicated
+# weight/bias clones. LN normalizes along the last (hidden) dim, so per-row
+# parallelism is correctness-preserving and needs no communication.
+_numa_layer_norm_tp: bool = False
+# Test/debug override for NUMA LN TP shard count. 0 means detect from runtime.
+_numa_layer_norm_tp_world_size: int = 0
+# Which shard id to materialize as the compute shard.
+_numa_layer_norm_tp_compute_shard: int = 0
+# Verbose stdout from numa_layer_norm_tp_pass.
+_numa_layer_norm_tp_debug: bool = False
+
 
 def decide_compile_threads() -> int:
     """

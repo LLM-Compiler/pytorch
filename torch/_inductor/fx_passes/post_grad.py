@@ -50,6 +50,7 @@ from .ddp_fusion import fuse_ddp_communication
 from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
 from .numa_attention_tp import numa_attention_tp_pass
+from .numa_layer_norm_tp import numa_layer_norm_tp_pass
 from .numa_mlp_tp import numa_mlp_tp_pass
 from .numa_residual_tp import numa_residual_tp_pass
 from .pre_grad import is_same_dict, save_inductor_dict
@@ -123,6 +124,11 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     if config._micro_pipeline_tp:
         micro_pipeline_tp_pass(gm.graph)
+
+    # LN runs first so its output is in _numa_tensor_cache when the
+    # subsequent attention/MLP pass reads x_node.
+    if config._numa_layer_norm_tp:
+        numa_layer_norm_tp_pass(gm.graph)
 
     if config._numa_mlp_tp:
         numa_mlp_tp_pass(gm.graph)
