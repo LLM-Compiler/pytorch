@@ -39,8 +39,11 @@ Example::
 from __future__ import annotations
 
 import argparse
+import glob
 import math
+import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -238,6 +241,60 @@ def _time_forward(
     )
 
 
+def _scan_output_code(cache_dir: str) -> dict:
+    """Grep generated Inductor output_code.py for NUMA tagging signals."""
+    files = glob.glob(os.path.join(cache_dir, "**", "output_code.py"), recursive=True)
+    numa_calls = 0
+    triton_kernels = 0
+    extern_mm = 0
+    reassemble = 0
+    largest_file = None
+    largest_size = 0
+    for f in files:
+        try:
+            with open(f) as fh:
+                txt = fh.read()
+        except OSError:
+            continue
+        if len(txt) > largest_size:
+            largest_size = len(txt)
+            largest_file = f
+        numa_calls += txt.count("numa_args=")
+        triton_kernels += txt.count("def triton_")
+        extern_mm += txt.count("extern_kernels.mm(") + txt.count("extern_kernels.addmm(")
+        reassemble += txt.count("# numa reassemble") + txt.count("_numa_reassemble")
+    return {
+        "files": len(files),
+        "numa_calls": numa_calls,
+        "triton_kernels": triton_kernels,
+        "extern_mm": extern_mm,
+        "reassemble": reassemble,
+        "largest_file": largest_file,
+    }
+
+
+def _profile_forward(compiled, input_ids: torch.Tensor, *, iters: int):
+    from torch.profiler import profile, ProfilerActivity, record_function
+
+    with torch.no_grad():
+        # warm
+        for _ in range(2):
+            compiled(input_ids)
+        with profile(activities=[ProfilerActivity.CPU], record_shapes=False) as prof:
+            for _ in range(iters):
+                with record_function("gpt2_forward"):
+                    compiled(input_ids)
+    return prof
+
+
+def _print_profile(label: str, prof, *, top_n: int = 25) -> None:
+    print(f"\n===== {label}: top {top_n} ops by self CPU time =====", file=sys.stderr)
+    table = prof.key_averages().table(
+        sort_by="self_cpu_time_total", row_limit=top_n
+    )
+    print(table, file=sys.stderr, flush=True)
+
+
 def _run_path(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -247,18 +304,29 @@ def _run_path(
     warmup: int,
     iters: int,
     lm_head: bool = False,
-) -> tuple[TimingSummary, torch.Tensor]:
+    profile: bool = False,
+) -> tuple[TimingSummary, torch.Tensor, dict]:
+    info: dict = {}
+    cache_dir = tempfile.mkdtemp(prefix="gpt2_speedup_inductor_cache_")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    # Reset dynamo+inductor so the patched flags take effect on this compile
+    # rather than a previously cached graph.
+    torch._dynamo.reset()
     with inductor_config.patch(_flags(numa, world_size, lm_head=lm_head)):
         compiled = _compile(model, numa=numa, world_size=world_size)
         # Run once to capture output for the correctness check (also primes
         # the cache before timing). Counts toward warmup.
         with torch.no_grad():
             ref_out = compiled(input_ids).detach().clone()
+        info.update(_scan_output_code(cache_dir))
+        info["cache_dir"] = cache_dir
         remaining_warmup = max(0, warmup - 1)
         timing = _time_forward(
             compiled, input_ids, warmup=remaining_warmup, iters=iters
         )
-    return timing, ref_out
+        if profile:
+            info["prof"] = _profile_forward(compiled, input_ids, iters=min(iters, 10))
+    return timing, ref_out, info
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +362,15 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--atol", type=float, default=1e-3)
     p.add_argument("--rtol", type=float, default=1e-3)
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Run torch.profiler for both standard and NUMA-TP paths and print "
+            "top CPU ops by self time. Also scans the generated Inductor "
+            "output_code.py to verify NUMA-TP tagging actually fired."
+        ),
+    )
     return p.parse_args()
 
 
@@ -339,21 +416,23 @@ def main() -> int:
     )
 
     print("Running standard ...", file=sys.stderr, flush=True)
-    std_timing, std_out = _run_path(
+    std_timing, std_out, std_info = _run_path(
         model, input_ids,
         numa=False, world_size=args.world_size,
         warmup=args.warmup, iters=args.iters,
+        profile=args.profile,
     )
 
     print(
         f"Running NUMA-TP (tp_lm_head={args.tp_lm_head}) ...",
         file=sys.stderr, flush=True,
     )
-    numa_timing, numa_out = _run_path(
+    numa_timing, numa_out, numa_info = _run_path(
         model, input_ids,
         numa=True, world_size=args.world_size,
         warmup=args.warmup, iters=args.iters,
         lm_head=args.tp_lm_head,
+        profile=args.profile,
     )
 
     if args.check_correctness:
@@ -387,6 +466,34 @@ def main() -> int:
         f"min={numa_timing.min_ms:.3f}",
         file=sys.stderr,
     )
+
+    if args.profile:
+        print("\n===== TP verification (output_code.py scan) =====", file=sys.stderr)
+        for label, info in (("standard", std_info), ("numa_tp", numa_info)):
+            print(
+                f"  {label}: files={info['files']} triton_kernels={info['triton_kernels']} "
+                f"extern_mm={info['extern_mm']} numa_args_calls={info['numa_calls']} "
+                f"reassemble={info['reassemble']}",
+                file=sys.stderr,
+            )
+            print(f"    cache_dir={info['cache_dir']}", file=sys.stderr)
+            print(f"    largest_output_code={info['largest_file']}", file=sys.stderr)
+        if numa_info["numa_calls"] == 0:
+            print(
+                "  WARNING: numa_args_calls=0 in NUMA-TP path — TP did NOT fire. "
+                "The NUMA path is running the standard kernels.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  OK: NUMA-TP path emitted {numa_info['numa_calls']} numa-tagged "
+                f"kernel calls (vs {std_info['numa_calls']} in standard, expected 0).",
+                file=sys.stderr,
+            )
+        if "prof" in std_info:
+            _print_profile("STANDARD", std_info["prof"])
+        if "prof" in numa_info:
+            _print_profile("NUMA-TP", numa_info["prof"])
 
     speedup = std_timing.mean_ms / numa_timing.mean_ms
     # stdout: just the speedup number, like the existing CLI.
