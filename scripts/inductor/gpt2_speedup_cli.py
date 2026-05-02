@@ -191,8 +191,10 @@ def _enable_numa() -> None:
     )
 
 
-def _flags(numa: bool, world_size: int, *, lm_head: bool = False) -> dict:
-    return {
+def _flags(
+    numa: bool, world_size: int, *, lm_head: bool = False, max_autotune: bool = False
+) -> dict:
+    base = {
         "_numa_layer_norm_tp": numa,
         "_numa_attention_tp": numa,
         "_numa_mlp_tp": numa,
@@ -203,6 +205,13 @@ def _flags(numa: bool, world_size: int, *, lm_head: bool = False) -> dict:
         "_numa_mlp_tp_world_size": world_size if numa else 0,
         "_numa_lm_head_tp_world_size": world_size if (numa and lm_head) else 0,
     }
+    if max_autotune:
+        base.update({
+            "max_autotune": True,
+            "max_autotune_gemm": True,
+            "max_autotune_pointwise": False,
+        })
+    return base
 
 
 def _compile(model: torch.nn.Module, numa: bool, world_size: int):
@@ -241,9 +250,31 @@ def _time_forward(
     )
 
 
-def _scan_output_code(cache_dir: str) -> dict:
-    """Grep generated Inductor output_code.py for NUMA tagging signals."""
-    files = glob.glob(os.path.join(cache_dir, "**", "output_code.py"), recursive=True)
+def _scan_output_code(cache_dir: str, since: float = 0.0) -> dict:
+    """Grep generated Inductor output_code.py for NUMA tagging signals.
+
+    Inductor caches its cache-dir resolution at import time, so the env-var
+    override we set in ``_run_path`` is often ignored and artifacts land in
+    the default ``/tmp/torchinductor_<user>/`` tree. Scan both, and (if
+    ``since`` is given) restrict to files modified after that timestamp so
+    we only count artifacts produced by the current compile.
+    """
+    candidate_dirs = [cache_dir]
+    default = os.path.join(
+        tempfile.gettempdir(), f"torchinductor_{os.environ.get('USER', '')}"
+    )
+    if default not in candidate_dirs:
+        candidate_dirs.append(default)
+    files: list[str] = []
+    for d in candidate_dirs:
+        if d and os.path.isdir(d):
+            files.extend(
+                glob.glob(os.path.join(d, "**", "output_code.py"), recursive=True)
+            )
+    # The Inductor wrapper file is large but not always called output_code.py
+    # in newer caches — also pick up the largest .py per dir.
+    if since > 0:
+        files = [f for f in files if os.path.getmtime(f) >= since]
     numa_calls = 0
     triton_kernels = 0
     extern_mm = 0
@@ -305,20 +336,24 @@ def _run_path(
     iters: int,
     lm_head: bool = False,
     profile: bool = False,
+    max_autotune: bool = False,
 ) -> tuple[TimingSummary, torch.Tensor, dict]:
     info: dict = {}
     cache_dir = tempfile.mkdtemp(prefix="gpt2_speedup_inductor_cache_")
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    compile_started = time.time()
     # Reset dynamo+inductor so the patched flags take effect on this compile
     # rather than a previously cached graph.
     torch._dynamo.reset()
-    with inductor_config.patch(_flags(numa, world_size, lm_head=lm_head)):
+    with inductor_config.patch(
+        _flags(numa, world_size, lm_head=lm_head, max_autotune=max_autotune)
+    ):
         compiled = _compile(model, numa=numa, world_size=world_size)
         # Run once to capture output for the correctness check (also primes
         # the cache before timing). Counts toward warmup.
         with torch.no_grad():
             ref_out = compiled(input_ids).detach().clone()
-        info.update(_scan_output_code(cache_dir))
+        info.update(_scan_output_code(cache_dir, since=compile_started))
         info["cache_dir"] = cache_dir
         remaining_warmup = max(0, warmup - 1)
         timing = _time_forward(
@@ -362,6 +397,16 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--atol", type=float, default=1e-3)
     p.add_argument("--rtol", type=float, default=1e-3)
+    p.add_argument(
+        "--max-autotune",
+        action="store_true",
+        help=(
+            "Enable Inductor max_autotune for matmuls. Without this the "
+            "addmm/bmm calls fall through to extern BLAS (OpenBLAS) which "
+            "does not honor numa_args, capping NUMA TP speedup to a small "
+            "fraction of the per-block ceiling."
+        ),
+    )
     p.add_argument(
         "--profile",
         action="store_true",
@@ -421,6 +466,7 @@ def main() -> int:
         numa=False, world_size=args.world_size,
         warmup=args.warmup, iters=args.iters,
         profile=args.profile,
+        max_autotune=args.max_autotune,
     )
 
     print(
