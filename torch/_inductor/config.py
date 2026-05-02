@@ -589,6 +589,14 @@ _numa_attention_tp_debug: bool = False
 # codegen fallback when kernel-level origin metadata is unavailable.
 _numa_attention_tp_shard_plan: Optional[Dict[str, Any]] = None
 
+# Residual-add NUMA tensor-parallel pass: absorbs the trailing
+# ``aten.add(Z, X)`` after a row-parallel attention/MLP out_linear into the
+# TP region so the add runs per-socket on cached row-shards, eliding the
+# row-parallel reassembly when the residual output feeds another TP region.
+_numa_residual_tp: bool = False
+# Verbose stdout from numa_residual_tp_pass (matched adds, propagated metadata).
+_numa_residual_tp_debug: bool = False
+
 
 def decide_compile_threads() -> int:
     """

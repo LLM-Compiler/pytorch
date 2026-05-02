@@ -51,6 +51,7 @@ from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
 from .numa_attention_tp import numa_attention_tp_pass
 from .numa_mlp_tp import numa_mlp_tp_pass
+from .numa_residual_tp import numa_residual_tp_pass
 from .pre_grad import is_same_dict, save_inductor_dict
 from .reinplace import reinplace_inplaceable_ops
 from .split_cat import POST_GRAD_PATTERNS
@@ -128,6 +129,11 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     if config._numa_attention_tp:
         numa_attention_tp_pass(gm.graph)
+
+    # Must run AFTER attention/MLP passes — it keys off the ``numa_shard_plan``
+    # they leave on the row-parallel out_linear nodes.
+    if config._numa_residual_tp:
+        numa_residual_tp_pass(gm.graph)
 
     if config._fuse_ddp_communication:
         fuse_ddp_communication(

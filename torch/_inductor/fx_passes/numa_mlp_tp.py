@@ -561,6 +561,7 @@ def numa_mlp_tp_pass(graph: torch.fx.Graph) -> None:
 
         # Build the numa_shard_plan describing the full shard layout for wrapper codegen.
         shard_plan: Dict[str, Any] = {
+            "kind": "mlp",
             "plan_id": plan_id,
             "world_size": world_size,
             "shard_d": shard_d,
