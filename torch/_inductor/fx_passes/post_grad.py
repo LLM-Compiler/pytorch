@@ -51,6 +51,7 @@ from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
 from .numa_attention_tp import numa_attention_tp_pass
 from .numa_layer_norm_tp import numa_layer_norm_tp_pass
+from .numa_lm_head_tp import numa_lm_head_tp_pass
 from .numa_mlp_tp import numa_mlp_tp_pass
 from .numa_residual_tp import numa_residual_tp_pass
 from .pre_grad import is_same_dict, save_inductor_dict
@@ -140,6 +141,13 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     # they leave on the row-parallel out_linear nodes.
     if config._numa_residual_tp:
         numa_residual_tp_pass(gm.graph)
+
+    # LM-head pass runs LAST: it claims any untagged mm/addmm. After all
+    # the other NUMA passes have tagged attention QKV/out_linear and
+    # MLP linears, the only such matmul in a GPT-style decoder is the
+    # final LM head.
+    if config._numa_lm_head_tp:
+        numa_lm_head_tp_pass(gm.graph)
 
     if config._fuse_ddp_communication:
         fuse_ddp_communication(

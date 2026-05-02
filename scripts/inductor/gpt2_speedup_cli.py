@@ -188,15 +188,17 @@ def _enable_numa() -> None:
     )
 
 
-def _flags(numa: bool, world_size: int) -> dict:
+def _flags(numa: bool, world_size: int, *, lm_head: bool = False) -> dict:
     return {
         "_numa_layer_norm_tp": numa,
         "_numa_attention_tp": numa,
         "_numa_mlp_tp": numa,
         "_numa_residual_tp": numa,
+        "_numa_lm_head_tp": numa and lm_head,
         "_numa_layer_norm_tp_world_size": world_size if numa else 0,
         "_numa_attention_tp_world_size": world_size if numa else 0,
         "_numa_mlp_tp_world_size": world_size if numa else 0,
+        "_numa_lm_head_tp_world_size": world_size if (numa and lm_head) else 0,
     }
 
 
@@ -244,8 +246,9 @@ def _run_path(
     world_size: int,
     warmup: int,
     iters: int,
+    lm_head: bool = False,
 ) -> tuple[TimingSummary, torch.Tensor]:
-    with inductor_config.patch(_flags(numa, world_size)):
+    with inductor_config.patch(_flags(numa, world_size, lm_head=lm_head)):
         compiled = _compile(model, numa=numa, world_size=world_size)
         # Run once to capture output for the correctness check (also primes
         # the cache before timing). Counts toward warmup.
@@ -279,6 +282,15 @@ def _parse_args() -> argparse.Namespace:
         "--check-correctness",
         action="store_true",
         help="Compare standard vs NUMA-TP output before timing; exit non-zero on FAIL.",
+    )
+    p.add_argument(
+        "--tp-lm-head",
+        action="store_true",
+        help=(
+            "Also TP the LM head matmul (replicated weight, M-split output). "
+            "Increases per-socket memory by V*D*sizeof(dtype) but typically "
+            "needed to break past the LM-head latency floor in GPT-style models."
+        ),
     )
     p.add_argument("--atol", type=float, default=1e-3)
     p.add_argument("--rtol", type=float, default=1e-3)
@@ -333,11 +345,15 @@ def main() -> int:
         warmup=args.warmup, iters=args.iters,
     )
 
-    print("Running NUMA-TP ...", file=sys.stderr, flush=True)
+    print(
+        f"Running NUMA-TP (tp_lm_head={args.tp_lm_head}) ...",
+        file=sys.stderr, flush=True,
+    )
     numa_timing, numa_out = _run_path(
         model, input_ids,
         numa=True, world_size=args.world_size,
         warmup=args.warmup, iters=args.iters,
+        lm_head=args.tp_lm_head,
     )
 
     if args.check_correctness:

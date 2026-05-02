@@ -609,6 +609,19 @@ _numa_layer_norm_tp_compute_shard: int = 0
 # Verbose stdout from numa_layer_norm_tp_pass.
 _numa_layer_norm_tp_debug: bool = False
 
+# LM-head (lone matmul) NUMA tensor-parallel pass: tags untagged
+# ``aten.mm`` / ``aten.addmm`` nodes (the LM head is the only such node
+# in a fully-TP-tagged GPT-2 prefill graph) with a shard plan that
+# replicates the weight across sockets and M-splits the output. Useful
+# specifically for the GPT-2 LM head where the weight is large (V*D)
+# but column-parallel splitting requires a launcher change. With this
+# pass each socket holds a full clone of the weight (memory cost) and
+# computes its M-shard of logits in parallel.
+_numa_lm_head_tp: bool = False
+_numa_lm_head_tp_world_size: int = 0
+_numa_lm_head_tp_compute_shard: int = 0
+_numa_lm_head_tp_debug: bool = False
+
 
 def decide_compile_threads() -> int:
     """
