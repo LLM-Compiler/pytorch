@@ -102,7 +102,7 @@ model.set_batch_seq(B, S)
 for p in model.parameters():
     nn.init.normal_(p, std=0.02)
 
-x = torch.randn(B * S, H_IN)
+x = torch.randn(B, S, H_IN)
 
 with inductor_config.patch({
     "_numa_attention_tp": False,

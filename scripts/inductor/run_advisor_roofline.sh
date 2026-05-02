@@ -60,11 +60,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ADVISOR_HOME="/opt/intel/oneapi/advisor/2023.1.0"
+# All paths below are env-overrideable — defaults match the standard Ubuntu setup
+# (intel-oneapi-advisor apt package + Miniconda in $HOME/miniconda3).
+ADVISOR_HOME="${ADVISOR_HOME:-/opt/intel/oneapi/advisor/latest}"
 ADVISOR_BIN="${ADVISOR_HOME}/bin64/advixe-cl"
-CONDA_BASE="/home/shavin/miniconda3"
-CONDA_ENV="triton_cpu_integrated"
-PYTHON="${CONDA_BASE}/envs/${CONDA_ENV}/bin/python"
+CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-triton_cpu_integrated}"
+PYTHON="${PYTHON:-${CONDA_BASE}/envs/${CONDA_ENV}/bin/python}"
 
 PROJECT_ROOT="${SCRIPT_DIR}/advisor_projects"
 PROJ_STD="${PROJECT_ROOT}/standard"
@@ -92,6 +94,7 @@ echo "  /dev/cpu/0/msr      : ${MSR_OK}  (needed for hardware PMU collection)"
 
 echo "  Intel Advisor       : $("${ADVISOR_BIN}" --version 2>&1 | head -1)"
 echo "  Python              : ${PYTHON}"
+echo "  TP shards (NUMA)    : ${ADVISOR_BENCH_TP_SHARDS}"
 echo "  Bench scripts       : ${BENCH_STD}"
 echo "                        ${BENCH_NUMA}"
 echo ""
@@ -136,6 +139,17 @@ ADVISOR_PAUSE_FLAGS=(--start-paused)
 # split is honored.
 export ADVISOR_BENCH_WARMUP="${ADVISOR_BENCH_WARMUP:-2}"
 export ADVISOR_BENCH_ITERS="${ADVISOR_BENCH_ITERS:-20}"
+# NUMA TP world size — default to the host's NUMA node count if numactl is available,
+# otherwise fall back to 2.  Override with ADVISOR_BENCH_TP_SHARDS=<n>.
+if [[ -z "${ADVISOR_BENCH_TP_SHARDS:-}" ]]; then
+    if command -v numactl >/dev/null 2>&1; then
+        _detected_nodes=$(numactl --hardware 2>/dev/null | awk '/^available:/ {print $2}')
+        ADVISOR_BENCH_TP_SHARDS="${_detected_nodes:-2}"
+    else
+        ADVISOR_BENCH_TP_SHARDS=2
+    fi
+fi
+export ADVISOR_BENCH_TP_SHARDS
 export ADVISOR_HOME
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,7 +215,9 @@ echo ""
 echo "════════════════════════════════════════════════════════════"
 echo "  Collection finished for both modes."
 echo "  Next step: run  generate_advisor_reports.sh"
-echo "  Or open in GUI:"
+echo "  Or open in GUI (X11/RDP/VNC required):"
 echo "    ${ADVISOR_HOME}/bin64/advixe-gui ${PROJ_STD}"
 echo "    ${ADVISOR_HOME}/bin64/advixe-gui ${PROJ_NUMA}"
+echo "  (You can also export an HTML/CSV report on this headless box via"
+echo "   advixe-cl --report=roofline --project-dir=<proj> --report-output=<file>)"
 echo "════════════════════════════════════════════════════════════"

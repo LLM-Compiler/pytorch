@@ -175,7 +175,13 @@ def _exit_compile_debug(state: Dict[str, Any]) -> None:
 
 
 class TransformerLayer(nn.Module):
-    """Identical to the two ``simple_llm_*_torch_compile_demo.py`` blocks."""
+    """Identical to the two ``simple_llm_*_torch_compile_demo.py`` blocks.
+
+    **Input layout:** Prefer ``x`` shaped ``[B, S, H_in]``. A flattened ``[B*S, H_in]``
+    tensor does not determine ``B`` vs ``S`` uniquely (e.g. ``1024 == 1*1024 == 2*512``);
+    ``torch.compile`` can then disagree with ``set_batch_seq`` during shape propagation,
+    breaking attention matmuls. The benchmark passes 3D activations for that reason.
+    """
 
     def __init__(
         self,
@@ -212,20 +218,40 @@ class TransformerLayer(nn.Module):
         self._seq = seq
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, H, E = self._batch, self._seq, self.H, self.E
-        q = torch.addmm(self.bq, x, self.Wq).view(B, S, H, E).transpose(1, 2)
-        k = torch.addmm(self.bk, x, self.Wk).view(B, S, H, E).transpose(1, 2)
-        v = torch.addmm(self.bv, x, self.Wv).view(B, S, H, E).transpose(1, 2)
+        H, E = self.H, self.E
+        input_was_3d = x.dim() == 3
+        if input_was_3d:
+            B, S, Hin = x.shape
+            if Hin != self.H_in:
+                raise ValueError(
+                    f"expected hidden dim {self.H_in}, got {Hin} on channel-last axis"
+                )
+            x_flat = x.reshape(B * S, Hin)
+        else:
+            B, S = self._batch, self._seq
+            x_flat = x
+            if x_flat.shape != (B * S, self.H_in):
+                raise ValueError(
+                    f"expected x shape ({B * S}, {self.H_in}) for batch={B} seq={S}, "
+                    f"got {tuple(x_flat.shape)}"
+                )
+
+        q = torch.addmm(self.bq, x_flat, self.Wq).view(B, S, H, E).transpose(1, 2)
+        k = torch.addmm(self.bk, x_flat, self.Wk).view(B, S, H, E).transpose(1, 2)
+        v = torch.addmm(self.bv, x_flat, self.Wv).view(B, S, H, E).transpose(1, 2)
         with sdpa_kernel(SDPBackend.MATH):
             y = F.scaled_dot_product_attention(q, k, v)
         y = y.transpose(1, 2).contiguous().view(B * S, H * E)
         attn_out = torch.addmm(self.bo, y, self.Wo)
-        h = attn_out + x
+        h = attn_out + x_flat
 
         u = torch.addmm(self.mlp_fc1_b, h, self.mlp_fc1_w)
         u = F.gelu(u)
         mlp_out = torch.addmm(self.mlp_fc2_b, u, self.mlp_fc2_w)
-        return mlp_out + h
+        out = mlp_out + h
+        if input_was_3d:
+            return out.view(B, S, self.H_in)
+        return out
 
 
 class SimpleLmStack(nn.Module):
@@ -475,7 +501,7 @@ def run_one_mode(
         for p in model.parameters():
             nn.init.normal_(p, std=0.02)
 
-        x = torch.randn(B * S, h_in, device=device)
+        x = torch.randn(B, S, h_in, device=device)
         y = x  # sink
 
         if mode == "standard":

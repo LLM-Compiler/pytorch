@@ -309,6 +309,72 @@ def _collect_chain_and_out_linear(
 # ---------------------------------------------------------------------------
 # Shape refresh
 # ---------------------------------------------------------------------------
+def _effective_head_tuple(
+    shape: List[Any],
+    *,
+    num_heads: int,
+    head_dim: int,
+    h_qkv: int,
+) -> Tuple[int, int]:
+    """Resolve (num_heads, head_dim) for BSHE layout checks.
+
+    When the FX graph hides the pre-SDPA 4D reshape, ``num_heads``/``head_dim``
+    may be (0, 0). If ``shape`` looks like ``(B, S, H, E)`` with ``H*E == H_qkv``,
+    infer ``H, E`` from the last two dims so we never shrink **S** when
+    ``S == H_qkv`` (e.g. seq 1024 with 4×256 heads).
+    """
+    if num_heads > 0 and head_dim > 0:
+        return num_heads, head_dim
+    if (
+        len(shape) == 4
+        and isinstance(shape[2], int)
+        and isinstance(shape[3], int)
+        and shape[2] > 0
+        and shape[3] > 0
+        and shape[2] * shape[3] == h_qkv
+    ):
+        return shape[2], shape[3]
+    return 0, 0
+
+
+def _is_bshe(
+    shape: List[Any],
+    *,
+    num_heads: int,
+    head_dim: int,
+    h_qkv: int,
+) -> bool:
+    nh, hd = _effective_head_tuple(
+        shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
+    )
+    if nh <= 0 or hd <= 0:
+        return False
+    return (
+        len(shape) == 4
+        and isinstance(shape[2], int)
+        and isinstance(shape[3], int)
+        and shape[2] == nh
+        and shape[3] == hd
+    )
+
+
+def _is_two_d_token_feature_row(
+    shape: List[Any],
+    *,
+    h_qkv: int,
+) -> bool:
+    """``(B*S, H_qkv)`` activations use dim 0 for tokens and dim 1 for features.
+
+    When ``B*S == H_qkv`` (e.g. one token per channel width), both dims numerically
+    equal ``h_qkv``; only dim 1 must be column-sharded for QKV/Wo views.
+    """
+    return (
+        len(shape) == 2
+        and isinstance(shape[1], int)
+        and shape[1] == h_qkv
+    )
+
+
 def _try_update_shape_param(
     node: torch.fx.Node,
     *,
@@ -317,6 +383,7 @@ def _try_update_shape_param(
     h_qkv: int,
     shard_d: int,
     world_size: int,
+    head_dim: int = 0,
 ) -> None:
     """For view/reshape/_unsafe_view/expand nodes with an explicit integer
     shape argument, rewrite the shape so that the (single) dim that's sharded
@@ -407,20 +474,31 @@ def _try_update_shape_param(
     if is_shape_producer:
         # Try literal replacements; do NOT require numel-shrink ratio match
         # (the producer outputs whatever shape we give it).
-        if num_heads and shard_heads:
+        nh_eff, hd_eff = _effective_head_tuple(
+            old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
+        )
+        if nh_eff and shard_heads:
             for i, d in enumerate(old_shape):
-                if d == num_heads:
-                    trial = list(old_shape)
-                    trial[i] = shard_heads
-                    _rewrite(trial)
-                    return
+                if d != nh_eff:
+                    continue
+                if _is_bshe(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv) and i != 2:
+                    continue
+                trial = list(old_shape)
+                trial[i] = shard_heads
+                _rewrite(trial)
+                return
         if h_qkv and shard_d:
             for i, d in enumerate(old_shape):
-                if d == h_qkv:
-                    trial = list(old_shape)
-                    trial[i] = shard_d
-                    _rewrite(trial)
-                    return
+                if d != h_qkv:
+                    continue
+                if _is_two_d_token_feature_row(old_shape, h_qkv=h_qkv) and i != 1:
+                    continue
+                if _is_bshe(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv) and i == 1:
+                    continue
+                trial = list(old_shape)
+                trial[i] = shard_d
+                _rewrite(trial)
+                return
         return
 
     if old_numel == new_input_numel:
@@ -439,28 +517,49 @@ def _try_update_shape_param(
             numel *= d
         return trial if numel == new_input_numel else None
 
-    # Prefer replacing num_heads (in any dim containing that literal).
-    if num_heads and shard_heads:
-        for i, d in enumerate(old_shape):
-            if d == num_heads:
-                trial = _try_replace(i, shard_heads)
-                if trial is not None:
-                    _rewrite(trial)
-                    return
+    nh_eff, _hd_eff = _effective_head_tuple(
+        old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
+    )
+    bshe = _is_bshe(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv)
 
-    # Then try H_qkv -> shard_d.
+    # Prefer replacing num_heads (in any dim containing that literal).
+    if nh_eff and shard_heads:
+        for i, d in enumerate(old_shape):
+            if d != nh_eff:
+                continue
+            if bshe and i != 2:
+                continue
+            trial = _try_replace(i, shard_heads)
+            if trial is not None:
+                _rewrite(trial)
+                return
+
+    # Then try H_qkv -> shard_d (never axis ``S`` in ``(B,S,H,E)`` when S == H_qkv;
+    # never dim 0 of ``(B*S, H_qkv)`` when B*S == H_qkv).
     if h_qkv and shard_d:
         for i, d in enumerate(old_shape):
-            if d == h_qkv:
-                trial = _try_replace(i, shard_d)
-                if trial is not None:
-                    _rewrite(trial)
-                    return
+            if d != h_qkv:
+                continue
+            if _is_two_d_token_feature_row(old_shape, h_qkv=h_qkv) and i != 1:
+                continue
+            if bshe and i == 1:
+                continue
+            trial = _try_replace(i, shard_d)
+            if trial is not None:
+                _rewrite(trial)
+                return
 
     # Then try B*H-style dims: any dim exactly divisible by world_size whose
     # quotient makes the numel match.
     for i, d in enumerate(old_shape):
         if d % world_size != 0:
+            continue
+        if bshe and i == 1:
+            continue
+        if (
+            _is_two_d_token_feature_row(old_shape, h_qkv=h_qkv)
+            and i == 0
+        ):
             continue
         trial = _try_replace(i, d // world_size)
         if trial is not None:
@@ -476,6 +575,7 @@ def _shrink_shape(
     h_qkv: int,
     shard_d: int,
     world_size: int,
+    head_dim: int = 0,
 ) -> Tuple[Any, ...]:
     """Shrink any dim that matches ``num_heads``/``h_qkv`` to its sharded
     equivalent. A single occurrence of ``num_heads`` (resp. ``h_qkv``) is
@@ -483,22 +583,43 @@ def _shrink_shape(
     all are replaced — this is acceptable since the attention chain is
     expected to mention the head axis no more than once per tensor.
     """
+    shape_list = list(shape)
+    nh_eff, _hd_eff = _effective_head_tuple(
+        shape_list, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
+    )
+    bshe = _is_bshe(shape_list, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv)
     new_shape: List[Any] = []
-    for d in shape:
+    for i, d in enumerate(shape):
         if isinstance(d, int):
-            if num_heads and d == num_heads:
+            if nh_eff and d == nh_eff:
+                if bshe and i != 2:
+                    new_shape.append(d)
+                    continue
                 new_shape.append(shard_heads)
                 continue
             if h_qkv and d == h_qkv:
+                if len(shape) == 2 and i != 1:
+                    new_shape.append(d)
+                    continue
+                if bshe and i == 1:
+                    new_shape.append(d)
+                    continue
                 new_shape.append(shard_d)
                 continue
             if (
                 world_size
                 and d > 0
                 and d % world_size == 0
-                and num_heads
+                and nh_eff
+                and not (bshe and i == 1)
+                and not (
+                    len(shape) == 2
+                    and i == 0
+                    and isinstance(shape[1], int)
+                    and shape[1] == h_qkv
+                )
                 and (d // world_size) * world_size == d
-                and d == num_heads * max(1, d // max(1, num_heads))
+                and d == nh_eff * max(1, d // max(1, nh_eff))
             ):
                 # B*num_heads-style dim
                 new_shape.append(d // world_size)
@@ -909,6 +1030,7 @@ def numa_attention_tp_pass(graph: torch.fx.Graph) -> None:
                 "h_qkv": h_qkv,
                 "shard_d": shard_d,
                 "world_size": world_size,
+                "head_dim": head_dim or 0,
             }
             _refresh_chain_vals_via_fake_tensor(
                 topo_chain, shape_rewrite_kwargs=shape_rewrite_kwargs
