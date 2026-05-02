@@ -497,6 +497,7 @@ def run_one_mode(
         model = SimpleLmStack(
             num_layers, num_heads, head_dim, h_in, mlp_hidden,
         ).to(device)
+        model.eval()
         model.set_batch_seq(B, S)
         for p in model.parameters():
             nn.init.normal_(p, std=0.02)
@@ -529,7 +530,7 @@ def run_one_mode(
                 }
             )
 
-        with ctx:
+        with ctx, torch.no_grad():
             # Clear all Dynamo compile caches so each mode gets a fresh
             # compilation. Without this, the standard-mode cached graph is
             # served as a cache hit for the numa_tp run — the inductor passes
