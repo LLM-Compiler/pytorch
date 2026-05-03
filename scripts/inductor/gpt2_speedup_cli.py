@@ -144,7 +144,6 @@ class GPT2_117M(torch.nn.Module):
             for _ in range(num_layers)
         )
         self.final_ln = torch.nn.LayerNorm(d_model)
-        # LM head with tied weights to the token embedding (no bias).
         self._init_weights(num_residual_layers=2 * num_layers)
 
     def _init_weights(self, num_residual_layers: int) -> None:
@@ -174,9 +173,7 @@ class GPT2_117M(torch.nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = self.final_ln(x)
-        # LM head: tied to token embedding -> matmul with embedding.weight.T.
-        logits = F.linear(x, self.token_embedding.weight)
-        return logits
+        return x
 
 
 # ---------------------------------------------------------------------------
