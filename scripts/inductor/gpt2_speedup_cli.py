@@ -40,12 +40,14 @@ from __future__ import annotations
 
 import argparse
 import glob
+import logging
 import math
 import os
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from typing import Any, Dict
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +55,8 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from torch._inductor import config as inductor_config
 
+inductor_config.max_autotune_gemm_backends = "TRITON"
+#inductor_config.max_autotune = True
 
 # GPT-2 117M default hyperparameters.
 DEF_VOCAB = 50257
@@ -191,6 +195,60 @@ def _enable_numa() -> None:
     )
 
 
+def _dynamo_clear_debug_dir_cache() -> None:
+    try:
+        from torch._dynamo.utils import _get_debug_dir
+
+        c = getattr(_get_debug_dir, "cache_clear", None)
+        if c is not None:
+            c()
+    except Exception:
+        pass
+
+
+def _enter_compile_debug(staging_dir: str) -> Dict[str, Any]:
+    from torch._dynamo import config as dynamo_config
+
+    artifact_staging = os.path.abspath(staging_dir)
+    os.makedirs(artifact_staging, exist_ok=True)
+
+    dynamo_logger = logging.getLogger("torch._dynamo")
+    state: Dict[str, Any] = {
+        "prev_tcd": os.environ.get("TORCH_COMPILE_DEBUG"),
+        "prev_tcdir": os.environ.get("TORCH_COMPILE_DEBUG_DIR"),
+        "prev_dynamo_debug_root": dynamo_config.debug_dir_root,
+        "prev_dynamo_log_level": dynamo_logger.level,
+        "prev_trace_enabled": inductor_config.trace.enabled,
+        "artifact_staging": artifact_staging,
+    }
+    os.environ["TORCH_COMPILE_DEBUG"] = "1"
+    os.environ["TORCH_COMPILE_DEBUG_DIR"] = artifact_staging
+    dynamo_config.debug_dir_root = dynamo_config.default_debug_dir_root()
+    dynamo_logger.setLevel(logging.DEBUG)
+    inductor_config.trace.enabled = True
+    _dynamo_clear_debug_dir_cache()
+    return state
+
+
+def _exit_compile_debug(state: Dict[str, Any]) -> None:
+    from torch._dynamo import config as dynamo_config
+
+    p = state["prev_tcd"]
+    if p is None:
+        os.environ.pop("TORCH_COMPILE_DEBUG", None)
+    else:
+        os.environ["TORCH_COMPILE_DEBUG"] = p
+    p2 = state["prev_tcdir"]
+    if p2 is None:
+        os.environ.pop("TORCH_COMPILE_DEBUG_DIR", None)
+    else:
+        os.environ["TORCH_COMPILE_DEBUG_DIR"] = p2
+    dynamo_config.debug_dir_root = state["prev_dynamo_debug_root"]
+    inductor_config.trace.enabled = state["prev_trace_enabled"]
+    logging.getLogger("torch._dynamo").setLevel(state["prev_dynamo_log_level"])
+    _dynamo_clear_debug_dir_cache()
+
+
 def _flags(
     numa: bool, world_size: int, *, lm_head: bool = False, max_autotune: bool = False
 ) -> dict:
@@ -205,12 +263,12 @@ def _flags(
         "_numa_mlp_tp_world_size": world_size if numa else 0,
         "_numa_lm_head_tp_world_size": world_size if (numa and lm_head) else 0,
     }
-    if max_autotune:
-        base.update({
-            "max_autotune": True,
-            "max_autotune_gemm": True,
-            "max_autotune_pointwise": False,
-        })
+    # if max_autotune:
+    #     base.update({
+    #         "max_autotune": True,
+    #         "max_autotune_gemm": True,
+    #         "max_autotune_pointwise": False,
+    #     })
     return base
 
 
@@ -337,30 +395,46 @@ def _run_path(
     lm_head: bool = False,
     profile: bool = False,
     max_autotune: bool = False,
+    compile_debug: bool = False,
+    compile_debug_staging: str | None = None,
 ) -> tuple[TimingSummary, torch.Tensor, dict]:
     info: dict = {}
     cache_dir = tempfile.mkdtemp(prefix="gpt2_speedup_inductor_cache_")
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
     compile_started = time.time()
-    # Reset dynamo+inductor so the patched flags take effect on this compile
-    # rather than a previously cached graph.
-    torch._dynamo.reset()
-    with inductor_config.patch(
-        _flags(numa, world_size, lm_head=lm_head, max_autotune=max_autotune)
-    ):
-        compiled = _compile(model, numa=numa, world_size=world_size)
-        # Run once to capture output for the correctness check (also primes
-        # the cache before timing). Counts toward warmup.
-        with torch.no_grad():
-            ref_out = compiled(input_ids).detach().clone()
-        info.update(_scan_output_code(cache_dir, since=compile_started))
-        info["cache_dir"] = cache_dir
-        remaining_warmup = max(0, warmup - 1)
-        timing = _time_forward(
-            compiled, input_ids, warmup=remaining_warmup, iters=iters
-        )
-        if profile:
-            info["prof"] = _profile_forward(compiled, input_ids, iters=min(iters, 10))
+    if compile_debug:
+        if not compile_debug_staging:
+            raise RuntimeError(
+                "compile_debug_staging is required when compile_debug is True"
+            )
+        cdbg_state = _enter_compile_debug(compile_debug_staging)
+    else:
+        cdbg_state = None
+    try:
+        # Reset dynamo+inductor so the patched flags take effect on this compile
+        # rather than a previously cached graph.
+        torch._dynamo.reset()
+        with inductor_config.patch(
+            _flags(numa, world_size, lm_head=lm_head, max_autotune=max_autotune)
+        ):
+            compiled = _compile(model, numa=numa, world_size=world_size)
+            # Run once to capture output for the correctness check (also primes
+            # the cache before timing). Counts toward warmup.
+            with torch.no_grad():
+                ref_out = compiled(input_ids).detach().clone()
+            info.update(_scan_output_code(cache_dir, since=compile_started))
+            info["cache_dir"] = cache_dir
+            remaining_warmup = max(0, warmup - 1)
+            timing = _time_forward(
+                compiled, input_ids, warmup=remaining_warmup, iters=iters
+            )
+            if profile:
+                info["prof"] = _profile_forward(
+                    compiled, input_ids, iters=min(iters, 10)
+                )
+    finally:
+        if cdbg_state is not None:
+            _exit_compile_debug(cdbg_state)
     return timing, ref_out, info
 
 
@@ -416,6 +490,24 @@ def _parse_args() -> argparse.Namespace:
             "output_code.py to verify NUMA-TP tagging actually fired."
         ),
     )
+    p.add_argument(
+        "--compile-debug",
+        action="store_true",
+        help=(
+            "Set TORCH_COMPILE_DEBUG=1 for both standard and NUMA-TP compiles, "
+            "with separate staging dirs under --compile-debug-root (artifacts "
+            "under <staging>/torch_compile_debug/run_*)."
+        ),
+    )
+    p.add_argument(
+        "--compile-debug-root",
+        type=str,
+        default=None,
+        help=(
+            "Base directory for compile debug staging; subfolders standard/ and "
+            "numa_tp/ are created. Default: <cwd>/gpt2_speedup_torch_compile_debug"
+        ),
+    )
     return p.parse_args()
 
 
@@ -460,6 +552,25 @@ def main() -> int:
         file=sys.stderr,
     )
 
+    compile_debug_root: str | None = None
+    std_staging: str | None = None
+    numa_staging: str | None = None
+    if args.compile_debug:
+        compile_debug_root = os.path.abspath(
+            args.compile_debug_root
+            or os.path.join(os.getcwd(), "gpt2_speedup_torch_compile_debug")
+        )
+        os.makedirs(compile_debug_root, exist_ok=True)
+        std_staging = os.path.join(compile_debug_root, "standard")
+        numa_staging = os.path.join(compile_debug_root, "numa_tp")
+        print(
+            "TORCH_COMPILE_DEBUG=1 for both paths; artifacts under "
+            "<staging>/torch_compile_debug/run_*",
+            file=sys.stderr,
+        )
+        print(f"  standard staging: {std_staging}", file=sys.stderr)
+        print(f"  numa_tp staging:  {numa_staging}", file=sys.stderr)
+
     print("Running standard ...", file=sys.stderr, flush=True)
     std_timing, std_out, std_info = _run_path(
         model, input_ids,
@@ -467,6 +578,8 @@ def main() -> int:
         warmup=args.warmup, iters=args.iters,
         profile=args.profile,
         max_autotune=args.max_autotune,
+        compile_debug=args.compile_debug,
+        compile_debug_staging=std_staging,
     )
 
     print(
@@ -479,6 +592,8 @@ def main() -> int:
         warmup=args.warmup, iters=args.iters,
         lm_head=args.tp_lm_head,
         profile=args.profile,
+        compile_debug=args.compile_debug,
+        compile_debug_staging=numa_staging,
     )
 
     if args.check_correctness:
