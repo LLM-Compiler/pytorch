@@ -37,7 +37,7 @@ others (reuse of wrapper's row-parallel bias policy).
 from __future__ import annotations
 
 import itertools
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -68,6 +68,20 @@ _VIEW_TARGETS: Set[Any] = {
 # AND whose output numel must equal that shape's product (or whose output
 # shape must match that list for broadcasting, e.g. ``expand``).
 _SHAPE_PARAM_TARGETS: Set[Any] = _VIEW_TARGETS | {aten.expand.default}
+
+# ``view`` / ``reshape`` / ``expand`` may carry literal ``num_heads`` while Q/K/V
+# activations are column-sharded. Their output/input numel ratio is often **not**
+# ``world_size`` (e.g. ``expand`` uses ``S / E``; post-``bmm`` reshape may see
+# ratio ``world_size ** 2``), so ``_try_update_shape_param`` applies literal head
+# shrinking before the ratio gate below for these ops only.
+_LITERAL_HEAD_SHAPE_OPS_WITHOUT_RATIO_GATE = frozenset(
+    {
+        aten.expand.default,
+        aten.view.default,
+        aten._unsafe_view.default,
+        aten.reshape.default,
+    }
+)
 
 # Nodes that PRODUCE a tensor from a constant shape list (no tensor input).
 # These often arise from ``zeros_like``/``ones_like`` decompositions and must
@@ -358,6 +372,33 @@ def _is_bshe(
     )
 
 
+def _is_bhse(
+    shape: List[Any],
+    *,
+    num_heads: int,
+    head_dim: int,
+    h_qkv: int,
+) -> bool:
+    """``(B, H, S, E)`` layout after ``transpose`` from ``(B, S, H, E)``.
+
+    When ``S == H_qkv`` (possible iff ``S == num_heads * head_dim``), axis ``S``
+    matches ``h_qkv`` numerically but must not be column-sharded like QKV width.
+    """
+    nh, hd = _effective_head_tuple(
+        shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
+    )
+    if nh <= 0 or hd <= 0:
+        return False
+    return (
+        len(shape) == 4
+        and isinstance(shape[1], int)
+        and isinstance(shape[2], int)
+        and isinstance(shape[3], int)
+        and shape[1] == nh
+        and shape[3] == hd
+    )
+
+
 def _is_two_d_token_feature_row(
     shape: List[Any],
     *,
@@ -375,6 +416,38 @@ def _is_two_d_token_feature_row(
     )
 
 
+def _skip_h_qkv_for_attn_square_axes(shape: List[Any], axis_idx: int) -> bool:
+    """True if ``axis_idx`` is a trailing sequence × sequence axis pair.
+
+    SDPA math decomposition uses ``[..., S, S]`` layouts for scores / softmax /
+    probs. When ``S`` equals ``H_qkv`` (e.g. GPT-2 Medium width 1024 at seq 1024),
+    those axes numerically match the QKV feature width but must not be rewritten
+    to ``shard_d`` — doing so halves the wrong dimensions and breaks reshapes.
+    """
+    n = len(shape)
+    if n < 3:
+        return False
+    s0, s1 = shape[-2], shape[-1]
+    if (
+        not isinstance(s0, int)
+        or not isinstance(s1, int)
+        or s0 <= 0
+        or s0 != s1
+    ):
+        return False
+    return axis_idx >= n - 2
+
+
+def _skip_h_qkv_replace_rank3(shape: Sequence[Any]) -> bool:
+    """Avoid ``h_qkv → shard_d`` on rank-3 activation tensors.
+
+    SDPA math views become ``[BH, ?, ?]``; when ``S == H_qkv``, a sequence axis can
+    equal ``h_qkv`` without being the QKV feature dimension (column-sharding axis
+    is always dim 1 of rank-2 ``(B*S, H_qkv)`` tensors).
+    """
+    return len(shape) == 3
+
+
 def _try_update_shape_param(
     node: torch.fx.Node,
     *,
@@ -389,6 +462,9 @@ def _try_update_shape_param(
     shape argument, rewrite the shape so that the (single) dim that's sharded
     is narrowed appropriately:
 
+    - ``expand`` / ``view`` / ``reshape`` / ``_unsafe_view``: shrink literal
+      ``num_heads`` before ratio checks — broadcast / reshape shapes often have
+      output/input ratios like ``S / head_dim`` or ``world_size ** 2``.
     - If a dim equals ``num_heads``, replace with ``shard_heads``.
     - Else if a dim equals ``h_qkv``, replace with ``shard_d``.
     - Else if exactly one dim is divisible by ``world_size`` and rewriting it
@@ -471,6 +547,36 @@ def _try_update_shape_param(
             return
         old_numel *= d
 
+    # ``view`` / ``reshape`` / ``expand`` targets often retain literal ``num_heads``
+    # while activations are column-sharded; output/input ratio vs tensor input may
+    # not be ``world_size`` (see ``_LITERAL_HEAD_SHAPE_OPS_WITHOUT_RATIO_GATE``).
+    if (
+        not is_shape_producer
+        and node.target in _LITERAL_HEAD_SHAPE_OPS_WITHOUT_RATIO_GATE
+        and shard_heads
+    ):
+        nh_lit, _hd_lit = _effective_head_tuple(
+            old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
+        )
+        if nh_lit:
+            bshe_lit = _is_bshe(
+                old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
+            )
+            bhse_lit = _is_bhse(
+                old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
+            )
+            for i, d in enumerate(old_shape):
+                if d != nh_lit:
+                    continue
+                if bshe_lit and i != 2:
+                    continue
+                if bhse_lit and i != 1:
+                    continue
+                trial = list(old_shape)
+                trial[i] = shard_heads
+                _rewrite(trial)
+                return
+
     if is_shape_producer:
         # Try literal replacements; do NOT require numel-shrink ratio match
         # (the producer outputs whatever shape we give it).
@@ -483,17 +589,23 @@ def _try_update_shape_param(
                     continue
                 if _is_bshe(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv) and i != 2:
                     continue
+                if _is_bhse(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv) and i != 1:
+                    continue
                 trial = list(old_shape)
                 trial[i] = shard_heads
                 _rewrite(trial)
                 return
-        if h_qkv and shard_d:
+        if h_qkv and shard_d and not _skip_h_qkv_replace_rank3(old_shape):
             for i, d in enumerate(old_shape):
                 if d != h_qkv:
                     continue
                 if _is_two_d_token_feature_row(old_shape, h_qkv=h_qkv) and i != 1:
                     continue
                 if _is_bshe(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv) and i == 1:
+                    continue
+                if _is_bhse(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv) and i == 2:
+                    continue
+                if _skip_h_qkv_for_attn_square_axes(old_shape, i):
                     continue
                 trial = list(old_shape)
                 trial[i] = shard_d
@@ -521,6 +633,7 @@ def _try_update_shape_param(
         old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
     )
     bshe = _is_bshe(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv)
+    bhse = _is_bhse(old_shape, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv)
 
     # Prefer replacing num_heads (in any dim containing that literal).
     if nh_eff and shard_heads:
@@ -529,6 +642,8 @@ def _try_update_shape_param(
                 continue
             if bshe and i != 2:
                 continue
+            if bhse and i != 1:
+                continue
             trial = _try_replace(i, shard_heads)
             if trial is not None:
                 _rewrite(trial)
@@ -536,13 +651,17 @@ def _try_update_shape_param(
 
     # Then try H_qkv -> shard_d (never axis ``S`` in ``(B,S,H,E)`` when S == H_qkv;
     # never dim 0 of ``(B*S, H_qkv)`` when B*S == H_qkv).
-    if h_qkv and shard_d:
+    if h_qkv and shard_d and not _skip_h_qkv_replace_rank3(old_shape):
         for i, d in enumerate(old_shape):
             if d != h_qkv:
                 continue
             if _is_two_d_token_feature_row(old_shape, h_qkv=h_qkv) and i != 1:
                 continue
             if bshe and i == 1:
+                continue
+            if bhse and i == 2:
+                continue
+            if _skip_h_qkv_for_attn_square_axes(old_shape, i):
                 continue
             trial = _try_replace(i, shard_d)
             if trial is not None:
@@ -555,6 +674,8 @@ def _try_update_shape_param(
         if d % world_size != 0:
             continue
         if bshe and i == 1:
+            continue
+        if bhse and i == 2:
             continue
         if (
             _is_two_d_token_feature_row(old_shape, h_qkv=h_qkv)
@@ -588,6 +709,7 @@ def _shrink_shape(
         shape_list, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv
     )
     bshe = _is_bshe(shape_list, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv)
+    bhse = _is_bhse(shape_list, num_heads=num_heads, head_dim=head_dim, h_qkv=h_qkv)
     new_shape: List[Any] = []
     for i, d in enumerate(shape):
         if isinstance(d, int):
@@ -595,13 +717,25 @@ def _shrink_shape(
                 if bshe and i != 2:
                     new_shape.append(d)
                     continue
+                if bhse and i != 1:
+                    new_shape.append(d)
+                    continue
                 new_shape.append(shard_heads)
                 continue
             if h_qkv and d == h_qkv:
+                if _skip_h_qkv_replace_rank3(shape_list):
+                    new_shape.append(d)
+                    continue
                 if len(shape) == 2 and i != 1:
                     new_shape.append(d)
                     continue
                 if bshe and i == 1:
+                    new_shape.append(d)
+                    continue
+                if bhse and i == 2:
+                    new_shape.append(d)
+                    continue
+                if _skip_h_qkv_for_attn_square_axes(shape_list, i):
                     new_shape.append(d)
                     continue
                 new_shape.append(shard_d)
@@ -612,6 +746,7 @@ def _shrink_shape(
                 and d % world_size == 0
                 and nh_eff
                 and not (bshe and i == 1)
+                and not (bhse and i == 2)
                 and not (
                     len(shape) == 2
                     and i == 0
@@ -727,7 +862,27 @@ def _refresh_chain_vals_via_fake_tensor(
 def _topo_sorted_subset(
     graph: torch.fx.Graph, subset: Set[torch.fx.Node]
 ) -> List[torch.fx.Node]:
-    return [n for n in graph.nodes if n in subset]
+    """Return ``subset`` nodes in topological order (inputs before users).
+
+    ``torch.fx.Graph.nodes`` iteration order follows tracing but is **not**
+    guaranteed to be a valid execution order when filtering to ``subset``.
+    Shape refresh must walk producers before consumers so ``meta['val']`` is
+    current before ``expand`` / ``view`` rewrite runs.
+    """
+    order: List[torch.fx.Node] = []
+    visited: Set[torch.fx.Node] = set()
+
+    def _dfs(n: torch.fx.Node) -> None:
+        if n not in subset or n in visited:
+            return
+        for inp in n.all_input_nodes:
+            _dfs(inp)
+        visited.add(n)
+        order.append(n)
+
+    for node in graph.nodes:
+        _dfs(node)
+    return order
 
 
 # ---------------------------------------------------------------------------

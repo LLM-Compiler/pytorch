@@ -237,6 +237,58 @@ class TestNumaAttentionTpPass(TestCase):
                 rewritten += 1
         self.assertGreaterEqual(rewritten, 3, "Expected 3 (Q/K/V) pre-SDPA views rewritten")
 
+    def test_seq_len_equals_h_qkv_attention_square_axes(self):
+        """Regression when seq collides numerically with QKV wiring.
+
+        Covers two collisions seen on GPT-2–style models at ``S == d_model`` (e.g. 345M @ 1024):
+
+        * Trailing ``[..., S, S]`` score maps — handled via
+          ``_skip_h_qkv_for_attn_square_axes``.
+        * ``(B, H, S, E)`` activations after transpose when ``S == H * E == H_qkv``
+          (here ``64 == 4 * 16``) — axis ``S`` must not get ``shard_d``.
+        """
+        if not HAS_CPU:
+            self.skipTest("CPU-only test")
+
+        B, S, H_in, H, E = 2, 64, 128, 4, 16
+        assert H * E == S  # Sequence length collides numerically with H_qkv (like 345m @ 1024).
+        world_size = 2
+        args = _make_example_inputs(B, S, H_in, H, E)
+        H_qkv = H * E
+        shard_d = H_qkv // world_size
+        shard_heads = H // world_size
+        (x, Wq, Wk, Wv, bq, bk, bv, Wo, bo) = args
+
+        Wq0 = Wq[:, :shard_d]
+        Wk0 = Wk[:, :shard_d]
+        Wv0 = Wv[:, :shard_d]
+        bq0 = bq[:shard_d]
+        bk0 = bk[:shard_d]
+        bv0 = bv[:shard_d]
+        Wo0 = Wo[:shard_d, :]
+
+        q0 = torch.addmm(bq0, x, Wq0).view(B, S, shard_heads, E).transpose(1, 2)
+        k0 = torch.addmm(bk0, x, Wk0).view(B, S, shard_heads, E).transpose(1, 2)
+        v0 = torch.addmm(bv0, x, Wv0).view(B, S, shard_heads, E).transpose(1, 2)
+        scale = 1.0 / math.sqrt(E)
+        scores0 = torch.matmul(q0 * scale, k0.transpose(-2, -1))
+        attn0 = torch.softmax(scores0, dim=-1)
+        y0 = (
+            torch.matmul(attn0, v0)
+            .transpose(1, 2)
+            .contiguous()
+            .view(B * S, shard_heads * E)
+        )
+        expected = torch.addmm(bo, y0, Wo0)
+
+        gm = self._trace(_attn_fn_factory(B, S, H, E), args)
+        with config.patch({"_numa_attention_tp_world_size": world_size}):
+            numa_attention_tp_pass(gm.graph)
+        gm.recompile()
+
+        out = gm(*args)
+        torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
 
 if __name__ == "__main__":
     if HAS_CPU:
