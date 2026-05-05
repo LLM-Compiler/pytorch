@@ -20,6 +20,15 @@ Presets (``bert_multi_size_speedup_cli.py``):
 ``sweep_manifest.jsonl`` rows match the GPT-2 sweep format; pass
 ``--omit-per-iter-latencies`` to drop ``latencies_ms``.
 
+After **both** standard and NUMA-TP runs succeed for a given
+(model, batch, sequence) configuration, the script appends one row to
+``speedup_by_config.csv`` under ``--result-dir`` (unless disabled). Columns
+are ``batch``, ``seq_length``, ``speedup`` (mean_standard_ms /
+mean_numa_ms), ``mean_standard_ms``, ``mean_numa_ms``. If more than one
+``--models`` entry is swept, a leading ``model`` column is added so rows
+stay unique. The file is truncated at the start of each sweep; rows are
+flushed after each config.
+
 Default iteration space::
 
     models:     base, large
@@ -42,6 +51,7 @@ See ``torch_compile_debug_runs/README.txt`` under the result dir.
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 import json
 import os
@@ -74,6 +84,18 @@ _run_path = _bert._run_path
 
 _TORCH_DEBUG_RUNS_ROOT = "torch_compile_debug_runs"
 _MANIFEST_NAME = "sweep_manifest.jsonl"
+_SPEEDUP_CSV_NAME = "speedup_by_config.csv"
+
+
+def _speedup_csv_header(include_model: bool) -> List[str]:
+    base = [
+        "batch",
+        "seq_length",
+        "speedup",
+        "mean_standard_ms",
+        "mean_numa_ms",
+    ]
+    return (["model"] + base) if include_model else base
 
 _TORCH_DEBUG_RUNS_README = """# Per-configuration Torch compile debug (BERT multi-size sweep)
 # Each subfolder name encodes: M<model>_B<batch>_S<seq>_<standard|numa_tp>
@@ -106,6 +128,46 @@ def _append_manifest(result_dir: str, record: Dict[str, Any]) -> None:
     path = os.path.join(result_dir, _MANIFEST_NAME)
     with open(path, "a") as fh:
         fh.write(json.dumps(record, default=str) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _init_speedup_csv(path: str, *, include_model: bool) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(_speedup_csv_header(include_model))
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _append_speedup_csv(
+    path: str,
+    *,
+    include_model: bool,
+    model_key: str,
+    batch: int,
+    seq_length: int,
+    mean_standard_ms: float,
+    mean_numa_ms: float,
+) -> None:
+    if mean_numa_ms <= 0.0:
+        raise ValueError("mean_numa_ms must be positive for speedup")
+    speedup = mean_standard_ms / mean_numa_ms
+    row: List[Any] = [
+        batch,
+        seq_length,
+        speedup,
+        mean_standard_ms,
+        mean_numa_ms,
+    ]
+    if include_model:
+        row = [model_key] + row
+    with open(path, "a", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(row)
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -235,6 +297,21 @@ def _parse_args() -> argparse.Namespace:
             "(faster; use when only timing / crash reproduction matters)."
         ),
     )
+    p.add_argument(
+        "--speedup-csv",
+        type=str,
+        default=None,
+        help=(
+            "Path for incremental speedup CSV (default: "
+            f"<result-dir>/{_SPEEDUP_CSV_NAME}). "
+            "Appends one row per (model, B, S) after both standard and NUMA-TP succeed."
+        ),
+    )
+    p.add_argument(
+        "--no-speedup-csv",
+        action="store_true",
+        help="Do not write speedup_by_config.csv (or --speedup-csv).",
+    )
     return p.parse_args()
 
 
@@ -264,6 +341,8 @@ def main() -> int:
         )
         return 2
 
+    speedup_csv_include_model = len(args.models) > 1
+
     manifest_path = os.path.join(result_dir, _MANIFEST_NAME)
     with open(manifest_path, "w") as fh:
         fh.write(
@@ -283,12 +362,28 @@ def main() -> int:
                     ),
                     "batch_seq_pairs": batch_seq_pairs,
                     "world_size": args.world_size,
+                    "speedup_csv": (
+                        os.path.abspath(
+                            args.speedup_csv
+                            or os.path.join(result_dir, _SPEEDUP_CSV_NAME)
+                        )
+                        if not args.no_speedup_csv
+                        else None
+                    ),
+                    "speedup_csv_include_model_column": speedup_csv_include_model,
                 }
             )
             + "\n"
         )
         fh.flush()
         os.fsync(fh.fileno())
+
+    speedup_csv_path: str | None = None
+    if not args.no_speedup_csv:
+        speedup_csv_path = os.path.abspath(
+            args.speedup_csv or os.path.join(result_dir, _SPEEDUP_CSV_NAME)
+        )
+        _init_speedup_csv(speedup_csv_path, include_model=speedup_csv_include_model)
 
     _enable_numa()
     torch.manual_seed(args.seed)
@@ -362,6 +457,8 @@ def main() -> int:
                 0, args.vocab_size, (B, S), dtype=torch.long
             )
 
+            mean_standard_ms: float | None = None
+            mean_numa_ms: float | None = None
             for mode in modes:
                 numa = mode == "numa_tp"
                 rel = _per_config_relpath(model_key, B, S, mode)
@@ -387,6 +484,10 @@ def main() -> int:
                     )
                     elapsed = time.perf_counter() - t_cfg
                     ok += 1
+                    if mode == "standard":
+                        mean_standard_ms = timing.mean_ms
+                    elif mode == "numa_tp":
+                        mean_numa_ms = timing.mean_ms
                     row = {
                         "ok": True,
                         "model": model_key,
@@ -414,6 +515,10 @@ def main() -> int:
                     )
                 except Exception as e:
                     fail += 1
+                    if mode == "standard":
+                        mean_standard_ms = None
+                    elif mode == "numa_tp":
+                        mean_numa_ms = None
                     print(f"  FAIL {e}", file=sys.stderr, flush=True)
                     _append_manifest(
                         result_dir,
@@ -428,13 +533,47 @@ def main() -> int:
                         },
                     )
 
+            if (
+                speedup_csv_path is not None
+                and "standard" in modes
+                and "numa_tp" in modes
+                and mean_standard_ms is not None
+                and mean_numa_ms is not None
+                and mean_numa_ms > 0.0
+            ):
+                try:
+                    _append_speedup_csv(
+                        speedup_csv_path,
+                        include_model=speedup_csv_include_model,
+                        model_key=model_key,
+                        batch=B,
+                        seq_length=S,
+                        mean_standard_ms=mean_standard_ms,
+                        mean_numa_ms=mean_numa_ms,
+                    )
+                    sp = mean_standard_ms / mean_numa_ms
+                    print(
+                        f"  speedup_csv: {model_key} B={B} S={S} "
+                        f"speedup={sp:.4f} (standard/numa ms)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(
+                        f"  WARN speedup_csv append failed: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
     total_s = time.perf_counter() - t0_all
-    print(
+    tail = (
         f"Done. ok={ok} fail={fail} wall_s={total_s:.1f}\n"
         f"Manifest: {manifest_path}\n"
-        f"Debug trees: {os.path.join(result_dir, _TORCH_DEBUG_RUNS_ROOT, '')}",
-        file=sys.stderr,
+        f"Debug trees: {os.path.join(result_dir, _TORCH_DEBUG_RUNS_ROOT, '')}"
     )
+    if speedup_csv_path is not None:
+        tail += f"\nSpeedup CSV: {speedup_csv_path}"
+    print(tail, file=sys.stderr)
     return 0 if fail == 0 else 1
 
 
