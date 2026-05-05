@@ -32,14 +32,14 @@ omit batch 1.
 Example::
 
     python scripts/inductor/gpt2_multi_size_compile_debug_sweep.py \\
-        --result-dir ./my_gpt2_debug_artifacts --warmup 1 --iters 1
+        --result-dir ./my_gpt2_debug_artifacts
 
-Example (tiered caps, new folder — does not touch prior ``./gpt2_compile_debug_artifacts``)::
+Example (tiered caps, new folder — does not touch prior ``./gpt2_compile_debug_artifacts``;
+defaults: ``--warmup 5 --iters 50``)::
 
     python scripts/inductor/gpt2_multi_size_compile_debug_sweep.py \\
         --result-dir ./gpt2_compile_debug_artifacts_tiered_seq8192divB_bs2_4_8_w2 \\
-        --batch-sizes 2 4 8 --tiered-max-seq-by-batch --world-size 2 \\
-        --warmup 5 --iters 50
+        --batch-sizes 2 4 8 --tiered-max-seq-by-batch --world-size 2
 
 See ``torch_compile_debug_runs/README.txt`` under the result dir.
 """
@@ -193,14 +193,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--warmup",
         type=int,
-        default=1,
-        help="Warmup forward passes per path (default: 1; use higher if needed).",
+        default=5,
+        help="Warmup forward passes per path (default: 5; use higher if needed).",
     )
     p.add_argument(
         "--iters",
         type=int,
-        default=1,
-        help="Timed iterations per path (default: 1; artifacts only need one compile).",
+        default=50,
+        help="Timed iterations per path (default: 50; use 1 for minimal timing / artifacts).",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
