@@ -29,6 +29,10 @@ mean_numa_ms), ``mean_standard_ms``, ``mean_numa_ms``. If more than one
 stay unique. The file is truncated at the start of each sweep; rows are
 flushed after each config.
 
+Optional ``--git-commit-push-each-speedup-row`` (see
+``bert_speedup_csv_git_commit_push.py``) commits and pushes **only** that CSV
+after each new row (CSV path must be inside your git clone and not ignored).
+
 Default iteration space::
 
     models:     base, large
@@ -81,6 +85,16 @@ DEF_VOCAB = _bert.DEF_VOCAB
 DEF_CONTEXT = _bert.DEF_CONTEXT
 _enable_numa = _bert._enable_numa
 _run_path = _bert._run_path
+
+_git_path = _HERE / "bert_speedup_csv_git_commit_push.py"
+_spec_git = importlib.util.spec_from_file_location(
+    "bert_speedup_csv_git_commit_push", _git_path
+)
+assert _spec_git and _spec_git.loader
+_git_mod = importlib.util.module_from_spec(_spec_git)
+sys.modules[_spec_git.name] = _git_mod
+_spec_git.loader.exec_module(_git_mod)
+commit_push_speedup_csv_only = _git_mod.commit_push_speedup_csv_only
 
 _TORCH_DEBUG_RUNS_ROOT = "torch_compile_debug_runs"
 _MANIFEST_NAME = "sweep_manifest.jsonl"
@@ -312,6 +326,37 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not write speedup_by_config.csv (or --speedup-csv).",
     )
+    p.add_argument(
+        "--git-commit-push-each-speedup-row",
+        action="store_true",
+        help=(
+            "After each new speedup row: git add that CSV only, commit, push to "
+            "--git-remote / --git-branch. Requires repo clone; file must not be gitignored."
+        ),
+    )
+    p.add_argument(
+        "--git-repo-root",
+        type=str,
+        default=None,
+        help="Git repository root (default: infer via git rev-parse from CSV directory).",
+    )
+    p.add_argument(
+        "--git-remote",
+        type=str,
+        default="origin",
+        help="Remote name for git push (default: origin).",
+    )
+    p.add_argument(
+        "--git-branch",
+        type=str,
+        default=None,
+        help="Branch to push (default: current branch).",
+    )
+    p.add_argument(
+        "--git-continue-on-error",
+        action="store_true",
+        help="If git commit/push fails, log and continue (default: exit immediately).",
+    )
     return p.parse_args()
 
 
@@ -319,6 +364,13 @@ def main() -> int:
     args = _parse_args()
     if args.skip_numa_tp and args.skip_standard:
         print("Both --skip-numa-tp and --skip-standard; nothing to do.", file=sys.stderr)
+        return 2
+    if args.git_commit_push_each_speedup_row and args.no_speedup_csv:
+        print(
+            "--git-commit-push-each-speedup-row requires a speedup CSV; "
+            "omit --no-speedup-csv.",
+            file=sys.stderr,
+        )
         return 2
 
     result_dir = os.path.abspath(
@@ -371,6 +423,15 @@ def main() -> int:
                         else None
                     ),
                     "speedup_csv_include_model_column": speedup_csv_include_model,
+                    "git_commit_push_each_speedup_row": args.git_commit_push_each_speedup_row,
+                    "git_repo_root": (
+                        os.path.abspath(args.git_repo_root)
+                        if args.git_repo_root
+                        else None
+                    ),
+                    "git_remote": args.git_remote,
+                    "git_branch": args.git_branch,
+                    "git_continue_on_error": args.git_continue_on_error,
                 }
             )
             + "\n"
@@ -551,6 +612,13 @@ def main() -> int:
                         mean_standard_ms=mean_standard_ms,
                         mean_numa_ms=mean_numa_ms,
                     )
+                except Exception as e:
+                    print(
+                        f"  WARN speedup_csv append failed: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
                     sp = mean_standard_ms / mean_numa_ms
                     print(
                         f"  speedup_csv: {model_key} B={B} S={S} "
@@ -558,12 +626,37 @@ def main() -> int:
                         file=sys.stderr,
                         flush=True,
                     )
-                except Exception as e:
-                    print(
-                        f"  WARN speedup_csv append failed: {e}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    if args.git_commit_push_each_speedup_row:
+                        try:
+                            commit_push_speedup_csv_only(
+                                speedup_csv_path,
+                                repo_root=args.git_repo_root,
+                                remote=args.git_remote,
+                                branch=args.git_branch,
+                                commit_message=(
+                                    f"BERT sweep speedup: {model_key} B={B} S={S} "
+                                    f"speedup={sp:.4f}"
+                                ),
+                            )
+                            print(
+                                "  git: committed and pushed speedup CSV only.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        except Exception as ge:
+                            if args.git_continue_on_error:
+                                print(
+                                    f"  WARN git commit/push: {ge}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"  FAIL git commit/push: {ge}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                raise SystemExit(1) from ge
 
     total_s = time.perf_counter() - t0_all
     tail = (
