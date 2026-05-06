@@ -1,0 +1,2 @@
+model,batch,seq_length,mode,mean_ms,median_ms,min_ms,warmup,iters
+base,1,128,eager,89.3042,82.9697,74.8029,5,50
