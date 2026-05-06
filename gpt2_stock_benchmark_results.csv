@@ -4,3 +4,4 @@ model,batch,seq_length,mode,mean_ms,median_ms,min_ms,warmup,iters
 117m,1,256,eager,108.4354,106.8740,105.9243,5,50
 117m,1,256,compile,58.5737,58.5570,58.2966,5,50
 117m,1,512,eager,160.0415,159.5463,158.3598,5,50
+117m,1,512,compile,95.6252,95.6737,94.3316,5,50
