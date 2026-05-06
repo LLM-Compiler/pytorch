@@ -1,0 +1,2 @@
+batch,seq_length,speedup,mean_standard_ms,mean_numa_ms
+4,128,1.161158328918979,187.06799292005599,161.10463858465664
