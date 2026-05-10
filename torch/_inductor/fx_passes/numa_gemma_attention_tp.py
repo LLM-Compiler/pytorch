@@ -342,6 +342,38 @@ def _collect_q_chain(match: Dict[str, Any]) -> List[torch.fx.Node]:
     return chain
 
 
+def _placeholder_behind_permute(mm: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """Return the placeholder weight that feeds an ``mm(_, permute(W))``."""
+    if len(mm.args) < 2:
+        return None
+    perm = mm.args[1]
+    if not isinstance(perm, torch.fx.Node) or not _is_permute(perm):
+        return None
+    w = perm.args[0] if len(perm.args) >= 1 else None
+    if isinstance(w, torch.fx.Node) and w.op == "placeholder":
+        return w
+    return None
+
+
+def _compute_mm_ancestry(graph: torch.fx.Graph, mm_q, mm_k, mm_v) -> Dict[torch.fx.Node, frozenset]:
+    """Per node, set of {q,k,v} ancestors. Mixed sets identify post-bmm nodes
+    where Q's num_heads axis dominates; pure {k} / {v} sets identify pre-GQA-
+    expand nodes where the num_kv_heads axis is what to rewrite."""
+    tags: Dict[torch.fx.Node, set] = {}
+    for n in graph.nodes:
+        s: set = set()
+        for a in n.all_input_nodes:
+            s |= tags.get(a, set())
+        if n is mm_q:
+            s.add("q")
+        if n is mm_k:
+            s.add("k")
+        if n is mm_v:
+            s.add("v")
+        tags[n] = s
+    return {k: frozenset(v) for k, v in tags.items()}
+
+
 def _apply_plan(
     graph: torch.fx.Graph,
     match: Dict[str, Any],
@@ -351,103 +383,143 @@ def _apply_plan(
     shard_id: int,
 ) -> bool:
     mm_q = match["mm_q"]
+    mm_k = match["mm_k"]
+    mm_v = match["mm_v"]
     mm_o = match["mm_o"]
 
-    # Wq placeholder: arg of permute that feeds mm_q at index 1.
-    wq_perm = mm_q.args[1] if len(mm_q.args) >= 2 else None
-    if not isinstance(wq_perm, torch.fx.Node) or not _is_permute(wq_perm):
-        return False
-    wq = wq_perm.args[0] if len(wq_perm.args) >= 1 else None
-    if not isinstance(wq, torch.fx.Node) or wq.op != "placeholder":
-        return False
-
-    wo_perm = mm_o.args[1] if len(mm_o.args) >= 2 else None
-    if not isinstance(wo_perm, torch.fx.Node) or not _is_permute(wo_perm):
-        return False
-    wo = wo_perm.args[0] if len(wo_perm.args) >= 1 else None
-    if not isinstance(wo, torch.fx.Node) or wo.op != "placeholder":
+    wq = _placeholder_behind_permute(mm_q)
+    wk = _placeholder_behind_permute(mm_k)
+    wv = _placeholder_behind_permute(mm_v)
+    wo = _placeholder_behind_permute(mm_o)
+    if wq is None or wk is None or wv is None or wo is None:
+        _debug("could not resolve Wq/Wk/Wv/Wo placeholders behind permute")
         return False
 
-    # Shape sanity. Wq: (q_size, hidden). Wo: (hidden, q_size).
+    # Shape sanity. Wq: (q_size, hidden). Wk/Wv: (kv_size, hidden). Wo: (hidden, q_size).
     wq_shape = _shape(wq)
+    wk_shape = _shape(wk)
+    wv_shape = _shape(wv)
     wo_shape = _shape(wo)
-    if wq_shape is None or wo_shape is None or len(wq_shape) != 2 or len(wo_shape) != 2:
+    if any(s is None or len(s) != 2 for s in (wq_shape, wk_shape, wv_shape, wo_shape)):
         return False
     q_size, hidden_q = wq_shape
+    kv_size, hidden_k = wk_shape
+    kv_size_v, hidden_v = wv_shape
     hidden_o, q_size_o = wo_shape
-    if q_size != q_size_o or hidden_q != hidden_o:
-        _debug(f"Wq/Wo shape mismatch: Wq={wq_shape} Wo={wo_shape}; skipping")
+    if q_size != q_size_o or hidden_q != hidden_o or hidden_q != hidden_k or hidden_q != hidden_v:
+        _debug(
+            f"hidden / q_size mismatch: Wq={wq_shape} Wk={wk_shape} Wv={wv_shape} Wo={wo_shape}"
+        )
+        return False
+    if kv_size != kv_size_v:
+        _debug(f"Wk/Wv kv_size mismatch: {kv_size} vs {kv_size_v}")
         return False
     if q_size % world_size != 0:
-        _debug(f"q_size={q_size} not divisible by world_size={world_size}; skipping")
         return False
     shard_q = q_size // world_size
 
-    # Inferred num_heads from a downstream view that reshapes to [B, S, H, E].
-    # mm_q output (s, q_size) -> reshape [1, S, q_size] -> reshape [1, S, H, E] -> permute.
+    # Infer num_heads/head_dim from mm_q output reshape chain.
     H_total: Optional[int] = None
     head_dim: Optional[int] = None
     for u in mm_q.users:
         if _is_reshape(u):
-            shp = _shape(u)
-            if shp is not None and len(shp) == 3:
-                # Then look forward for a 4D reshape.
-                for u2 in u.users:
-                    if _is_reshape(u2):
-                        shp2 = _shape(u2)
-                        if shp2 is not None and len(shp2) == 4 and shp2[-1] * shp2[-2] == q_size:
-                            H_total = shp2[-2]
-                            head_dim = shp2[-1]
-                            break
-                if H_total is not None:
-                    break
+            for u2 in u.users:
+                if _is_reshape(u2):
+                    shp2 = _shape(u2)
+                    if shp2 is not None and len(shp2) == 4 and shp2[-1] * shp2[-2] == q_size:
+                        H_total = shp2[-2]
+                        head_dim = shp2[-1]
+                        break
+            if H_total is not None:
+                break
     if H_total is None or head_dim is None:
         _debug("could not infer num_heads / head_dim from mm_q chain; skipping")
         return False
     if H_total % world_size != 0:
-        _debug(f"num_heads={H_total} not divisible by world_size={world_size}; skipping")
         return False
     H_shard = H_total // world_size
 
+    if kv_size % head_dim != 0:
+        _debug(f"kv_size={kv_size} not divisible by head_dim={head_dim}")
+        return False
+    num_kv_heads = kv_size // head_dim
+
+    # K/V column-sharding (Wk/Wv slice) requires the kv_cache placeholder to
+    # also be sliced per NUMA node — without that, the in-graph index_put_ op
+    # broadcasts a sharded src into a full-size dest and downstream GQA expand
+    # fails. That cache-placeholder handling lives in wrapper codegen and is
+    # not yet wired up; until then, gate K/V slicing behind an opt-in config
+    # flag and default to replicated K/V (which is correct for num_kv_heads=1
+    # and at worst leaves K/V unsharded for larger variants).
+    slice_kv_requested = bool(getattr(config, "_numa_attention_tp_slice_kv", False))
+    slice_kv = (
+        slice_kv_requested
+        and num_kv_heads >= world_size
+        and num_kv_heads % world_size == 0
+    )
+    shard_kv_size = kv_size // world_size if slice_kv else kv_size
+    shard_kv_heads = num_kv_heads // world_size if slice_kv else num_kv_heads
+
     _debug(
-        f"match plan_id={plan_id}: q_size={q_size} hidden={hidden_q} "
-        f"H_total={H_total} head_dim={head_dim} "
-        f"shard_q={shard_q} H_shard={H_shard} compute_shard={shard_id}/{world_size}"
+        f"match plan_id={plan_id}: q_size={q_size} kv_size={kv_size} hidden={hidden_q} "
+        f"H_total={H_total} num_kv_heads={num_kv_heads} head_dim={head_dim} | "
+        f"shard_q={shard_q} H_shard={H_shard} slice_kv={slice_kv} "
+        f"shard_kv_heads={shard_kv_heads} compute_shard={shard_id}/{world_size}"
     )
 
-    # Build per-shard slice -> permute for Wq and Wo.
+    # Per-shard slice -> permute nodes, anchored before mm_q.
     wq_shards: List[torch.fx.Node] = []
     wo_shards: List[torch.fx.Node] = []
+    wk_shards: List[torch.fx.Node] = []
+    wv_shards: List[torch.fx.Node] = []
     with graph.inserting_before(mm_q):
         for sid in range(world_size):
-            start = sid * shard_q
-            end = (sid + 1) * shard_q
-            wq_slice = graph.call_function(aten.slice.Tensor, args=(wq, 0, start, end, 1))
+            start_q = sid * shard_q
+            end_q = (sid + 1) * shard_q
+            wq_slice = graph.call_function(aten.slice.Tensor, args=(wq, 0, start_q, end_q, 1))
             wq_slice.meta.update(wq.meta)
-            wq_slice.meta["numa_plan_id"] = plan_id
-            wq_slice.meta["numa_shard_id"] = sid
             wq_slice_perm = graph.call_function(aten.permute.default, args=(wq_slice, [1, 0]))
             _refresh_val(wq_slice_perm, (hidden_q, shard_q))
             wq_shards.append(wq_slice_perm)
 
-            wo_slice = graph.call_function(aten.slice.Tensor, args=(wo, 1, start, end, 1))
+            wo_slice = graph.call_function(aten.slice.Tensor, args=(wo, 1, start_q, end_q, 1))
             wo_slice.meta.update(wo.meta)
-            wo_slice.meta["numa_plan_id"] = plan_id
-            wo_slice.meta["numa_shard_id"] = sid
             wo_slice_perm = graph.call_function(aten.permute.default, args=(wo_slice, [1, 0]))
             _refresh_val(wo_slice_perm, (shard_q, hidden_o))
             wo_shards.append(wo_slice_perm)
 
-    # Rewire compute-shard mm_q and mm_o to per-shard permutes.
+            if slice_kv:
+                start_kv = sid * shard_kv_size
+                end_kv = (sid + 1) * shard_kv_size
+                wk_slice = graph.call_function(aten.slice.Tensor, args=(wk, 0, start_kv, end_kv, 1))
+                wk_slice.meta.update(wk.meta)
+                wk_slice_perm = graph.call_function(aten.permute.default, args=(wk_slice, [1, 0]))
+                _refresh_val(wk_slice_perm, (hidden_q, shard_kv_size))
+                wk_shards.append(wk_slice_perm)
+
+                wv_slice = graph.call_function(aten.slice.Tensor, args=(wv, 0, start_kv, end_kv, 1))
+                wv_slice.meta.update(wv.meta)
+                wv_slice_perm = graph.call_function(aten.permute.default, args=(wv_slice, [1, 0]))
+                _refresh_val(wv_slice_perm, (hidden_q, shard_kv_size))
+                wv_shards.append(wv_slice_perm)
+
+    # Rewire compute-shard mms.
     mm_q.args = (mm_q.args[0], wq_shards[shard_id])
     mm_o.args = (mm_o.args[0], wo_shards[shard_id])
+    if slice_kv:
+        mm_k.args = (mm_k.args[0], wk_shards[shard_id])
+        mm_v.args = (mm_v.args[0], wv_shards[shard_id])
 
-    # Walk every reshape/expand in the activation chain (Q side, then through
-    # K-broadcast, the bmm output chain, the softmax chain, V-broadcast, and
-    # the output collapse) and rewrite shape literals from full → sharded.
+    # Tag nodes by mm-ancestry. Used to disambiguate which axis to rewrite
+    # when shape literals contain values that would otherwise be confusable
+    # (e.g. num_heads == num_queries_per_kv == 4 in num_kv_heads=1 GQA).
+    tags = _compute_mm_ancestry(graph, mm_q, mm_k, mm_v)
+
+    # Collect all chain nodes reachable forward from the three Q/K/V mms,
+    # stopping at mm_o (inclusive).
     nodes_to_rewrite: List[torch.fx.Node] = []
     visited: set = set()
-    frontier: List[torch.fx.Node] = [mm_q, match["mm_k"], match["mm_v"]]
+    frontier: List[torch.fx.Node] = [mm_q, mm_k, mm_v]
     while frontier:
         n = frontier.pop()
         if n in visited:
@@ -460,33 +532,110 @@ def _apply_plan(
             if u in visited:
                 continue
             frontier.append(u)
-    nodes_to_rewrite.append(mm_o)
+    if mm_o not in visited:
+        nodes_to_rewrite.append(mm_o)
+
+    # Sequence length S is also part of the chain shapes; if it happens to
+    # equal q_size or kv_size, value-based rewriting becomes ambiguous.
+    # Detect S from any reshape arg of form (1, S, q_size) directly off mm_q.
+    S_dim: Optional[int] = None
+    for u in mm_q.users:
+        if _is_reshape(u):
+            shp = _shape(u)
+            if shp is not None and len(shp) == 3 and shp[-1] == q_size:
+                S_dim = shp[1]
+                break
+    if S_dim is not None:
+        if S_dim == q_size or S_dim == shard_q or S_dim == kv_size or S_dim == shard_kv_size:
+            _debug(
+                f"S_dim={S_dim} collides with q_size/kv_size — value-based rewrite "
+                f"would corrupt shapes; skipping this match"
+            )
+            return False
+
+    has_q_in = lambda t: "q" in t  # noqa: E731
+
+    # The GQA expand_1 / expand_3 broadcast (1, S, num_kv_heads, 1, head_dim)
+    # to (1, S, num_kv_heads, num_queries_per_kv, head_dim). Value-based
+    # rewriting can't disambiguate position 2 (num_kv_heads) from position 3
+    # (num_queries_per_kv) when those happen to be equal. Handle this 5D
+    # expand positionally so both axes are always set correctly:
+    #   new_kv_heads        = shard_kv_heads (= num_kv_heads if not sliced)
+    #   new_queries_per_kv  = H_shard / new_kv_heads
+    new_queries_per_kv = (
+        H_shard // shard_kv_heads if shard_kv_heads > 0 else None
+    )
 
     for n in nodes_to_rewrite:
-        # Shape-arg rewrite for reshape and expand.
+        tag = tags.get(n, frozenset())
+        is_kv_only = tag == frozenset({"k"}) or tag == frozenset({"v"}) or tag == frozenset({"k", "v"})
+
+        # 5D GQA expand: positional rewrite of (kv_heads, queries_per_kv).
+        if (
+            _is_expand(n)
+            and is_kv_only
+            and new_queries_per_kv is not None
+            and len(n.args) >= 2
+            and isinstance(n.args[1], (list, tuple))
+            and len(n.args[1]) == 5
+        ):
+            target = list(n.args[1])
+            target[2] = shard_kv_heads
+            target[3] = new_queries_per_kv
+            head = list(n.args[:1])
+            tail = list(n.args[2:])
+            n.args = tuple(head + [target] + tail)
+            _refresh_val(n, tuple(target))
+            # Don't run the generic value-based rules below for this node —
+            # they could re-rewrite an already-correct dim.
+            continue
+
         if _is_reshape(n) or _is_expand(n):
-            _replace_shape_arg(n, old_dim=q_size, new_dim=shard_q)
+            # q_size appears in q-only chain (post-mm_q reshape, pre-head-split)
+            # AND in the post-bmm1 output collapse [1, S, q_size] and [S, q_size]
+            # which have tag {q,k,v}. Rewrite whenever "q" is in the tag set.
+            if has_q_in(tag):
+                _replace_shape_arg(n, old_dim=q_size, new_dim=shard_q)
+            # Pre-GQA-expand K/V chain: rewrite kv_size and num_kv_heads, but
+            # only when we sliced Wk/Wv (otherwise K/V replicate, full literals
+            # remain valid).
+            if slice_kv and is_kv_only:
+                _replace_shape_arg(n, old_dim=kv_size, new_dim=shard_kv_size)
+                if num_kv_heads != shard_kv_heads:
+                    _replace_shape_arg(n, old_dim=num_kv_heads, new_dim=shard_kv_heads)
+            # num_heads rewrite applies everywhere (Q 4D shapes, post-GQA-expand
+            # K/V, post-bmm0 softmax chain, post-bmm1 output collapse).
             _replace_shape_arg(n, old_dim=H_total, new_dim=H_shard)
-        # Refresh meta['val']: any dim equal to q_size or H_total becomes sharded.
+
         sh = _shape(n)
         if sh is None:
             continue
         new_sh: List[int] = []
         changed = False
         for d in sh:
-            if d == q_size:
-                new_sh.append(shard_q)
-                changed = True
-            elif d == H_total:
-                new_sh.append(H_shard)
-                changed = True
-            else:
-                new_sh.append(d)
+            if has_q_in(tag) and d == q_size:
+                new_sh.append(shard_q); changed = True; continue
+            if slice_kv and is_kv_only and d == kv_size:
+                new_sh.append(shard_kv_size); changed = True; continue
+            if (
+                slice_kv
+                and is_kv_only
+                and d == num_kv_heads
+                and num_kv_heads != shard_kv_heads
+            ):
+                new_sh.append(shard_kv_heads); changed = True; continue
+            if d == H_total:
+                new_sh.append(H_shard); changed = True; continue
+            new_sh.append(d)
         if changed:
             _refresh_val(n, tuple(new_sh))
 
-    # mm_o output stays at (s, hidden) — no resize needed.
-    # Build a shard plan (consumed by wrapper codegen for per-NUMA clones).
+    column_parallel_nodes: List[Tuple[str, int]] = [(wq.name, 0)]
+    if slice_kv:
+        column_parallel_nodes.append((wk.name, 0))
+        column_parallel_nodes.append((wv.name, 0))
+    replicated_nodes: List[str] = [] if slice_kv else [wk.name, wv.name]
+
     shard_plan: Dict[str, Any] = {
         "kind": "attention",
         "subkind": "gemma_gqa",
@@ -495,17 +644,20 @@ def _apply_plan(
         "shard_d": shard_q,
         "compute_shard": shard_id,
         "x_node": _trace_x_placeholder(mm_q).name if _trace_x_placeholder(mm_q) else "",
-        "column_parallel_nodes": [(wq.name, 0)],
+        "column_parallel_nodes": column_parallel_nodes,
         "row_parallel_nodes": [(wo.name, 1)],
-        "replicated_nodes": [],
+        "replicated_nodes": replicated_nodes,
         "zero_on_nonzero_nodes": [],
         "q_size": q_size,
+        "kv_size": kv_size,
         "h": hidden_q,
         "num_heads": H_total,
+        "num_kv_heads": num_kv_heads,
+        "slice_kv": slice_kv,
         "head_dim": head_dim,
     }
     setattr(config, "_numa_attention_tp_shard_plan", dict(shard_plan))
-    for n in itertools.chain(wq_shards, wo_shards, [mm_q, mm_o]):
+    for n in itertools.chain(wq_shards, wo_shards, wk_shards, wv_shards, [mm_q, mm_k, mm_v, mm_o]):
         n.meta["numa_shard_plan"] = shard_plan
     return True
 

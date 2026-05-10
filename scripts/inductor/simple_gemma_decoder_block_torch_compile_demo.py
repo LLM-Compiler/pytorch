@@ -265,7 +265,7 @@ class SimpleGemmaStack(nn.Module):
         head_dim: int,
         intermediate_size: int,
         rms_norm_eps: float = 1e-6,
-        use_qk_norm: bool = False,
+        use_qk_norm: bool = True,
         use_pre_ffw_norm: bool = True,
         use_post_ffw_norm: bool = True,
         attn_logit_softcapping: float | None = None,
