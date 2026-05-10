@@ -60,7 +60,14 @@ def _debug_graph(graph: torch.fx.Graph, title: str) -> None:
     if not _debug_enabled():
         return
     print(f"[numa_mlp_tp] --- {title} ---", flush=True)
-    graph.print_tabular()
+    try:
+        graph.print_tabular()
+    except ImportError:
+        for n in graph.nodes:
+            tgt = getattr(n.target, "__name__", str(n.target))
+            val = n.meta.get("val")
+            shape = tuple(val.shape) if hasattr(val, "shape") else None
+            print(f"  {n.op:14s} {n.name:24s} {tgt:32s} args={n.args}  shape={shape}", flush=True)
 
 
 def _node_sig(n: torch.fx.Node) -> str:
@@ -400,6 +407,546 @@ def _find_mlp_triples(
     return triples
 
 
+# ---------------------------------------------------------------------------
+# GeGLU pattern (Gemma): mm(x, gate_w) and mm(x, up_w) sharing x via separate
+# reshapes, tanh-approx GELU on gate, elem-mul with up, then mm(_, down_w).
+#
+# Post-grad shape (verified against torch.compile of F.linear + F.gelu(...,
+# approximate="tanh")):
+#
+#   view      = reshape(x, [s, h])                      # x = (B, S, h)
+#   permute   = permute(gate_w, [1, 0])                 # gate_w: (d, h) -> (h, d)
+#   gate_mm   = mm(view, permute)                        # (s, d)
+#   view_1    = reshape(gate_mm, [B, S, d])
+#   mul_4     = view_1 * 0.5
+#   mul       = view_1 * view_1
+#   mul_1     = mul * view_1
+#   mul_2     = mul_1 * 0.044715
+#   add       = view_1 + mul_2
+#   mul_3     = add * 0.7978845608028654
+#   tanh      = tanh(mul_3)
+#   add_1     = tanh + 1
+#   mul_5     = mul_4 * add_1                            # gelu_tanh(gate)
+#   view_2    = reshape(x, [s, h])
+#   permute_1 = permute(up_w, [1, 0])
+#   mm_1      = mm(view_2, permute_1)                    # (s, d)
+#   view_3    = reshape(mm_1, [B, S, d])
+#   mul_6     = mul_5 * view_3
+#   view_4    = reshape(mul_6, [s, d])
+#   permute_2 = permute(down_w, [1, 0])                  # down_w: (h, d) -> (d, h)
+#   mm_2      = mm(view_4, permute_2)                    # (s, h)
+#
+# Sharding: shard_d = d // world_size.
+#   - gate_w (placeholder, shape (d, h)): column-parallel, slice dim 0
+#   - up_w   (placeholder, shape (d, h)): column-parallel, slice dim 0
+#   - down_w (placeholder, shape (h, d)): row-parallel,    slice dim 1
+# Per-shard rewire: insert ``slice -> permute`` and replace the mm operand.
+# ---------------------------------------------------------------------------
+_GELU_TANH_HALF_C = 0.5
+_GELU_TANH_CUBE_C = 0.044715
+_GELU_TANH_SQRT_2_OVER_PI = 0.7978845608028654
+
+
+def _is_reshape(node: Any) -> bool:
+    return (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target is aten.reshape.default
+    )
+
+
+def _is_permute(node: Any) -> bool:
+    return (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target is aten.permute.default
+    )
+
+
+def _reshape_source(node: torch.fx.Node) -> torch.fx.Node:
+    """If ``node`` is a reshape, return its source; else return ``node``."""
+    if _is_reshape(node) and isinstance(node.args[0], torch.fx.Node):
+        return node.args[0]  # type: ignore[return-value]
+    return node
+
+
+def _shape_last_dim(node: torch.fx.Node) -> Optional[int]:
+    val = node.meta.get("val")
+    if isinstance(val, torch.Tensor) and val.dim() >= 1:
+        return _shape_dim_to_int(val.shape[-1])
+    tm = _get_single_tensor_metadata(node)
+    if tm is not None and len(tm.shape) >= 1:
+        return _shape_dim_to_int(tm.shape[-1])
+    return None
+
+
+def _match_tanh_approx_gelu(
+    view1: torch.fx.Node,
+) -> Optional[List[torch.fx.Node]]:
+    """Match the 9-op tanh-approx GELU chain rooted at ``view1`` (the reshape
+    that consumes the first mm output). Returns the ordered chain
+    ``[mul_4, mul, mul_1, mul_2, add, mul_3, tanh, add_1, mul_5]``, or None.
+    The final element is the GELU output (``mul_5``).
+    """
+    mul_half: Optional[torch.fx.Node] = None  # view1 * 0.5
+    mul_sq: Optional[torch.fx.Node] = None    # view1 * view1
+    for u in view1.users:
+        if u.op != "call_function" or not _target_is_mul_tensor(u.target):
+            continue
+        if len(u.args) < 2:
+            continue
+        a0, a1 = u.args[0], u.args[1]
+        c = _mul_tensor_tensor_and_scalar(u, view1)
+        if c is not None and math.isclose(c, _GELU_TANH_HALF_C, rel_tol=1e-5, abs_tol=1e-6):
+            if mul_half is None:
+                mul_half = u
+        elif a0 is view1 and a1 is view1:
+            if mul_sq is None:
+                mul_sq = u
+    if mul_half is None or mul_sq is None:
+        return None
+
+    # mul_1 = mul_sq * view1 (or view1 * mul_sq)
+    mul_cube: Optional[torch.fx.Node] = None
+    for u in mul_sq.users:
+        if u.op != "call_function" or not _target_is_mul_tensor(u.target):
+            continue
+        if len(u.args) < 2:
+            continue
+        a0, a1 = u.args[0], u.args[1]
+        if (a0 is mul_sq and a1 is view1) or (a0 is view1 and a1 is mul_sq):
+            mul_cube = u
+            break
+    if mul_cube is None:
+        return None
+
+    # mul_2 = mul_cube * 0.044715
+    mul_044: Optional[torch.fx.Node] = None
+    for u in mul_cube.users:
+        c = _mul_tensor_tensor_and_scalar(u, mul_cube)
+        if c is not None and math.isclose(c, _GELU_TANH_CUBE_C, rel_tol=1e-4, abs_tol=1e-6):
+            mul_044 = u
+            break
+    if mul_044 is None:
+        return None
+
+    # add = view1 + mul_044 (or mul_044 + view1)
+    add_node: Optional[torch.fx.Node] = None
+    for u in mul_044.users:
+        if u.op != "call_function" or u.target is not aten.add.Tensor:
+            continue
+        if len(u.args) < 2:
+            continue
+        a0, a1 = u.args[0], u.args[1]
+        if (a0 is view1 and a1 is mul_044) or (a0 is mul_044 and a1 is view1):
+            add_node = u
+            break
+    if add_node is None:
+        return None
+
+    # mul_3 = add * sqrt(2/pi)
+    mul_sqrt: Optional[torch.fx.Node] = None
+    for u in add_node.users:
+        c = _mul_tensor_tensor_and_scalar(u, add_node)
+        if c is not None and math.isclose(
+            c, _GELU_TANH_SQRT_2_OVER_PI, rel_tol=1e-5, abs_tol=1e-6
+        ):
+            mul_sqrt = u
+            break
+    if mul_sqrt is None:
+        return None
+
+    # tanh
+    tanh_node: Optional[torch.fx.Node] = None
+    for u in mul_sqrt.users:
+        if u.op == "call_function" and u.target is aten.tanh.default:
+            tanh_node = u
+            break
+    if tanh_node is None:
+        return None
+
+    # add_1 = tanh + 1
+    add1_node: Optional[torch.fx.Node] = None
+    for u in tanh_node.users:
+        if u.op != "call_function" or u.target is not aten.add.Tensor:
+            continue
+        if len(u.args) < 2:
+            continue
+        a0, a1 = u.args[0], u.args[1]
+        if (a0 is tanh_node and _fx_float(a1) == 1.0) or (
+            a1 is tanh_node and _fx_float(a0) == 1.0
+        ):
+            add1_node = u
+            break
+    if add1_node is None:
+        return None
+
+    # mul_5 = mul_half * add_1
+    mul_out: Optional[torch.fx.Node] = None
+    for u in add1_node.users:
+        if u.op != "call_function" or not _target_is_mul_tensor(u.target):
+            continue
+        if len(u.args) < 2:
+            continue
+        m0, m1 = u.args[0], u.args[1]
+        if (m0 is mul_half and m1 is add1_node) or (m0 is add1_node and m1 is mul_half):
+            mul_out = u
+            break
+    if mul_out is None:
+        return None
+
+    return [mul_half, mul_sq, mul_cube, mul_044, add_node, mul_sqrt, tanh_node, add1_node, mul_out]
+
+
+def _find_geglu_quintuples(graph: torch.fx.Graph) -> List[Dict[str, Any]]:
+    """Find Gemma-style GeGLU MLP blocks in the post-grad graph.
+
+    Returns a list of dicts with keys:
+      gate_mm, up_mm, down_mm, gate_view (reshape after gate_mm),
+      up_view (reshape after up_mm), mul_node (gelu*up), down_view
+      (reshape feeding down_mm), gelu_chain (list of 9 nodes).
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for gate_mm in list(graph.nodes):
+        if gate_mm in seen:
+            continue
+        if gate_mm.op != "call_function" or not _target_is_mm(gate_mm.target):
+            continue
+        if len(gate_mm.args) < 2:
+            continue
+        view_x_g = gate_mm.args[0]
+        gate_perm = gate_mm.args[1]
+        if not isinstance(view_x_g, torch.fx.Node) or not isinstance(gate_perm, torch.fx.Node):
+            continue
+        if not _is_permute(gate_perm):
+            continue
+
+        # gate_mm -> view_1 (reshape)
+        view_1 = None
+        for u in gate_mm.users:
+            if _is_reshape(u) and u.args[0] is gate_mm:
+                view_1 = u
+                break
+        if view_1 is None:
+            continue
+
+        chain = _match_tanh_approx_gelu(view_1)
+        if chain is None:
+            continue
+        gelu_out = chain[-1]
+
+        # gelu_out * view_3 (a reshape of an mm output)
+        mul_node = None
+        view_3 = None
+        for u in gelu_out.users:
+            if u.op != "call_function" or not _target_is_mul_tensor(u.target):
+                continue
+            if len(u.args) < 2:
+                continue
+            a0, a1 = u.args[0], u.args[1]
+            other = a1 if a0 is gelu_out else (a0 if a1 is gelu_out else None)
+            if not isinstance(other, torch.fx.Node):
+                continue
+            if not _is_reshape(other):
+                continue
+            src = other.args[0]
+            if (
+                isinstance(src, torch.fx.Node)
+                and src.op == "call_function"
+                and _target_is_mm(src.target)
+            ):
+                mul_node = u
+                view_3 = other
+                break
+        if mul_node is None or view_3 is None:
+            continue
+        up_mm = view_3.args[0]
+        if not isinstance(up_mm, torch.fx.Node):
+            continue
+        if len(up_mm.args) < 2:
+            continue
+        view_x_u = up_mm.args[0]
+        up_perm = up_mm.args[1]
+        if not isinstance(view_x_u, torch.fx.Node) or not isinstance(up_perm, torch.fx.Node):
+            continue
+        if not _is_permute(up_perm):
+            continue
+
+        # gate_mm and up_mm must read reshapes of the same source x.
+        x_src_g = _reshape_source(view_x_g)
+        x_src_u = _reshape_source(view_x_u)
+        if x_src_g is not x_src_u:
+            continue
+
+        # mul_node -> view_4 (reshape) -> down_mm
+        view_4 = None
+        for u in mul_node.users:
+            if _is_reshape(u) and u.args[0] is mul_node:
+                view_4 = u
+                break
+        if view_4 is None:
+            continue
+        down_mm = None
+        for u in view_4.users:
+            if (
+                u.op == "call_function"
+                and _target_is_mm(u.target)
+                and len(u.args) >= 2
+                and u.args[0] is view_4
+            ):
+                down_mm = u
+                break
+        if down_mm is None:
+            continue
+        down_perm = down_mm.args[1]
+        if not isinstance(down_perm, torch.fx.Node) or not _is_permute(down_perm):
+            continue
+
+        seen.add(gate_mm)
+        seen.add(up_mm)
+        out.append(
+            {
+                "gate_mm": gate_mm,
+                "up_mm": up_mm,
+                "down_mm": down_mm,
+                "gate_view": view_1,
+                "up_view": view_3,
+                "mul_node": mul_node,
+                "down_view": view_4,
+                "gelu_chain": chain,
+                "x_src": x_src_g,
+                "gate_perm": gate_perm,
+                "up_perm": up_perm,
+                "down_perm": down_perm,
+            }
+        )
+    return out
+
+
+def _bsl_to_2d_last(shape: Tuple[int, ...], new_last: int) -> Tuple[int, ...]:
+    return tuple(list(shape[:-1]) + [new_last])
+
+
+def _apply_geglu_plan(
+    graph: torch.fx.Graph,
+    match: Dict[str, Any],
+    *,
+    world_size: int,
+    plan_id: int,
+    shard_id: int,
+) -> bool:
+    gate_mm: torch.fx.Node = match["gate_mm"]
+    up_mm: torch.fx.Node = match["up_mm"]
+    down_mm: torch.fx.Node = match["down_mm"]
+    gate_perm: torch.fx.Node = match["gate_perm"]
+    up_perm: torch.fx.Node = match["up_perm"]
+    down_perm: torch.fx.Node = match["down_perm"]
+    x_src: torch.fx.Node = match["x_src"]
+    gelu_chain: List[torch.fx.Node] = match["gelu_chain"]
+    gate_view: torch.fx.Node = match["gate_view"]
+    up_view: torch.fx.Node = match["up_view"]
+    mul_node: torch.fx.Node = match["mul_node"]
+    down_view: torch.fx.Node = match["down_view"]
+
+    # Original placeholder weights.
+    gate_w = gate_perm.args[0] if isinstance(gate_perm.args[0], torch.fx.Node) else None
+    up_w = up_perm.args[0] if isinstance(up_perm.args[0], torch.fx.Node) else None
+    down_w = down_perm.args[0] if isinstance(down_perm.args[0], torch.fx.Node) else None
+    if gate_w is None or up_w is None or down_w is None:
+        return False
+
+    # Shape sanity. gate_w / up_w: (d, h). down_w: (h, d).
+    g_shape = _shape_2d(gate_w)
+    u_shape = _shape_2d(up_w)
+    dw_shape = _shape_2d(down_w)
+    if g_shape is None or u_shape is None or dw_shape is None:
+        return False
+    d_g, h_g = g_shape
+    d_u, h_u = u_shape
+    h_d, d_d = dw_shape
+    if d_g != d_u or d_g != d_d or h_g != h_u or h_g != h_d:
+        _debug(
+            f"GeGLU shape mismatch: gate={g_shape} up={u_shape} down={dw_shape}; skipping"
+        )
+        return False
+    d = d_g
+    h = h_g
+    if d % world_size != 0:
+        _debug(f"GeGLU d={d} not divisible by world_size={world_size}; skipping")
+        return False
+    shard_d = d // world_size
+
+    _debug(
+        f"GeGLU match plan_id={plan_id}: gate={_node_sig(gate_mm)} "
+        f"up={_node_sig(up_mm)} down={_node_sig(down_mm)} | "
+        f"d={d} h={h} shard_d={shard_d} compute_shard={shard_id}/{world_size}"
+    )
+
+    # Build per-shard slice -> permute for each weight, anchored before gate_mm.
+    gate_shards: List[torch.fx.Node] = []
+    up_shards: List[torch.fx.Node] = []
+    down_shards: List[torch.fx.Node] = []
+    with graph.inserting_before(gate_mm):
+        for sid in range(world_size):
+            start = sid * shard_d
+            end = (sid + 1) * shard_d
+
+            g_slice = graph.call_function(
+                aten.slice.Tensor, args=(gate_w, 0, start, end, 1)
+            )
+            _clone_meta(g_slice, gate_w)
+            _set_numa_meta(
+                g_slice, plan_id=plan_id, shard_id=sid, total_shards=world_size,
+                role="gate_w_slice", target_node=sid,
+            )
+            g_slice_perm = graph.call_function(
+                aten.permute.default, args=(g_slice, [1, 0])
+            )
+            _clone_meta(g_slice_perm, gate_perm)
+            _resize_node_val_and_tensor_meta(g_slice_perm, (h, shard_d))
+            _set_numa_meta(
+                g_slice_perm, plan_id=plan_id, shard_id=sid, total_shards=world_size,
+                role="gate_w_slice_perm", target_node=sid,
+            )
+            gate_shards.append(g_slice_perm)
+
+            u_slice = graph.call_function(
+                aten.slice.Tensor, args=(up_w, 0, start, end, 1)
+            )
+            _clone_meta(u_slice, up_w)
+            _set_numa_meta(
+                u_slice, plan_id=plan_id, shard_id=sid, total_shards=world_size,
+                role="up_w_slice", target_node=sid,
+            )
+            u_slice_perm = graph.call_function(
+                aten.permute.default, args=(u_slice, [1, 0])
+            )
+            _clone_meta(u_slice_perm, up_perm)
+            _resize_node_val_and_tensor_meta(u_slice_perm, (h, shard_d))
+            _set_numa_meta(
+                u_slice_perm, plan_id=plan_id, shard_id=sid, total_shards=world_size,
+                role="up_w_slice_perm", target_node=sid,
+            )
+            up_shards.append(u_slice_perm)
+
+            # down_w shape (h, d): row-parallel, slice along input dim = 1.
+            d_slice = graph.call_function(
+                aten.slice.Tensor, args=(down_w, 1, start, end, 1)
+            )
+            _clone_meta(d_slice, down_w)
+            _set_numa_meta(
+                d_slice, plan_id=plan_id, shard_id=sid, total_shards=world_size,
+                role="down_w_slice", target_node=sid,
+            )
+            d_slice_perm = graph.call_function(
+                aten.permute.default, args=(d_slice, [1, 0])
+            )
+            _clone_meta(d_slice_perm, down_perm)
+            _resize_node_val_and_tensor_meta(d_slice_perm, (shard_d, h))
+            _set_numa_meta(
+                d_slice_perm, plan_id=plan_id, shard_id=sid, total_shards=world_size,
+                role="down_w_slice_perm", target_node=sid,
+            )
+            down_shards.append(d_slice_perm)
+
+    shard_plan: Dict[str, Any] = {
+        "kind": "mlp",
+        "subkind": "geglu",
+        "plan_id": plan_id,
+        "world_size": world_size,
+        "shard_d": shard_d,
+        "compute_shard": shard_id,
+        "x_node": x_src.name,
+        "column_parallel_nodes": [(gate_w.name, 0), (up_w.name, 0)],
+        "row_parallel_nodes": [(down_w.name, 1)],
+        "replicated_nodes": [x_src.name],
+        "zero_on_nonzero_nodes": [],
+        "h": h,
+        "d": d,
+    }
+    setattr(config, "_numa_mlp_tp_shard_plan", dict(shard_plan))
+
+    for sn in itertools.chain(gate_shards, up_shards, down_shards):
+        sn.meta["numa_shard_plan"] = shard_plan
+
+    # Annotate replicated activation source.
+    _set_numa_meta(
+        x_src, plan_id=plan_id, shard_id=0, total_shards=world_size,
+        role="x_replica", target_node=0,
+    )
+
+    # Rewire compute-shard operands.
+    gate_mm.args = (gate_mm.args[0], gate_shards[shard_id])
+    up_mm.args = (up_mm.args[0], up_shards[shard_id])
+    down_mm.args = (down_mm.args[0], down_shards[shard_id])
+
+    for n, role in (
+        (gate_mm, "gate_mm_shard"),
+        (up_mm, "up_mm_shard"),
+        (down_mm, "down_mm_shard"),
+    ):
+        _set_numa_meta(
+            n, plan_id=plan_id, shard_id=shard_id, total_shards=world_size,
+            role=role, target_node=shard_id,
+        )
+        n.meta["numa_shard_plan"] = shard_plan
+
+    # Refresh activation-chain shapes from full-d to shard_d.
+    # gate_mm and up_mm: 2D (s, d) -> (s, shard_d). down_mm: 2D (s, d) -> (s, h) unchanged.
+    gate_mm_shape = shape_nd_or_none(gate_mm)
+    if gate_mm_shape is not None:
+        _resize_node_val_and_tensor_meta(
+            gate_mm, _bsl_to_2d_last(gate_mm_shape, shard_d)
+        )
+    up_mm_shape = shape_nd_or_none(up_mm)
+    if up_mm_shape is not None:
+        _resize_node_val_and_tensor_meta(up_mm, _bsl_to_2d_last(up_mm_shape, shard_d))
+
+    # Activation chain: gate_view, gelu_chain (9 nodes), up_view, mul_node, down_view.
+    chain_to_resize: List[torch.fx.Node] = [gate_view] + list(gelu_chain) + [up_view, mul_node, down_view]
+    for n in chain_to_resize:
+        sh = shape_nd_or_none(n)
+        if sh is None:
+            continue
+        new_shape = _bsl_to_2d_last(sh, shard_d)
+        # Reshape ops carry the target shape as an explicit list literal in
+        # args[1]; that literal must be updated alongside meta['val'] or the
+        # downstream view fails ("shape [..., d] invalid for input of size ...").
+        if _is_reshape(n) and len(n.args) >= 2 and isinstance(n.args[1], (list, tuple)):
+            old_shape_arg = list(n.args[1])
+            if len(old_shape_arg) == len(new_shape):
+                new_shape_arg = list(old_shape_arg[:-1]) + [shard_d]
+                n.args = (n.args[0], new_shape_arg) + tuple(n.args[2:])
+        _resize_node_val_and_tensor_meta(n, new_shape)
+        n.meta["numa_shard_plan"] = shard_plan
+        _set_numa_meta(
+            n, plan_id=plan_id, shard_id=shard_id, total_shards=world_size,
+            role="y_shard", target_node=shard_id,
+        )
+    return True
+
+
+def shape_nd_or_none(node: torch.fx.Node) -> Optional[Tuple[int, ...]]:
+    val = node.meta.get("val")
+    shape: Optional[Tuple[Any, ...]] = None
+    if isinstance(val, torch.Tensor):
+        shape = tuple(val.shape)
+    else:
+        tm = _get_single_tensor_metadata(node)
+        if tm is not None:
+            shape = tuple(tm.shape)
+    if shape is None:
+        return None
+    out: List[int] = []
+    for s in shape:
+        i = _shape_dim_to_int(s)
+        if i is None:
+            return None
+        out.append(i)
+    return tuple(out)
+
+
 def numa_mlp_tp_pass(graph: torch.fx.Graph) -> None:
     """
     Rewrites linear->gelu->linear dimensions for NUMA tensor-parallel execution.
@@ -661,6 +1208,17 @@ def numa_mlp_tp_pass(graph: torch.fx.Graph) -> None:
         )
         linear2.meta["numa_shard_plan"] = shard_plan
         changed = True
+
+    # ---- GeGLU pattern (Gemma) ----
+    geglu_matches = _find_geglu_quintuples(graph)
+    _debug(f"GeGLU candidates: {len(geglu_matches)}")
+    for m in geglu_matches:
+        plan_id = next(plan_counter)
+        shard_id = _get_compute_shard_id(world_size)
+        if _apply_geglu_plan(
+            graph, m, world_size=world_size, plan_id=plan_id, shard_id=shard_id
+        ):
+            changed = True
 
     if changed:
         graph.lint()
