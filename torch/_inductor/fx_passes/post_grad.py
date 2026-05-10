@@ -50,6 +50,7 @@ from .ddp_fusion import fuse_ddp_communication
 from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
 from .numa_attention_tp import numa_attention_tp_pass
+from .numa_gemma_attention_tp import numa_gemma_attention_tp_pass
 from .numa_layer_norm_tp import numa_layer_norm_tp_pass
 from .numa_lm_head_tp import numa_lm_head_tp_pass
 from .numa_mlp_tp import numa_mlp_tp_pass
@@ -136,6 +137,10 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     if config._numa_attention_tp:
         numa_attention_tp_pass(gm.graph)
+        # Gemma-specific attention path (manual softmax + GQA replicated KV).
+        # Fires only on graphs the GPT-2-style SDPA matcher above did not match;
+        # gated by the same config flag.
+        numa_gemma_attention_tp_pass(gm.graph)
 
     # Must run AFTER attention/MLP passes — it keys off the ``numa_shard_plan``
     # they leave on the row-parallel out_linear nodes.
