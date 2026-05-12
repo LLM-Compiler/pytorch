@@ -84,6 +84,7 @@ def run_one_mode(
     num_tp_shards: Optional[int],
     warmup: int,
     iters: int,
+    attn_logit_softcapping: Optional[float] = None,
 ) -> Tuple[float, int, int]:
     """Returns ``(mean_ms, shards_used, n_nodes)``."""
     torch.manual_seed(0)
@@ -127,6 +128,7 @@ def run_one_mode(
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             intermediate_size=mlp_hidden,
+            attn_logit_softcapping=attn_logit_softcapping,
         ).to(device).eval()
         for p in model.parameters():
             nn.init.normal_(p, std=0.02)
@@ -182,6 +184,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--num-kv-heads", type=int, default=1)
     p.add_argument("--head-dim", type=int, default=256)
     p.add_argument("--mlp-hidden", type=int, default=6912)
+    p.add_argument("--attn-logit-softcapping", type=float, default=None,
+                   help="Gemma 9B/27B-style attn-logit softcapping cap (e.g. 50.0)")
     p.add_argument("--num-tp-shards", type=int, default=None)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
@@ -202,6 +206,7 @@ def main() -> None:
         num_tp_shards=args.num_tp_shards,
         warmup=args.warmup,
         iters=args.iters,
+        attn_logit_softcapping=args.attn_logit_softcapping,
     )
     try:
         std_mean, _, _ = run_one_mode("standard", **kw)

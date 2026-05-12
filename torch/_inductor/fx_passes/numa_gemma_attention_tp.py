@@ -204,11 +204,39 @@ def _find_attention_blocks(graph: torch.fx.Graph) -> List[Dict[str, Any]]:
     for bmm0 in list(graph.nodes):
         if not _is_bmm(bmm0):
             continue
-        # bmm output -> reshape -> add(mask) -> softmax chain
+        # bmm output -> reshape -> [optional softcap: div -> tanh -> mul] -> add(mask) -> softmax
         view_qk = next((u for u in bmm0.users if _is_reshape(u)), None)
         if view_qk is None:
             continue
-        add_mask = next((u for u in view_qk.users if _is_call(u, aten.add.Tensor)), None)
+        softcap_nodes: List[torch.fx.Node] = []
+        anchor: torch.fx.Node = view_qk
+        # Gemma 9B/27B attn-logit softcapping: scores = mul(tanh(div(scores, cap)), cap).
+        # Detect by looking for a div.Tensor user of view_qk whose other arg is a scalar
+        # (the softcap value, e.g. 50.0 for Gemma-27B).
+        div_n = next(
+            (
+                u for u in view_qk.users
+                if _is_call(u, aten.div.Tensor) and len(u.args) >= 2 and not isinstance(u.args[1], torch.fx.Node)
+            ),
+            None,
+        )
+        if div_n is not None:
+            tanh_n = next((u for u in div_n.users if _is_call(u, aten.tanh.default)), None)
+            mul_n = (
+                next(
+                    (
+                        u for u in tanh_n.users
+                        if _is_call(u, aten.mul.Tensor) and len(u.args) >= 2 and not isinstance(u.args[1], torch.fx.Node)
+                    ),
+                    None,
+                )
+                if tanh_n is not None
+                else None
+            )
+            if tanh_n is not None and mul_n is not None:
+                softcap_nodes = [div_n, tanh_n, mul_n]
+                anchor = mul_n
+        add_mask = next((u for u in anchor.users if _is_call(u, aten.add.Tensor)), None)
         if add_mask is None:
             continue
         sm = _find_softmax_chain_after_add(add_mask)
@@ -271,6 +299,7 @@ def _find_attention_blocks(graph: torch.fx.Graph) -> List[Dict[str, Any]]:
                 "mm_v": mm_v,
                 "bmm0": bmm0,
                 "view_qk": view_qk,
+                "softcap_nodes": softcap_nodes,
                 "add_mask": add_mask,
                 "softmax": sm,
                 "expand_attn": expand_attn,
@@ -460,11 +489,13 @@ def _apply_plan(
     shard_kv_size = kv_size // world_size if slice_kv else kv_size
     shard_kv_heads = num_kv_heads // world_size if slice_kv else num_kv_heads
 
+    softcap_present = bool(match.get("softcap_nodes"))
     _debug(
         f"match plan_id={plan_id}: q_size={q_size} kv_size={kv_size} hidden={hidden_q} "
         f"H_total={H_total} num_kv_heads={num_kv_heads} head_dim={head_dim} | "
         f"shard_q={shard_q} H_shard={H_shard} slice_kv={slice_kv} "
-        f"shard_kv_heads={shard_kv_heads} compute_shard={shard_id}/{world_size}"
+        f"shard_kv_heads={shard_kv_heads} compute_shard={shard_id}/{world_size} "
+        f"softcap={softcap_present}"
     )
 
     # Sequence length S is also part of the chain shapes; if it happens to
