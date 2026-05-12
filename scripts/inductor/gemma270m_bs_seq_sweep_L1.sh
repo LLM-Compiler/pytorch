@@ -23,7 +23,6 @@ WARMUP="${WARMUP:-5}"
 ITERS="${ITERS:-20}"
 
 CONFIGS=(
-  "4 2048"
   "8 2048"
   "1 4096"
   "2 2048"
