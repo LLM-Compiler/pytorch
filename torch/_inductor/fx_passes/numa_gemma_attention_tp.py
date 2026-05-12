@@ -832,10 +832,14 @@ def _apply_plan(
         if changed:
             _refresh_val(n, tuple(new_sh))
 
-    column_parallel_nodes: List[Tuple[str, int]] = [(wq.name, 0)]
+    # 3-tuple form: (name, dim, shard_size). Wq uses ``shard_q`` and Wk/Wv use
+    # ``shard_kv_size`` — under GQA with num_kv_heads < num_heads these differ.
+    # The wrapper reads the per-node shard_size from index 2 instead of relying
+    # on the plan-wide ``shard_d`` (which still defaults to ``shard_q``).
+    column_parallel_nodes: List[Tuple[str, int, int]] = [(wq.name, 0, shard_q)]
     if slice_kv:
-        column_parallel_nodes.append((wk.name, 0))
-        column_parallel_nodes.append((wv.name, 0))
+        column_parallel_nodes.append((wk.name, 0, shard_kv_size))
+        column_parallel_nodes.append((wv.name, 0, shard_kv_size))
     replicated_nodes: List[str] = [] if slice_kv else [wk.name, wv.name]
 
     shard_plan: Dict[str, Any] = {
@@ -847,7 +851,7 @@ def _apply_plan(
         "compute_shard": shard_id,
         "x_node": _trace_x_placeholder(mm_q).name if _trace_x_placeholder(mm_q) else "",
         "column_parallel_nodes": column_parallel_nodes,
-        "row_parallel_nodes": [(wo.name, 1)],
+        "row_parallel_nodes": [(wo.name, 1, shard_q)],
         "replicated_nodes": replicated_nodes,
         "zero_on_nonzero_nodes": [],
         "q_size": q_size,

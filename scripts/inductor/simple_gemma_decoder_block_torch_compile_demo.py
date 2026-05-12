@@ -112,6 +112,7 @@ class GemmaAttention(nn.Module):
         rms_norm_eps: float,
         use_qk_norm: bool,
         attn_logit_softcapping: float | None,
+        use_kv_cache: bool = True,
     ) -> None:
         super().__init__()
         assert num_heads % num_kv_heads == 0
@@ -123,6 +124,12 @@ class GemmaAttention(nn.Module):
         self.kv_size = num_kv_heads * head_dim
         self.scaling = head_dim ** -0.5
         self.attn_logit_softcapping = attn_logit_softcapping
+        # Prefill-only cache-less mode: skip the in-graph ``index_copy_`` writes
+        # and use the freshly-computed xk/xv directly. The FX graph then has no
+        # k_cache/v_cache placeholders and no ``aten.index_put_`` -> downstream
+        # NUMA TP K/V sharding is no longer blocked by Inductor's fused
+        # index_copy stride bug.
+        self.use_kv_cache = use_kv_cache
 
         # Split Q/K/V weights (no bias). Shapes follow F.linear's (out, in)
         # convention: Wq is (q_size, hidden), Wk/Wv are (kv_size, hidden).
@@ -137,8 +144,8 @@ class GemmaAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs_cis: torch.Tensor,
-        kv_write_indices: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        kv_write_indices: torch.Tensor | None,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor] | None,
         mask: torch.Tensor,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
@@ -156,10 +163,13 @@ class GemmaAttention(nn.Module):
         xq = apply_rotary_emb(xq, freqs_cis=freqs_cis)
         xk = apply_rotary_emb(xk, freqs_cis=freqs_cis)
 
-        k_cache, v_cache = kv_cache
-        k_cache.index_copy_(1, kv_write_indices, xk)
-        v_cache.index_copy_(1, kv_write_indices, xv)
-        key, value = k_cache, v_cache
+        if self.use_kv_cache:
+            k_cache, v_cache = kv_cache
+            k_cache.index_copy_(1, kv_write_indices, xk)
+            v_cache.index_copy_(1, kv_write_indices, xv)
+            key, value = k_cache, v_cache
+        else:
+            key, value = xk, xv
         if self.num_kv_heads != self.num_heads:
             key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=2)
             value = torch.repeat_interleave(value, self.num_queries_per_kv, dim=2)
@@ -214,11 +224,13 @@ class GemmaDecoderLayer(nn.Module):
         use_pre_ffw_norm: bool,
         use_post_ffw_norm: bool,
         attn_logit_softcapping: float | None,
+        use_kv_cache: bool = True,
     ) -> None:
         super().__init__()
         self.self_attn = GemmaAttention(
             hidden_size, num_heads, num_kv_heads, head_dim,
             rms_norm_eps, use_qk_norm, attn_logit_softcapping,
+            use_kv_cache=use_kv_cache,
         )
         self.mlp = GemmaMLP(hidden_size, intermediate_size)
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -234,8 +246,8 @@ class GemmaDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs_cis: torch.Tensor,
-        kv_write_indices: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        kv_write_indices: torch.Tensor | None,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor] | None,
         mask: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -269,13 +281,16 @@ class SimpleGemmaStack(nn.Module):
         use_pre_ffw_norm: bool = True,
         use_post_ffw_norm: bool = True,
         attn_logit_softcapping: float | None = None,
+        use_kv_cache: bool = True,
     ) -> None:
         super().__init__()
+        self.use_kv_cache = use_kv_cache
         self.layers = nn.ModuleList(
             GemmaDecoderLayer(
                 hidden_size, num_heads, num_kv_heads, head_dim,
                 intermediate_size, rms_norm_eps, use_qk_norm,
                 use_pre_ffw_norm, use_post_ffw_norm, attn_logit_softcapping,
+                use_kv_cache=use_kv_cache,
             )
             for _ in range(num_layers)
         )
@@ -284,12 +299,16 @@ class SimpleGemmaStack(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs_cis: torch.Tensor,
-        kv_write_indices: torch.Tensor,
+        kv_write_indices: torch.Tensor | None,
         kv_caches,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        for layer, kv in zip(self.layers, kv_caches):
-            hidden_states = layer(hidden_states, freqs_cis, kv_write_indices, kv, mask)
+        if self.use_kv_cache:
+            for layer, kv in zip(self.layers, kv_caches):
+                hidden_states = layer(hidden_states, freqs_cis, kv_write_indices, kv, mask)
+        else:
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, freqs_cis, None, None, mask)
         return hidden_states
 
 
@@ -322,19 +341,24 @@ def _mean_forward_seconds(fn, *, warmup: int, iters: int) -> float:
 def _build_prefill_inputs(
     B: int, S: int, H_in: int, num_kv_heads: int, head_dim: int,
     num_layers: int, device: torch.device,
+    use_kv_cache: bool = True,
 ):
     x = torch.randn(B, S, H_in, device=device)
     freqs_cis = precompute_freqs_cis(head_dim, S).to(device)
-    kv_write_indices = torch.arange(S, device=device)
-    kv_caches = [
-        (
-            torch.zeros(B, S, num_kv_heads, head_dim, device=device),
-            torch.zeros(B, S, num_kv_heads, head_dim, device=device),
-        )
-        for _ in range(num_layers)
-    ]
     mask = torch.full((1, 1, S, S), float("-inf"), device=device)
     mask = torch.triu(mask, diagonal=1)
+    if use_kv_cache:
+        kv_write_indices = torch.arange(S, device=device)
+        kv_caches = [
+            (
+                torch.zeros(B, S, num_kv_heads, head_dim, device=device),
+                torch.zeros(B, S, num_kv_heads, head_dim, device=device),
+            )
+            for _ in range(num_layers)
+        ]
+    else:
+        kv_write_indices = None
+        kv_caches = None
     return x, freqs_cis, kv_write_indices, kv_caches, mask
 
 

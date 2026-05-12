@@ -588,6 +588,13 @@ _numa_attention_tp_debug: bool = False
 # Last full NUMA attention TP shard plan captured from FX pass. Used as a
 # codegen fallback when kernel-level origin metadata is unavailable.
 _numa_attention_tp_shard_plan: Optional[Dict[str, Any]] = None
+# Opt-in K/V column-parallel sharding for Gemma attention. Requires
+# num_kv_heads >= world_size and num_kv_heads % world_size == 0. When True:
+# numa_gemma_attention_tp slices Wk/Wv along dim 0 so each socket only stores
+# its kv-head subset. Safe when the model has no in-graph KV cache writes
+# (use_kv_cache=False in the demo model) — otherwise an Inductor fused
+# index_copy stride bug crashes at runtime. Default False (K/V replicated).
+_numa_attention_tp_slice_kv: bool = False
 
 # Residual-add NUMA tensor-parallel pass: absorbs the trailing
 # ``aten.add(Z, X)`` after a row-parallel attention/MLP out_linear into the

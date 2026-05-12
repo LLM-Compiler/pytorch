@@ -129,12 +129,14 @@ def run_one_mode(
             head_dim=head_dim,
             intermediate_size=mlp_hidden,
             attn_logit_softcapping=attn_logit_softcapping,
+            use_kv_cache=False,
         ).to(device).eval()
         for p in model.parameters():
             nn.init.normal_(p, std=0.02)
 
         x, freqs_cis, kv_write_indices, kv_caches, mask = _build_prefill_inputs(
             B, S, h_in, num_kv_heads, head_dim, num_layers, device,
+            use_kv_cache=False,
         )
 
         if mode == "standard":

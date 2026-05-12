@@ -1915,8 +1915,10 @@ class PythonWrapperCodegen(CodeGen):
                     )
 
                     ngen = ensure_generalized_lists(numa_shard_plan)
-                    col_names = {n for n, _ in ngen.get("column_parallel_nodes", [])}
-                    row_names = {n for n, _ in ngen.get("row_parallel_nodes", [])}
+                    # Entries are 2-tuples (name, dim) or 3-tuples (name, dim,
+                    # shard_size). We only need the name here.
+                    col_names = {e[0] for e in ngen.get("column_parallel_nodes", [])}
+                    row_names = {e[0] for e in ngen.get("row_parallel_nodes", [])}
                     has_row = any(n in call_args for n in row_names)
                     has_col = any(n in call_args for n in col_names)
                     should_allreduce_outputs = has_row and not has_col
@@ -2148,12 +2150,27 @@ class PythonWrapperCodegen(CodeGen):
         x_node = normalized_plan.get("x_node")
         shard_d = int(normalized_plan.get("shard_d", 0))
 
-        column_parallel_map: Dict[str, int] = {
-            n: int(d) for n, d in normalized_plan.get("column_parallel_nodes", [])
-        }
-        row_parallel_map: Dict[str, int] = {
-            n: int(d) for n, d in normalized_plan.get("row_parallel_nodes", [])
-        }
+        # column_parallel_nodes / row_parallel_nodes entries are 2-tuples
+        # ``(name, dim)`` or 3-tuples ``(name, dim, shard_size)``. The 3-tuple
+        # form lets a plan slice different weights with different per-node
+        # chunk sizes (needed when Wq and Wk/Wv differ — Gemma GQA with
+        # num_kv_heads < num_heads: Wq uses shard_q, Wk/Wv use shard_kv_size).
+        # 2-tuples fall back to the plan-wide ``shard_d`` for backwards compat.
+        def _parse_pp_entry(entry):
+            if len(entry) == 3:
+                n, d, s = entry
+                return n, int(d), int(s)
+            n, d = entry
+            return n, int(d), int(shard_d)
+
+        column_parallel_map: Dict[str, Tuple[int, int]] = {}
+        for entry in normalized_plan.get("column_parallel_nodes", []):
+            n, d, s = _parse_pp_entry(entry)
+            column_parallel_map[n] = (d, s)
+        row_parallel_map: Dict[str, Tuple[int, int]] = {}
+        for entry in normalized_plan.get("row_parallel_nodes", []):
+            n, d, s = _parse_pp_entry(entry)
+            row_parallel_map[n] = (d, s)
         replicated_set = set(normalized_plan.get("replicated_nodes", []))
         zero_on_nonzero_set = set(normalized_plan.get("zero_on_nonzero_nodes", []))
 
@@ -2185,9 +2202,13 @@ class PythonWrapperCodegen(CodeGen):
                 )
             return clone_name
 
-        def _emit_slice_clone(var_name: str, dim: int, sid: int) -> str:
-            start = sid * shard_d
-            end = (sid + 1) * shard_d
+        def _emit_slice_clone(var_name: str, dim: int, sid: int, shard_size: Optional[int] = None) -> str:
+            # ``shard_size`` overrides the plan-wide ``shard_d`` so weights with
+            # smaller per-node chunks (Wk/Wv under GQA: ``shard_kv_size``) get
+            # their own start/end. Falls back to ``shard_d`` for legacy callers.
+            chunk = int(shard_size) if shard_size is not None else shard_d
+            start = sid * chunk
+            end = (sid + 1) * chunk
             # Stride-safety rule: Inductor's MM template bakes the IR buffer's
             # strides as Python constants (``stride_bk = {{stride("B", 0)}}``
             # etc.). For a ``SliceView`` of a C-contiguous parent, the IR
@@ -2343,11 +2364,13 @@ class PythonWrapperCodegen(CodeGen):
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
                 elif arg_name in column_parallel_map and shard_d > 0:
-                    name = _emit_slice_clone(arg_name, column_parallel_map[arg_name], sid)
+                    cp_dim, cp_size = column_parallel_map[arg_name]
+                    name = _emit_slice_clone(arg_name, cp_dim, sid, cp_size)
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
                 elif arg_name in row_parallel_map and shard_d > 0:
-                    name = _emit_slice_clone(arg_name, row_parallel_map[arg_name], sid)
+                    rp_dim, rp_size = row_parallel_map[arg_name]
+                    name = _emit_slice_clone(arg_name, rp_dim, sid, rp_size)
                     per_node_arg_names[sid].append(name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
                 else:
