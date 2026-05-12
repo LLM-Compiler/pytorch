@@ -531,6 +531,51 @@ def _apply_plan(
         mm_k.args = (mm_k.args[0], wk_shards[shard_id])
         mm_v.args = (mm_v.args[0], wv_shards[shard_id])
 
+    # Positional rewrite for the 4 bmm-input 3D reshapes
+    # (bmm0.args[0..1] and bmm1.args[0..1]). Each has shape literal
+    # [B*H_total, S, E] (for bmm input) or [B*H_total, S, S]. Value-based
+    # H_total->H_shard catches the leading dim only when B=1 (where it
+    # equals H_total exactly); for B>1 the leading literal is B*H_total
+    # which the value-based rule does not match. Compute the new leading
+    # dim positionally as (old // H_total) * H_shard. Safe to also run for
+    # B=1 — produces the same result as the value-based rule.
+    bmm_input_nodes: List[torch.fx.Node] = []
+    for bmm_node in (match.get("bmm0"), match.get("bmm1")):
+        if bmm_node is None:
+            continue
+        for inp in bmm_node.args[:2]:
+            if isinstance(inp, torch.fx.Node) and _is_reshape(inp):
+                bmm_input_nodes.append(inp)
+
+    # Nodes whose shape was set positionally above must be skipped by the
+    # value-based loop below; otherwise the H_total -> H_shard rule would
+    # re-rewrite an already-correct dim. This collides specifically when
+    # B*H_shard == H_total (i.e. B == world_size, e.g. B=2 with world_size=2).
+    positionally_rewritten: set = set()
+
+    for n in bmm_input_nodes:
+        if len(n.args) < 2 or not isinstance(n.args[1], (list, tuple)):
+            continue
+        raw = list(n.args[1])
+        if len(raw) != 3:
+            continue
+        d0 = raw[0]
+        if not isinstance(d0, int) or d0 <= 0 or H_total <= 0:
+            continue
+        if d0 % H_total != 0:
+            continue
+        new_d0 = (d0 // H_total) * H_shard
+        if new_d0 == d0:
+            continue
+        raw[0] = new_d0
+        head = list(n.args[:1])
+        tail = list(n.args[2:])
+        n.args = tuple(head + [raw] + tail)
+        sh = _shape(n)
+        if sh is not None and len(sh) == 3:
+            _refresh_val(n, (new_d0, sh[1], sh[2]))
+        positionally_rewritten.add(n)
+
     # Tag nodes by mm-ancestry. Used to disambiguate which axis to rewrite
     # when shape literals contain values that would otherwise be confusable
     # (e.g. num_heads == num_queries_per_kv == 4 in num_kv_heads=1 GQA).
@@ -591,6 +636,12 @@ def _apply_plan(
             _refresh_val(n, tuple(target))
             # Don't run the generic value-based rules below for this node —
             # they could re-rewrite an already-correct dim.
+            continue
+
+        # Same reasoning for the bmm-input 3D reshapes handled positionally
+        # before this loop: skip the value-based H_total -> H_shard rule so
+        # we don't re-rewrite (B*H_shard) -> H_shard when B*H_shard == H_total.
+        if n in positionally_rewritten:
             continue
 
         if _is_reshape(n) or _is_expand(n):
