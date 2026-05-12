@@ -109,6 +109,60 @@ def _is_bmm(n: Any) -> bool:
     return _is_call(n, aten.bmm.default)
 
 
+def _is_index_put(n: Any) -> bool:
+    return _is_call(n, aten.index_put.default)
+
+
+def _is_copy_(n: Any) -> bool:
+    return _is_call(n, aten.copy_.default)
+
+
+def _find_cache_index_put(mm_node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """Walk forward from ``mm_node`` and return the first ``aten.index_put.default``
+    node whose target (args[0]) is a placeholder. That target is the K or V
+    cache that gets written by the in-place ``index_copy_`` in the source.
+    Returns ``None`` if no such node is found in the forward cone (e.g.
+    cacheless test harnesses or eager-only models).
+    """
+    visited: set = set()
+    frontier: List[torch.fx.Node] = [mm_node]
+    while frontier:
+        n = frontier.pop()
+        if n in visited:
+            continue
+        visited.add(n)
+        for u in n.users:
+            if (
+                _is_index_put(u)
+                and len(u.args) >= 1
+                and isinstance(u.args[0], torch.fx.Node)
+                and u.args[0].op == "placeholder"
+            ):
+                return u
+            if u not in visited:
+                frontier.append(u)
+    return None
+
+
+def _find_companion_copy_(cache_ph: torch.fx.Node, ip_node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """After functionalization the in-place ``index_copy_`` becomes::
+
+        ip = aten.index_put.default(cache_ph, [...], values)
+        aten.copy_.default(cache_ph, ip)              # writes back via alias
+
+    Return that ``copy_`` node, or ``None`` if it has been DCE'd / never existed.
+    """
+    for u in list(cache_ph.users):
+        if (
+            _is_copy_(u)
+            and len(u.args) >= 2
+            and u.args[0] is cache_ph
+            and u.args[1] is ip_node
+        ):
+            return u
+    return None
+
+
 def _shape(n: torch.fx.Node) -> Optional[Tuple[int, ...]]:
     val = n.meta.get("val")
     if isinstance(val, torch.Tensor):
@@ -561,6 +615,69 @@ def _apply_plan(
     if slice_kv:
         mm_k.args = (mm_k.args[0], wk_shards[shard_id])
         mm_v.args = (mm_v.args[0], wv_shards[shard_id])
+
+        # K/V CACHE SLICING — PHASE 1 (FX-side groundwork; not end-to-end).
+        #
+        # When Wk/Wv are column-sharded, the K/V cache placeholders that the
+        # in-graph index_copy_ writes into are still full-size. Slice them in
+        # the graph (compute-shard slice) so shapes line up, and tag the slice
+        # so a future wrapper-codegen change ("Phase 2") can emit per-socket
+        # index_put calls writing to the disjoint kv-head slice each socket
+        # owns. Without Phase 2 every socket would race-write to the compute
+        # shard's slice instead of its own — wrong for decode and breaks the
+        # downstream prefill reads of ``index_put`` result.
+        #
+        # This block only runs when ``slice_kv=True``, which itself requires
+        # ``config._numa_attention_tp_slice_kv = True`` (default ``False``).
+        # The flag stays gated off until Phase 2 lands in wrapper.py.
+        KV_SHARD_DIM = 2   # cache shape: (B, max_S, num_kv_heads, head_dim)
+        kv_start = shard_id * shard_kv_heads
+        kv_end = (shard_id + 1) * shard_kv_heads
+        for mm_node, role in ((mm_k, "k_cache"), (mm_v, "v_cache")):
+            ip_node = _find_cache_index_put(mm_node)
+            if ip_node is None:
+                # No cache write in this graph (e.g. cacheless test harness).
+                # That's fine — the sharded K/V chain just stays in-graph.
+                _debug(f"slice_kv: no cache index_put downstream of {role[0]}m mm; skipping cache slice")
+                continue
+            cache_ph = ip_node.args[0]
+            cache_shape = _shape(cache_ph)
+            if cache_shape is None or len(cache_shape) != 4:
+                _debug(f"slice_kv: cache {cache_ph.name} has unexpected shape {cache_shape}; skipping")
+                continue
+            with graph.inserting_before(ip_node):
+                cache_slice = graph.call_function(
+                    aten.slice.Tensor, args=(cache_ph, KV_SHARD_DIM, kv_start, kv_end, 1)
+                )
+            new_cache_shape = list(cache_shape)
+            new_cache_shape[KV_SHARD_DIM] = shard_kv_heads
+            _refresh_val(cache_slice, tuple(new_cache_shape))
+            kv_cache_plan = {
+                "full_cache_name": cache_ph.name,
+                "shard_dim": KV_SHARD_DIM,
+                "shard_kv_heads": shard_kv_heads,
+                "num_kv_heads": num_kv_heads,
+                "world_size": world_size,
+                "compute_shard": shard_id,
+                "role": role,
+                "plan_id": plan_id,
+            }
+            cache_slice.meta["numa_kv_cache_plan"] = kv_cache_plan
+            # Rewire index_put.args[0] = slice (also refresh its shape).
+            ip_node.args = (cache_slice,) + tuple(ip_node.args[1:])
+            ip_node.meta["numa_kv_cache_plan"] = kv_cache_plan
+            ip_val = ip_node.meta.get("val")
+            if isinstance(ip_val, torch.Tensor):
+                _refresh_val(ip_node, tuple(new_cache_shape))
+            # Rewire the companion copy_(cache_ph, ip) → copy_(cache_slice, ip).
+            cp_node = _find_companion_copy_(cache_ph, ip_node)
+            if cp_node is not None:
+                cp_node.args = (cache_slice,) + tuple(cp_node.args[1:])
+                cp_node.meta["numa_kv_cache_plan"] = kv_cache_plan
+            _debug(
+                f"slice_kv: sliced {role} {cache_ph.name} -> {cache_slice.name} "
+                f"[dim={KV_SHARD_DIM}, {kv_start}:{kv_end}]; ip={ip_node.name}"
+            )
 
     # Positional rewrite for the 4 bmm-input 3D reshapes
     # (bmm0.args[0..1] and bmm1.args[0..1]). Each has shape literal
