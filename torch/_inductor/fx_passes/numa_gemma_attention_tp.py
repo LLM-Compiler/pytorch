@@ -467,6 +467,27 @@ def _apply_plan(
         f"shard_kv_heads={shard_kv_heads} compute_shard={shard_id}/{world_size}"
     )
 
+    # Sequence length S is also part of the chain shapes; if it happens to
+    # equal q_size, shard_q, kv_size, or shard_kv_size, value-based rewriting
+    # becomes ambiguous. Check this BEFORE mutating the graph so we leave
+    # everything untouched on bail-out (otherwise mm_q gets rewired to sliced
+    # weights but downstream view literals stay un-rewritten, producing a
+    # half-broken graph that fails at runtime with shape mismatches).
+    S_pre: Optional[int] = None
+    for u in mm_q.users:
+        if _is_reshape(u):
+            shp = _shape(u)
+            if shp is not None and len(shp) == 3 and shp[-1] == q_size:
+                S_pre = shp[1]
+                break
+    if S_pre is not None and S_pre in (q_size, shard_q, kv_size, shard_kv_size):
+        _debug(
+            f"S_dim={S_pre} collides with q_size/shard_q/kv_size/shard_kv_size "
+            f"({q_size}/{shard_q}/{kv_size}/{shard_kv_size}) — value-based rewrite "
+            f"would corrupt shapes; skipping this match before any graph mutation"
+        )
+        return False
+
     # Per-shard slice -> permute nodes, anchored before mm_q.
     wq_shards: List[torch.fx.Node] = []
     wo_shards: List[torch.fx.Node] = []
@@ -534,24 +555,6 @@ def _apply_plan(
             frontier.append(u)
     if mm_o not in visited:
         nodes_to_rewrite.append(mm_o)
-
-    # Sequence length S is also part of the chain shapes; if it happens to
-    # equal q_size or kv_size, value-based rewriting becomes ambiguous.
-    # Detect S from any reshape arg of form (1, S, q_size) directly off mm_q.
-    S_dim: Optional[int] = None
-    for u in mm_q.users:
-        if _is_reshape(u):
-            shp = _shape(u)
-            if shp is not None and len(shp) == 3 and shp[-1] == q_size:
-                S_dim = shp[1]
-                break
-    if S_dim is not None:
-        if S_dim == q_size or S_dim == shard_q or S_dim == kv_size or S_dim == shard_kv_size:
-            _debug(
-                f"S_dim={S_dim} collides with q_size/kv_size — value-based rewrite "
-                f"would corrupt shapes; skipping this match"
-            )
-            return False
 
     has_q_in = lambda t: "q" in t  # noqa: E731
 
