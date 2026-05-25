@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!-- <!DOCTYPE IntelParallelAdvisorSummaryCollection SYSTEM  "IntelParallelAdvisorSummaryCollection.dtd"> -->
+
+<IntelParallelAdvisorSummary version="" 
+                             kind="DATAKIND_SURVEY_EX" >
+  <hotspot filename="/tmp/tmpaj_sp4w5/main.cpp"
+           line_no="404"
+           routine="run_omp_kernels._omp_fn.0"
+           is_vectorized="0"
+           self_time="1.529909E+00"
+           total_time="7.171838E+02"
+           trip_counts="8320"
+           func_instance="132"
+           priority="0"/>
+  <hotspot filename="/tmp/tmp90fo3etd/main.cpp"
+           line_no="404"
+           routine="run_omp_kernels._omp_fn.0"
+           is_vectorized="0"
+           self_time="1.600106E-01"
+           total_time="6.063686E+02"
+           trip_counts="384"
+           func_instance="128"
+           priority="0"/>
+  <hotspot filename="/tmp/tmpo89bldfn/main.cpp"
+           line_no="404"
+           routine="run_omp_kernels._omp_fn.0"
+           is_vectorized="0"
+           self_time="6.899378E-01"
+           total_time="2.224098E+02"
+           trip_counts="4096"
+           func_instance="241"
+           priority="0"/>
+  <hotspot filename="/tmp/tmp90fo3etd/main.cpp"
+           line_no="425"
+           routine="launch"
+           is_vectorized="0"
+           self_time="0.000000E+00"
+           total_time="6.047197E+01"
+           trip_counts="1"
+           func_instance="23"
+           priority="0"/>
+  <hotspot filename="/tmp/tmp90fo3etd/main.cpp"
+           line_no="608"
+           routine="launch"
+           is_vectorized="0"
+           self_time="0.000000E+00"
+           total_time="6.047197E+01"
+           trip_counts="1"
+           func_instance="17"
+           priority="0"/>
+</IntelParallelAdvisorSummary >

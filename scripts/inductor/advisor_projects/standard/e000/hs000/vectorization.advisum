@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!-- <!DOCTYPE IntelParallelAdvisorSummaryCollection SYSTEM  "IntelParallelAdvisorSummaryCollection.dtd"> -->
+
+<IntelParallelAdvisorSummary version="" 
+                             kind="DATAKIND_SURVEY_EX" >
+  <hotspot filename="/tmp/torchinductor_ubuntu/nu/cnuaob64nvvgngcw6h5lfc4ga3hf7ug5reeit2wcyoanka3b5gll.py"
+           line_no="70"
+           routine="triton_tem_fused_bmm_4"
+           is_vectorized="1"
+           self_time="1.817303E+01"
+           total_time="1.817303E+01"
+           trip_counts="4"
+           func_instance="178"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/hv/chv5ttaqaxzfxckunnwkssugibexw6z4owww3alea6dft2q7sman.py"
+           line_no="31"
+           routine="triton_red_fused_add_arange_embedding_native_layer_norm_0"
+           is_vectorized="1"
+           self_time="6.200632E-01"
+           total_time="7.601205E-01"
+           trip_counts=""
+           func_instance="670"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/xu/cxung7wbudj577tnnbwl26lbmiavblpaaqq3q7whck4tzd7ykctw.py"
+           line_no="31"
+           routine="triton_red_fused_add_arange_embedding_native_layer_norm_9"
+           is_vectorized="1"
+           self_time="5.899870E-01"
+           total_time="7.499818E-01"
+           trip_counts=""
+           func_instance="663"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/xu/cxung7wbudj577tnnbwl26lbmiavblpaaqq3q7whck4tzd7ykctw.py"
+           line_no="31"
+           routine="triton_red_fused_add_arange_embedding_native_layer_norm_9"
+           is_vectorized="1"
+           self_time="4.699770E-01"
+           total_time="6.199885E-01"
+           trip_counts=""
+           func_instance="19"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/xu/cxung7wbudj577tnnbwl26lbmiavblpaaqq3q7whck4tzd7ykctw.py"
+           line_no="58"
+           routine="triton_red_fused_add_arange_embedding_native_layer_norm_9"
+           is_vectorized="1"
+           self_time="3.800183E-01"
+           total_time="3.800183E-01"
+           trip_counts=""
+           func_instance="519"
+           priority="0"/>
+</IntelParallelAdvisorSummary >

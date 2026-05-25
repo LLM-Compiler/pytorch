@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!-- <!DOCTYPE IntelParallelAdvisorSummaryCollection SYSTEM  "IntelParallelAdvisorSummaryCollection.dtd"> -->
+
+<IntelParallelAdvisorSummary version="" 
+                             kind="DATAKIND_SURVEY_EX" >
+  <hotspot filename="/tmp/torchinductor_ubuntu/og/cogvqknst6wd4e7467g5amcrb6l3bvonsrr35hisrgrqavxcncdo.py"
+           line_no="66"
+           routine="triton_tem_fused_addmm_gelu_10"
+           is_vectorized="1"
+           self_time="1.339833E+03"
+           total_time="1.339833E+03"
+           trip_counts="80"
+           func_instance="899"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/ef/cefh6ix2ghpdofektt5xpfniptyjwvuueju4gmrgnxrakduwwf7d.py"
+           line_no="66"
+           routine="triton_tem_fused_addmm_1"
+           is_vectorized="1"
+           self_time="9.709877E+02"
+           total_time="9.709877E+02"
+           trip_counts="80"
+           func_instance="515"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/mf/cmft7yldg2253ofevg2agk5nzy6qj4xtksqah6oxtjia4bp3pmhb.py"
+           line_no="66"
+           routine="triton_tem_fused_addmm_8"
+           is_vectorized="1"
+           self_time="2.973859E+02"
+           total_time="2.973859E+02"
+           trip_counts="40"
+           func_instance="859"
+           priority="0"/>
+  <hotspot filename="/tmp/tmp90fo3etd/main.cpp"
+           line_no="555"
+           routine="operator()"
+           is_vectorized="0"
+           self_time="2.898988E+00"
+           total_time="4.110907E+03"
+           trip_counts="195"
+           func_instance="487"
+           priority="0"/>
+  <hotspot filename="/tmp/tmpaj_sp4w5/main.cpp"
+           line_no="555"
+           routine="operator()"
+           is_vectorized="0"
+           self_time="2.463928E+00"
+           total_time="1.110568E+03"
+           trip_counts="1760"
+           func_instance="117"
+           priority="0"/>
+</IntelParallelAdvisorSummary >

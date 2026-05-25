@@ -1,0 +1,30 @@
+======================================================================
+  Cache-Aware Roofline Comparison
+  Standard path  vs  NUMA tensor-parallel path
+======================================================================
+
+=== TOP LOOPS — STANDARD (no NUMA) ===
+sep=,
+
+"Intel(R) Advisor Command Line Tool
+Copyright (C) 2009-2025 Intel Corporation. All rights reserved."
+"Survey Data version=1.1.0","delimiter=,"
+
+"Function Call Sites and Loops","Total Time","Self Time","Type","Why No Vectorization","Vector ISA","Compiler Estimated Gain","Transformations","Source Location","Module"
+"Total","1672.866s","0s","","","","","","",""
+"func@0x129c40","1445.096s","0s","Function","","","","","","libc.so.6"
+"func@0x9c720","1445.096s","0s","Function","","","","","","libc.so.6"
+"[loop in func@0x9c720]","1445.096s","2.529s","Scalar","","","","","","libc.so.6"
+
+=== TOP LOOPS — NUMA-TP ===
+sep=,
+
+"Intel(R) Advisor Command Line Tool
+Copyright (C) 2009-2025 Intel Corporation. All rights reserved."
+"Survey Data version=1.1.0","delimiter=,"
+
+"Function Call Sites and Loops","Total Time","Self Time","Type","Why No Vectorization","Vector ISA","Compiler Estimated Gain","Transformations","Source Location","Module"
+"Total","2427.195s","0s","","","","","","",""
+"func@0x129c40","2202.508s","0s","Function","","","","","","libc.so.6"
+"func@0x9c720","2202.508s","0s","Function","","","","","","libc.so.6"
+"[loop in func@0x9c720]","2202.508s","2.509s","Scalar","","","","","","libc.so.6"

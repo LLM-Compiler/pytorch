@@ -1,0 +1,17 @@
+======================================================================
+  Cache-Aware Roofline Comparison
+  Standard path  vs  NUMA tensor-parallel path
+======================================================================
+
+=== TOP LOOPS — STANDARD (no NUMA) ===
+sep=,
+
+"Intel(R) Advisor Command Line Tool
+Copyright (C) 2009-2025 Intel Corporation. All rights reserved."
+"Survey Data version=1.1.0","delimiter=,"
+
+"Function Call Sites and Loops","Total Time","Self Time","Type","Why No Vectorization","Vector ISA","Compiler Estimated Gain","Transformations","Source Location","Module"
+"Total","2120.271s","0s","","","","","","",""
+"func@0x129c40","1526.338s","0s","Function","","","","","","libc.so.6"
+"func@0x9c720","1526.338s","0s","Function","","","","","","libc.so.6"
+"[loop in func@0x9c720]","1526.338s","2.529s","Scalar","","","","","","libc.so.6"

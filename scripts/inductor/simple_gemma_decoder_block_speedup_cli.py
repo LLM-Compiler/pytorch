@@ -191,6 +191,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--num-tp-shards", type=int, default=None)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
+    p.add_argument("--detailed", action="store_true", help="Output std_mean numa_mean speedup")
     return p.parse_args()
 
 
@@ -234,7 +235,11 @@ def main() -> None:
     if not (speedup == speedup):
         print("speedup is nan", file=sys.stderr)
         raise SystemExit(1)
-    print(speedup)
+    
+    if args.detailed:
+        print(f"{std_mean:.2f} {numa_mean:.2f} {speedup:.3f}")
+    else:
+        print(speedup)
 
 
 if __name__ == "__main__":

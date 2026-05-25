@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!-- <!DOCTYPE IntelParallelAdvisorSummaryCollection SYSTEM  "IntelParallelAdvisorSummaryCollection.dtd"> -->
+
+<IntelParallelAdvisorSummary version="" 
+                             kind="DATAKIND_SURVEY_EX" >
+  <hotspot filename="/tmp/torchinductor_ubuntu/je/cjetz3oqndimslbhdu5swenwytyzy4crbultgir7jrpkohdgexup.py"
+           line_no="70"
+           routine="triton_tem_fused_bmm_6"
+           is_vectorized="1"
+           self_time="5.671499E+02"
+           total_time="5.671499E+02"
+           trip_counts="256"
+           func_instance="409"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/ou/couu4xvtkqq43rmr7pmmlzjhgb434r6vku2e5mqot3rruie33rq5.py"
+           line_no="47"
+           routine="triton_red_fused__safe_softmax_5"
+           is_vectorized="1"
+           self_time="9.271948E+01"
+           total_time="1.548332E+02"
+           trip_counts="2"
+           func_instance="677"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/su/csuki6k4iasx72r326fpti5h7djstfdrk6bvntijvwdps62ykcpq.py"
+           line_no="66"
+           routine="triton_tem_fused_addmm_8"
+           is_vectorized="1"
+           self_time="6.879883E+01"
+           total_time="6.879883E+01"
+           trip_counts="48"
+           func_instance="301"
+           priority="0"/>
+  <hotspot filename="/tmp/tmpaj_sp4w5/main.cpp"
+           line_no="555"
+           routine="operator()"
+           is_vectorized="0"
+           self_time="1.389992E+00"
+           total_time="9.201695E+02"
+           trip_counts="4160"
+           func_instance="763"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/mh/cmh2kd4d272qprkqebq6jjy3vlbeeknshlpg56w42bxarwjngrqn.py"
+           line_no="30"
+           routine="triton_red_fused_add_arange_embedding_native_layer_norm_9"
+           is_vectorized="1"
+           self_time="1.359976E+00"
+           total_time="1.719977E+00"
+           trip_counts=""
+           func_instance="469"
+           priority="0"/>
+</IntelParallelAdvisorSummary >

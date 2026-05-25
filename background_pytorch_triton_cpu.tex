@@ -1,0 +1,288 @@
+% ============================================================
+%  Background section: PyTorch 2.0 Compiler Stack + Triton CPU
+%  Two-column IEEE conference format
+% ============================================================
+\documentclass[conference]{IEEEtran}
+
+% ---- packages -----------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{cite}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{balance}
+
+\begin{document}
+
+% ============================================================
+\section{Background}
+\label{sec:background}
+% ============================================================
+
+% ------------------------------------------------------------
+\subsection{The PyTorch~2.0 Compiler Stack with Triton CPU}
+\label{sec:bg_pytorch}
+% ------------------------------------------------------------
+
+PyTorch 2.0 introduced a production-grade compilation pathway that
+transforms eager-mode model definitions into high-performance native
+code without requiring any changes to model source~\cite{ansel2024pytorch2}.
+The stack pairs \emph{TorchDynamo}—a Python bytecode–level graph
+capture frontend—with \emph{TorchInductor}, a backend that schedules
+and generates kernels for the captured computation graph.
+By default, Inductor targets CPU workloads by emitting C++ loop nests
+that are compiled and executed directly.
+In this work we replace the C++ CPU codegen backend with the
+\emph{Triton CPU} backend~\cite{tillet2019triton, triton_cpu_repo},
+motivated by two properties that are central to our approach:
+
+\begin{enumerate}[leftmargin=*, label=\arabic*., itemsep=2pt]
+
+    \item \textbf{Inductor-integrated extensible codegen.}
+          Triton CPU is an experimental backend that plugs into
+          Inductor's codegen abstraction layer.  Unlike the C++ backend,
+          it exposes a well-defined, stage-by-stage lowering pipeline
+          into which new target-specific transformations can be inserted
+          without modifying core Inductor code.  This makes it possible
+          to augment the generated kernel call-sites with the per-socket
+          memory placement and metadata annotations required for
+          tensor-parallel execution.
+
+    \item \textbf{MLIR-based compiler and runtime extensibility.}
+          Triton CPU is built on the MLIR compiler
+          infrastructure~\cite{lattner2021mlir}, which organises
+          compilation as a cascade of modular dialect lowerings.
+          Because both the compiler passes and the runtime launcher
+          are written against well-specified MLIR and C++ interfaces,
+          new execution models—such as the NUMA-aware thread pool
+          introduced in this work—can be grafted onto the runtime
+          without invasive changes to the Triton compiler itself.
+
+\end{enumerate}
+
+The following subsections describe the end-to-end compilation pipeline,
+from model definition to kernel execution on CPU, focusing on the
+unmodified upstream behaviour.  Points where this work extends the
+pipeline are noted inline and elaborated in Section~\ref{sec:approach}.
+
+% ............................................................
+\subsubsection{TorchDynamo: Graph Capture}
+\label{sec:bg_dynamo}
+% ............................................................
+
+TorchDynamo operates by intercepting Python bytecode at the interpreter
+level before it is executed~\cite{ansel2024pytorch2}.
+When a model is decorated with \texttt{torch.compile}, Dynamo installs
+a frame evaluation hook that observes each Python instruction.
+As the model's forward pass runs, Dynamo records the sequence of ATen
+tensor operations into an acyclic dataflow graph—the \emph{FX graph}—in
+which each node represents a primitive operator and edges carry tensor
+values between producers and consumers.
+Control flow that depends on runtime tensor values, such as
+data-dependent branches, is handled by splitting the graph at the
+branch point and re-tracing the relevant sub-graph when the condition
+changes.  Shapes and data types are propagated through the graph by
+executing each node symbolically against abstract tensor
+(\emph{FakeTensor}) proxies, so that downstream stages can reason about
+memory layouts and sizes without running real computation.
+
+% ............................................................
+\subsubsection{TorchInductor: Lowering and Optimization}
+\label{sec:bg_inductor}
+% ............................................................
+
+TorchInductor receives the captured FX graph and transforms it in
+several stages before emitting kernel code.
+The first stage is a set of \emph{post-gradient FX passes} that
+rewrite subgraph patterns at the ATen operator level.
+These passes perform algebraic simplifications, operator fusion
+opportunities, and target-specific graph rewrites; they operate
+directly on FX graph nodes and leave behind a semantically equivalent
+but more execution-friendly graph.
+In this work, we extend this FX pass stage to match the weight-linear
+and attention sub-graphs present in each transformer layer and rewrite
+them into a tensor-parallel form, inserting per-socket weight slices
+and propagating kernel-sharding metadata through the graph; the details
+are described in Section~\ref{sec:approach}.
+
+Following the FX passes, Inductor lowers the transformed graph to its
+own loop-level intermediate representation.  This IR makes loop bounds,
+reduction axes, and access patterns explicit, enabling Inductor's
+scheduler to identify kernels that can be fused, determine tiling
+strategies, and allocate intermediate buffers.  The scheduler then
+hands each kernel to the configured codegen backend—Triton CPU in our
+setting—together with the loop structure and buffer metadata required to
+generate executable code.
+
+% ............................................................
+\subsubsection{Triton Code Generation}
+\label{sec:bg_triton_cg}
+% ............................................................
+
+Inductor's Triton codegen backend~\cite{ansel2024pytorch2} translates
+each scheduled kernel into a Triton kernel program.
+We use the existing codegen path without changes to the kernel body
+representation; only the kernel \emph{call-site} wrapper is extended to
+carry the per-socket tensor pointers and metadata described in
+Section~\ref{sec:approach}.
+
+In the generated kernel, computation is organised as a
+three-dimensional grid of independently executable \emph{program
+instances}.  Each program instance is identified at runtime by its
+three integer coordinates within the grid—analogous to a thread block
+index in GPU programming.  Within a program instance, operations are
+applied to a contiguous tile of elements whose width is chosen to match
+the SIMD vector width of the target processor.  Tile-width boundaries
+and out-of-bounds access are handled through predicate masks, so the
+same kernel body executes correctly regardless of whether the problem
+size divides evenly into tiles.  A Python wrapper module generated
+alongside the kernel encodes the grid dimensions and the argument
+layout needed to invoke the compiled binary.
+
+% ............................................................
+\subsubsection{Kernel Compilation via MLIR}
+\label{sec:bg_compilation}
+% ............................................................
+
+Each Triton kernel is compiled through a multi-stage MLIR lowering
+pipeline~\cite{lattner2021mlir} that progressively translates the kernel
+from Triton's high-level tile IR through a CPU-specific MLIR dialect—
+applying vectorisation, SIMD instruction selection, and target-specific
+optimisations—before emitting native assembly and linking it into a
+shared object binary (\texttt{.so}).
+This binary is stored in a content-addressed on-disk cache and loaded
+into the Python process at inference time, so repeated invocations with
+the same kernel signature and input shapes incur no recompilation
+overhead.
+
+% ............................................................
+\subsubsection{Triton CPU Runtime}
+\label{sec:bg_triton_rt}
+% ............................................................
+
+At runtime, each kernel binary is invoked through a
+\emph{CPULauncher}: a small C++ extension module that is compiled once
+per unique kernel signature and loaded dynamically into the Python
+process.  The launcher's \texttt{launch} entry point receives the
+kernel's three-dimensional grid extents, a pointer to the compiled
+kernel function, and the tensor argument list.  It then constructs the
+complete set of grid coordinates—one three-tuple for each program
+instance—and distributes execution of those program instances across the
+available processor cores.
+
+In the standard execution path the launcher uses OpenMP's static-schedule
+parallel loop to assign contiguous ranges of grid blocks to hardware
+threads.  Each thread calls the kernel function with the coordinates of
+each block in its assigned range; the kernel uses those coordinates to
+compute the element range it is responsible for and performs the
+corresponding vectorised load-compute-store operations.  No
+synchronisation between threads is needed because grid blocks are
+defined to be independent.
+
+The current upstream Triton CPU runtime is \emph{NUMA-unaware}: threads
+are allocated to grid blocks without any regard for which physical
+memory controller holds the operand tensors, and the operating system
+scheduler is free to migrate threads across sockets between kernel
+launches.  As a consequence, a significant fraction of memory accesses
+cross the inter-socket interconnect, incurring remote NUMA latency that
+substantially reduces effective memory bandwidth.  Our modifications to
+this runtime—which introduce a persistent per-socket thread pool with
+explicit CPU affinity binding and route each socket's threads to the
+weight copies resident in local DRAM—are described in
+Section~\ref{sec:approach}.
+
+% ============================================================
+%  References
+% ============================================================
+\bibliographystyle{IEEEtran}
+
+\begin{thebibliography}{10}
+
+\bibitem{ansel2024pytorch2}
+J.~Ansel, E.~Yang, H.~He, N.~Gimelshein, A.~Jain, M.~Voznesensky,
+B.~Bao, P.~Bell, D.~Berard, E.~Burovski, G.~Chauhan, A.~Chourdia,
+W.~Constable, A.~Desmaison, Z.~DeVito, E.~Ellison, W.~Feng, J.~Gong,
+M.~Gschwind, B.~Hirsh, S.~Huang, K.~Kalamkar, J.~Kirsch, M.~Lazos,
+M.~Lezcano, Y.~Liang, J.~Liang, Y.~Lu, C.~K.~Luk, B.~Maher,
+Y.~Pan, C.~Puhrsch, M.~Reso, M.~Saroufim, M.~Y.~Siraichi,
+H.~Suk, M.~Suo, P.~Tillet, E.~Wang, X.~Wang, W.~Wen, S.~Zhang,
+X.~Zhao, K.~Zhou, R.~Zou, A.~Mathews, G.~Chanan, P.~Wu, and
+S.~Chintala,
+``PyTorch~2: Faster machine learning through dynamic Python bytecode
+transformation and graph compilation,''
+in \emph{Proc. 29th ACM Int. Conf. Architectural Support for
+Programming Languages and Operating Systems (ASPLOS)}, vol.~2,
+pp.~929--947, ACM, 2024.
+
+\bibitem{paszke2019pytorch}
+A.~Paszke, S.~Gross, F.~Massa, A.~Lerer, J.~Bradbury, G.~Chanan,
+T.~Killeen, Z.~Lin, N.~Gimelshein, L.~Antiga, A.~Desmaison,
+A.~Kopf, E.~Yang, Z.~DeVito, M.~Raison, A.~Tejani, S.~Chilamkurthy,
+B.~Steiner, L.~Fang, J.~Bai, and S.~Chintala,
+``PyTorch: An imperative style, high-performance deep learning library,''
+in \emph{Advances in Neural Information Processing Systems},
+vol.~32, pp.~8026--8037, 2019.
+
+\bibitem{tillet2019triton}
+P.~Tillet, H.~T.~Kung, and D.~Cox,
+``Triton: An intermediate language and compiler for tiled neural network
+computations,''
+in \emph{Proc. 3rd ACM SIGPLAN Int. Workshop on Machine Learning and
+Programming Languages (MAPL)}, pp.~10--19, ACM, 2019.
+
+\bibitem{triton_cpu_repo}
+OpenAI Triton Contributors,
+``Triton-CPU: CPU backend for the Triton compiler,''
+GitHub repository.
+[Online]. Available: \url{https://github.com/triton-lang/triton-cpu}
+
+\bibitem{lattner2021mlir}
+C.~Lattner, M.~Amini, U.~Bondhugula, A.~Cohen, A.~Davis, J.~Pienaar,
+R.~Riddle, T.~Shpeisman, N.~Vasilache, and O.~Zinenko,
+``MLIR: Scaling compiler infrastructure for domain specific
+computation,''
+in \emph{Proc. IEEE/ACM Int. Symp. Code Generation and Optimization
+(CGO)}, pp.~2--14, IEEE, 2021.
+
+\bibitem{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones,
+A.~N.~Gomez, \L.~Kaiser, and I.~Polosukhin,
+``Attention is all you need,''
+in \emph{Advances in Neural Information Processing Systems},
+vol.~30, 2017.
+
+\bibitem{brown2020gpt3}
+T.~B.~Brown, B.~Mann, N.~Ryder, M.~Subbiah, J.~Kaplan, P.~Dhariwal,
+A.~Neelakantan, P.~Shyam, G.~Sastry, A.~Askell \emph{et~al.},
+``Language models are few-shot learners,''
+in \emph{Advances in Neural Information Processing Systems},
+vol.~33, pp.~1877--1901, 2020.
+
+\bibitem{radford2019gpt2}
+A.~Radford, J.~Wu, R.~Child, D.~Luan, D.~Amodei, and I.~Sutskever,
+``Language models are unsupervised multitask learners,''
+\emph{OpenAI Blog}, vol.~1, no.~8, p.~9, 2019.
+
+\bibitem{shoeybi2019megatron}
+M.~Shoeybi, M.~Narayanan, H.~Peng, C.~Chi, J.~Casper, and
+B.~Catanzaro,
+``Megatron-LM: Training multi-billion parameter language models using
+model parallelism,''
+\emph{arXiv preprint arXiv:1909.08053}, 2019.
+
+\bibitem{luk2005intel}
+C.~K.~Luk, R.~Cohn, R.~Muth, H.~Patil, A.~Klauser, G.~Lowney,
+S.~Wallace, V.~J.~Reddi, and K.~Hazelwood,
+``Pin: Building customized program analysis tools with dynamic
+instrumentation,''
+in \emph{Proc. ACM SIGPLAN Conf. Programming Language Design and
+Implementation (PLDI)}, pp.~190--200, ACM, 2005.
+
+\end{thebibliography}
+
+\end{document}

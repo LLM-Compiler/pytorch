@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!-- <!DOCTYPE IntelParallelAdvisorSummaryCollection SYSTEM  "IntelParallelAdvisorSummaryCollection.dtd"> -->
+
+<IntelParallelAdvisorSummary version="" 
+                             kind="DATAKIND_SURVEY_EX" >
+  <hotspot filename="/tmp/tmp90fo3etd/main.cpp"
+           line_no="404"
+           routine="run_omp_kernels._omp_fn.0"
+           is_vectorized="0"
+           self_time="2.699881E-01"
+           total_time="1.500646E+03"
+           trip_counts="256"
+           func_instance="304"
+           priority="0"/>
+  <hotspot filename="/tmp/tmp90fo3etd/main.cpp"
+           line_no="425"
+           routine="launch"
+           is_vectorized="0"
+           self_time="0.000000E+00"
+           total_time="1.301545E+02"
+           trip_counts="1"
+           func_instance="253"
+           priority="0"/>
+  <hotspot filename="/tmp/tmp90fo3etd/main.cpp"
+           line_no="608"
+           routine="launch"
+           is_vectorized="0"
+           self_time="0.000000E+00"
+           total_time="1.301545E+02"
+           trip_counts="1"
+           func_instance="252"
+           priority="0"/>
+  <hotspot filename="/tmp/tmpaj_sp4w5/main.cpp"
+           line_no="404"
+           routine="run_omp_kernels._omp_fn.0"
+           is_vectorized="0"
+           self_time="1.100138E-01"
+           total_time="3.956765E+01"
+           trip_counts="426"
+           func_instance="113"
+           priority="0"/>
+  <hotspot filename="/tmp/torchinductor_ubuntu/nu/cnuaob64nvvgngcw6h5lfc4ga3hf7ug5reeit2wcyoanka3b5gll.py"
+           line_no="70"
+           routine="triton_tem_fused_bmm_4"
+           is_vectorized="1"
+           self_time="1.817303E+01"
+           total_time="1.817303E+01"
+           trip_counts="4"
+           func_instance="178"
+           priority="0"/>
+</IntelParallelAdvisorSummary >

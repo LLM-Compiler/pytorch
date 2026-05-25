@@ -1,0 +1,10 @@
+
+=== Start: [2026/05/09 23:13:04] === 
+Peak bandwidth measurement started...
+Peak bandwidth measurement finished.
+Analysis started...
+Result file: /home/ubuntu/pytorch-private/scripts/inductor/advisor_b1_s4096/numa/e000/trc000/trc000.advixe 
+Application exit code: 0 
+Result file: /home/ubuntu/pytorch-private/scripts/inductor/advisor_b1_s4096/numa/e000/trc000/trc000.advixe 
+Analysis completed
+=== End: [2026/05/10 00:41:41] === 

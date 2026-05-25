@@ -1,0 +1,7 @@
+Gemma-3 4B end-to-end prefill (L=1)  NUMA-TP vs standard
+B    S      speedup     
+---- ------ ------------
+1    4096   1.7875955007086004
+2    2048   1.3998557242694958
+4    512    FAIL        
+8    256    FAIL        

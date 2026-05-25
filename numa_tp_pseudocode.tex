@@ -1,0 +1,418 @@
+%% NUMA Tensor-Parallel Pseudocode
+%% Requires: algorithm2e, amsmath, amssymb
+%% Usage: \usepackage[ruled,linesnumbered,noend]{algorithm2e}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% Algorithm 1 – NUMA MLP Tensor-Parallel FX Pass
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{algorithm}[t]
+\caption{NUMA MLP Tensor-Parallel FX Pass}
+\label{alg:numa-mlp-pass}
+\small
+\DontPrintSemicolon
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKw{KwAnd}{and}
+\SetKw{KwFor}{for}
+\SetKw{KwEach}{each}
+\SetKw{KwReturn}{return}
+\SetKwFunction{FindMLPTriples}{FindMLPTriples}
+\SetKwFunction{Slice}{Slice}
+\SetKwFunction{RewireArgs}{RewireArgs}
+\SetKwFunction{RefreshMeta}{RefreshMeta}
+\SetKwFunction{Annotate}{Annotate}
+
+\KwIn{Post-grad FX graph $\mathcal{G}$; NUMA world size $N$}
+\KwOut{Rewired graph $\mathcal{G}'$ with \texttt{numa\_shard\_plan} metadata on each node}
+
+\BlankLine
+\If{$N < 2$}{\KwReturn}
+
+\ForEach{$(\text{lin}_1,\; \sigma,\; \text{lin}_2) \;\leftarrow\; \FindMLPTriples(\mathcal{G})$}{
+    \tcc{lin$_1$: $\mathbf{Y} = \mathbf{X}\mathbf{A} + \mathbf{b}_1 \in \mathbb{R}^{S \times d}$;
+         $\sigma$: element-wise activation;
+         lin$_2$: $\mathbf{Z} = \sigma(\mathbf{Y})\mathbf{B} + \mathbf{b}_2 \in \mathbb{R}^{S \times h}$}
+    \If{$d \bmod N \neq 0$}{\textbf{skip}}
+    $\delta \leftarrow d / N$\tcp*{hidden shard width per socket}
+
+    \BlankLine
+    \tcc{Step 1 – Insert weight-slice nodes (no in-graph clones).}
+    \For{$i \leftarrow 0$ \KwTo $N-1$}{
+        $\mathbf{A}_i \leftarrow \Slice(\mathbf{A},\; \dim{=}1,\; i\delta,\; (i{+}1)\delta)$
+            \tcp*{column-parallel: output-feature dim}
+        $\mathbf{B}_i \leftarrow \Slice(\mathbf{B},\; \dim{=}0,\; i\delta,\; (i{+}1)\delta)$
+            \tcp*{row-parallel: input-feature dim}
+        \If{$\mathbf{b}_1$ exists}{
+            $\mathbf{b}_{1,i} \leftarrow \Slice(\mathbf{b}_1,\; \dim{=}0,\; i\delta,\; (i{+}1)\delta)$}
+        \Annotate{$\mathbf{A}_i,\;\mathbf{B}_i$}{\texttt{numa\_shard\_plan}}
+    }
+
+    \BlankLine
+    \tcc{Step 2 – Rewire compute shard $s$ to use its own slices.}
+    $\RewireArgs(\text{lin}_1):\; (\mathbf{X},\,\mathbf{A}) \;\rightarrow\; (\mathbf{X},\,\mathbf{A}_s,\,\mathbf{b}_{1,s})$\;
+    $\RewireArgs(\text{lin}_2):\; (\sigma(\mathbf{Y}),\,\mathbf{B}) \;\rightarrow\; (\sigma(\mathbf{Y}),\,\mathbf{B}_s)$\;
+
+    \BlankLine
+    \tcc{Step 3 – Update FakeTensor shapes for downstream passes.}
+    $\RefreshMeta(\text{lin}_1):\; \text{shape} \;\leftarrow\; (S,\,\delta)$\;
+    $\RefreshMeta(\sigma,\;\text{intermediate nodes}):\; \text{shape} \;\leftarrow\; (S,\,\delta)$\;
+
+    \BlankLine
+    \tcc{Step 4 – Tag all nodes with the shard plan.}
+    Attach \texttt{numa\_shard\_plan} $\leftarrow \{$
+        \texttt{kind}: ``mlp'',\;
+        \texttt{world\_size}: $N$,\;
+        \texttt{shard\_d}: $\delta$,\;
+        \texttt{column\_parallel\_nodes}: $[(\mathbf{A},1),\;(\mathbf{b}_1,0)]$,\;
+        \texttt{row\_parallel\_nodes}: $[(\mathbf{B},0)]$,\;
+        \texttt{zero\_on\_nonzero\_nodes}: $[\mathbf{b}_2]$ $\}$
+        to $\{\text{lin}_1,\,\sigma,\,\text{lin}_2\}$\;
+}
+\end{algorithm}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% Algorithm 2 – NUMA GeGLU (Gemma) MLP Tensor-Parallel FX Pass
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{algorithm}[t]
+\caption{NUMA GeGLU MLP Tensor-Parallel FX Pass (Gemma)}
+\label{alg:numa-geglu-pass}
+\small
+\DontPrintSemicolon
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKw{KwAnd}{and}
+\SetKwFunction{FindGeGLU}{FindGeGLUTriples}
+\SetKwFunction{Slice}{Slice}
+\SetKwFunction{Permute}{Permute}
+\SetKwFunction{RewireArgs}{RewireArgs}
+\SetKwFunction{RefreshMeta}{RefreshMeta}
+\SetKwFunction{Annotate}{Annotate}
+
+\KwIn{Post-grad FX graph $\mathcal{G}$; NUMA world size $N$}
+\KwOut{Rewired graph $\mathcal{G}'$ with \texttt{numa\_shard\_plan} metadata}
+
+\BlankLine
+\If{$N < 2$}{\KwReturn}
+
+\ForEach{$(\mathbf{W}_\text{gate},\,\mathbf{W}_\text{up},\,\mathbf{W}_\text{down}) \;\leftarrow\; \FindGeGLU(\mathcal{G})$}{
+    \tcc{GeGLU block: $\mathbf{Z} = \bigl(\sigma_\text{tanh}(\mathbf{x}\mathbf{W}_\text{gate}^\top) \odot \mathbf{x}\mathbf{W}_\text{up}^\top\bigr)\mathbf{W}_\text{down}^\top$;
+         $\mathbf{W}_\text{gate},\mathbf{W}_\text{up} \in \mathbb{R}^{d \times h}$,\;
+         $\mathbf{W}_\text{down} \in \mathbb{R}^{h \times d}$}
+    \If{$d \bmod N \neq 0$}{\textbf{skip}}
+    $\delta \leftarrow d / N$\;
+
+    \BlankLine
+    \tcc{Step 1 – Per-shard slice$\rightarrow$permute for each weight matrix.}
+    \For{$i \leftarrow 0$ \KwTo $N-1$}{
+        \tcc{Gate and up weights: column-parallel along output-feature dim 0.}
+        $\mathbf{W}_{\text{gate},i} \leftarrow \Permute(\Slice(\mathbf{W}_\text{gate},\;\dim{=}0,\;i\delta,\;(i{+}1)\delta),\;[1,0])$\;
+        $\mathbf{W}_{\text{up},i}   \leftarrow \Permute(\Slice(\mathbf{W}_\text{up},  \;\dim{=}0,\;i\delta,\;(i{+}1)\delta),\;[1,0])$\;
+        \tcc{Down weight: row-parallel along reduction dim 1.}
+        $\mathbf{W}_{\text{down},i} \leftarrow \Permute(\Slice(\mathbf{W}_\text{down},\;\dim{=}1,\;i\delta,\;(i{+}1)\delta),\;[1,0])$\;
+    }
+
+    \BlankLine
+    \tcc{Step 2 – Rewire compute shard.}
+    $\RewireArgs(\text{gate\_mm}):\;\mathbf{W}_\text{gate}\rightarrow\mathbf{W}_{\text{gate},s}$\;
+    $\RewireArgs(\text{up\_mm}):\;\mathbf{W}_\text{up}\rightarrow\mathbf{W}_{\text{up},s}$\;
+    $\RewireArgs(\text{down\_mm}):\;\mathbf{W}_\text{down}\rightarrow\mathbf{W}_{\text{down},s}$\;
+
+    \BlankLine
+    \tcc{Step 3 – Refresh shapes for activation chain (GELU + up-merge).}
+    $\RefreshMeta(\text{gate\_mm},\,\text{gelu\_chain},\,\text{up\_mm},\,\text{hadamard},\,\text{reshape}):\;\text{last dim}\leftarrow\delta$\;
+
+    \BlankLine
+    Attach \texttt{numa\_shard\_plan} $\leftarrow \{$
+        \texttt{kind}: ``mlp'', \texttt{subkind}: ``geglu'',\;
+        \texttt{column\_parallel\_nodes}: $[(\mathbf{W}_\text{gate},0),\;(\mathbf{W}_\text{up},0)]$,\;
+        \texttt{row\_parallel\_nodes}: $[(\mathbf{W}_\text{down},1)]$ $\}$
+        to all chain nodes\;
+}
+\end{algorithm}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% Algorithm 3 – NUMA Attention Tensor-Parallel FX Pass
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{algorithm}[t]
+\caption{NUMA Multi-Head Attention Tensor-Parallel FX Pass}
+\label{alg:numa-attn-pass}
+\small
+\DontPrintSemicolon
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKw{KwAnd}{and}
+\SetKwFunction{FindQKV}{FindQKVGroups}
+\SetKwFunction{CollectChain}{CollectAttnChain}
+\SetKwFunction{Slice}{Slice}
+\SetKwFunction{RewireArgs}{RewireArgs}
+\SetKwFunction{RefreshChain}{RefreshChainMeta}
+\SetKwFunction{Annotate}{Annotate}
+
+\KwIn{Post-grad FX graph $\mathcal{G}$ (SDPA decomposed to primitive ops); world size $N$}
+\KwOut{Rewired graph $\mathcal{G}'$ with head-parallel shard metadata}
+
+\BlankLine
+\If{$N < 2$}{\KwReturn}
+
+\ForEach{$(\mathbf{x},\;\text{q\_lin},\;\text{k\_lin},\;\text{v\_lin}) \;\leftarrow\; \FindQKV(\mathcal{G})$}{
+    \tcc{Three linear ops sharing input $\mathbf{x}$:
+        $\mathbf{Q}{=}\mathbf{x}\mathbf{W}_Q{+}\mathbf{b}_Q$,\;
+        $\mathbf{K}{=}\mathbf{x}\mathbf{W}_K{+}\mathbf{b}_K$,\;
+        $\mathbf{V}{=}\mathbf{x}\mathbf{W}_V{+}\mathbf{b}_V$;
+        outputs $\in\mathbb{R}^{S\times H_\text{qkv}}$,\;
+        $H_\text{qkv} = H \cdot E$}
+    \If{$H_\text{qkv} \bmod N \neq 0$ \KwAnd $H \bmod N \neq 0$}{\textbf{skip}}
+    $\delta \leftarrow H_\text{qkv}/N$ \tcp*{head-feature shard width}
+    $\hat{H} \leftarrow H/N$\tcp*{heads per socket}
+
+    \BlankLine
+    $(\text{out\_lin},\;\mathcal{C}) \;\leftarrow\; \CollectChain(\text{q\_lin},\,\text{k\_lin},\,\text{v\_lin})$\;
+    \tcc{out\_lin: $\mathbf{Z}{=}\mathbf{y}\mathbf{W}_O{+}\mathbf{b}_O$,\;
+         $\mathbf{W}_O\in\mathbb{R}^{H_\text{qkv}\times H_\text{in}}$;\;
+         $\mathcal{C}$: reshape/transpose/BMM/softmax chain between QKV and out\_lin}
+
+    \BlankLine
+    \tcc{Step 1 – Insert per-shard slice nodes for Q/K/V weights (column-parallel) and
+         output-projection weight (row-parallel).}
+    \For{$i \leftarrow 0$ \KwTo $N-1$}{
+        \For{$(\mathbf{W},\,\mathbf{b}) \in \{(\mathbf{W}_Q,\mathbf{b}_Q),\,(\mathbf{W}_K,\mathbf{b}_K),\,(\mathbf{W}_V,\mathbf{b}_V)\}$}{
+            $\mathbf{W}_i \leftarrow \Slice(\mathbf{W},\;\dim{=}1,\;i\delta,\;(i{+}1)\delta)$\;
+            $\mathbf{b}_i \leftarrow \Slice(\mathbf{b},\;\dim{=}0,\;i\delta,\;(i{+}1)\delta)$\;
+        }
+        $\mathbf{W}_{O,i} \leftarrow \Slice(\mathbf{W}_O,\;\dim{=}0,\;i\delta,\;(i{+}1)\delta)$
+            \tcp*{row-parallel: input-feature dim}
+    }
+
+    \BlankLine
+    \tcc{Step 2 – Rewire compute shard $s$ to its sliced operands.}
+    \For{$(\text{lin},\,\mathbf{W}_s,\,\mathbf{b}_s) \in \{(\text{q\_lin},\mathbf{W}_{Q,s},\mathbf{b}_{Q,s}),\ldots\}$}{
+        $\RewireArgs(\text{lin}):\; (\mathbf{b},\,\mathbf{x},\,\mathbf{W}) \;\rightarrow\; (\mathbf{b}_s,\,\mathbf{x},\,\mathbf{W}_s)$\;
+        $\text{shape}(\text{lin}) \;\leftarrow\; (S,\,\delta)$\;
+    }
+    $\RewireArgs(\text{out\_lin}):\; \mathbf{W}_O \;\rightarrow\; \mathbf{W}_{O,s}$\;
+
+    \BlankLine
+    \tcc{Step 3 – Propagate sharded shapes through the SDPA chain $\mathcal{C}$.
+         For each chain node (view/reshape/expand/BMM/softmax), re-evaluate the op
+         on updated FakeTensors; fix explicit shape arguments
+         ($H \!\rightarrow\! \hat{H}$, $H_\text{qkv} \!\rightarrow\! \delta$).}
+    $\RefreshChain(\mathcal{C},\;\hat{H},\;\delta,\;N)$\;
+
+    \BlankLine
+    \tcc{Step 4 – Attach shard plan to all chain nodes.}
+    Attach \texttt{numa\_shard\_plan} $\leftarrow \{$
+        \texttt{kind}: ``attention'',
+        \texttt{column\_parallel\_nodes}: $[(\mathbf{W}_Q,1),\,(\mathbf{W}_K,1),\,(\mathbf{W}_V,1),\,(\mathbf{b}_Q,0),\,(\mathbf{b}_K,0),\,(\mathbf{b}_V,0)]$,\;
+        \texttt{row\_parallel\_nodes}: $[(\mathbf{W}_O,0)]$,\;
+        \texttt{replicated\_nodes}: $[\mathbf{x},\,\mathbf{b}_O]$,\;
+        \texttt{zero\_on\_nonzero\_nodes}: $[\mathbf{b}_O]$ $\}$
+        to all nodes in $\{\text{q\_lin}, \text{k\_lin}, \text{v\_lin}\} \cup \mathcal{C} \cup \{\text{out\_lin}\}$\;
+}
+\end{algorithm}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% Algorithm 4 – NUMA Wrapper Codegen: Per-Socket Buffer Allocation
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{algorithm}[t]
+\caption{NUMA Wrapper Codegen: Per-Socket Buffer Allocation}
+\label{alg:numa-wrapper-alloc}
+\small
+\DontPrintSemicolon
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKw{KwAnd}{and}
+\SetKwFunction{Emit}{Emit}
+\SetKwFunction{CacheOrEmit}{CacheOrEmit}
+\SetKwFunction{NUMAClone}{NUMAClone}
+\SetKwFunction{NUMAEmptyStrided}{NUMAEmptyStrided}
+\SetKwFunction{Slice}{Slice}
+
+\KwIn{Shard plan $P$; kernel call arguments $[a_1,\ldots,a_m]$ with types; NUMA world size $N$}
+\KwOut{
+    (i) Emitted code for per-socket buffer allocation;
+    (ii) \texttt{numa\_args} list structure;
+    (iii) Updated \texttt{\_numa\_tensor\_cache}
+}
+
+\BlankLine
+\tcc{Unpack plan.}
+$\delta \;\leftarrow\; P[\texttt{shard\_d}]$;\;
+$\mathcal{C}_\text{col} \leftarrow P[\texttt{column\_parallel\_nodes}]$;\;
+$\mathcal{R}_\text{row} \leftarrow P[\texttt{row\_parallel\_nodes}]$;\;
+$\mathcal{S}_\text{rep} \leftarrow P[\texttt{replicated\_nodes}]$;\;
+$\mathcal{Z}     \leftarrow P[\texttt{zero\_on\_nonzero\_nodes}]$\;
+
+\BlankLine
+\tcc{Determine kernel role: \emph{row-parallel kernel} iff it uses a row-parallel weight
+     but no column-parallel weight (triggers output all-reduce).}
+$\text{is\_row\_parallel} \;\leftarrow\; \bigl(\exists a_k \in \mathcal{R}_\text{row}\bigr)
+    \;\wedge\; \bigl(\nexists a_k \in \mathcal{C}_\text{col}\bigr)$\;
+
+\BlankLine
+Initialize $\text{nodeArgs}[i] \;\leftarrow\; []$ for each socket $i \in \{0,\ldots,N{-}1\}$\;
+
+\BlankLine
+\ForEach{tensor argument $a_k$}{
+    \uIf{$a_k \in \texttt{\_numa\_tensor\_cache}$}{
+        \tcc{Reuse per-socket buffer from a prior kernel (e.g., softmax in\_out\_ptr).}
+        \For{$i \leftarrow 0$ \KwTo $N-1$}{
+            $\text{nodeArgs}[i].\text{append}(\texttt{\_numa\_tensor\_cache}[a_k][i])$\;
+        }
+    }
+    \uElseIf{$a_k$ is an \emph{output} or \emph{in-out} buffer}{
+        \tcc{Allocate uninitialised per-socket output directly on target NUMA node
+             (avoids first-touch faults from a redundant copy of undefined bytes).}
+        \For{$i \leftarrow 0$ \KwTo $N-1$}{
+            $b_{k,i} \;\leftarrow\; \NUMAEmptyStrided(a_k.\texttt{shape},\;a_k.\texttt{stride},\;
+                \texttt{numa\_node}{=}i)$\;
+            $\text{nodeArgs}[i].\text{append}(b_{k,i})$\;
+        }
+        $\texttt{\_numa\_tensor\_cache}[a_k] \;\leftarrow\; [b_{k,0},\ldots,b_{k,N-1}]$\;
+    }
+    \uElseIf{$a_k = P[\texttt{x\_node}]$ \tcc*[r]{activation: changes every forward}}{
+        \For{$i \leftarrow 0$ \KwTo $N-1$}{
+            $b_{k,i} \;\leftarrow\; \NUMAClone(a_k,\;\texttt{numa\_node}{=}i)$\;
+            $\text{nodeArgs}[i].\text{append}(b_{k,i})$\;
+        }
+    }
+    \uElseIf{$(a_k,\,d_k) \in \mathcal{C}_\text{col}$ \tcc*[r]{column-parallel weight}}{
+        \tcc{Hoist full clone per socket into \texttt{\_numa\_weight\_cache}; re-create
+             the column slice each forward (O(1), no memcpy).}
+        \For{$i \leftarrow 0$ \KwTo $N-1$}{
+            $\hat{a}_{k,i} \;\leftarrow\; \CacheOrEmit(\NUMAClone(a_k,\;\texttt{numa\_node}{=}i))$\;
+            $b_{k,i} \;\leftarrow\; \Slice(\hat{a}_{k,i},\;\dim{=}d_k,\;i\delta,\;(i{+}1)\delta)$\;
+            $\text{nodeArgs}[i].\text{append}(b_{k,i})$\;
+        }
+    }
+    \uElseIf{$(a_k,\,d_k) \in \mathcal{R}_\text{row}$ \tcc*[r]{row-parallel weight}}{
+        \tcc{Compact slice on target socket; cached across forwards.}
+        \For{$i \leftarrow 0$ \KwTo $N-1$}{
+            $b_{k,i} \;\leftarrow\; \CacheOrEmit(
+                \NUMAClone(\Slice(a_k,\;\dim{=}d_k,\;i\delta,\;(i{+}1)\delta),\;
+                \texttt{numa\_node}{=}i))$\;
+            $\text{nodeArgs}[i].\text{append}(b_{k,i})$\;
+        }
+    }
+    \uElseIf{$a_k \in \mathcal{Z}$ \KwAnd $\text{is\_row\_parallel}$}{
+        \tcc{Row-parallel output bias: full value on socket 0; zeros on others
+             to avoid double-counting after the post-kernel reduction.}
+        $\text{nodeArgs}[0].\text{append}(\CacheOrEmit(\NUMAClone(a_k,\;0)))$\;
+        \For{$i \leftarrow 1$ \KwTo $N-1$}{
+            $\text{nodeArgs}[i].\text{append}(\CacheOrEmit(
+                \NUMAClone(\mathbf{0}_{\text{like}\,a_k},\;i)))$\;
+        }
+    }
+    \Else{
+        \tcc{Unknown/replicated tensor: replicate on every socket (cached).}
+        \For{$i \leftarrow 0$ \KwTo $N-1$}{
+            $\text{nodeArgs}[i].\text{append}(\CacheOrEmit(\NUMAClone(a_k,\;i)))$\;
+        }
+    }
+}
+
+\BlankLine
+$\texttt{numa\_args} \;\leftarrow\;
+    \bigl[\text{nodeArgs}[0],\;\text{nodeArgs}[1],\;\ldots,\;\text{nodeArgs}[N{-}1]\bigr]$\;
+\Emit{$K.\texttt{run}(a_1,\ldots,a_m,\;\texttt{grid}{=}G,\;\texttt{stream}{=}\mathtt{s},\;
+    \texttt{numa\_args}{=}\texttt{numa\_args})$}\;
+\end{algorithm}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% Algorithm 5 – NUMA Wrapper Codegen: Row-Parallel Output Reduction
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{algorithm}[t]
+\caption{NUMA Wrapper Codegen: Row-Parallel Output Reduction}
+\label{alg:numa-wrapper-reduce}
+\small
+\DontPrintSemicolon
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKw{KwAnd}{and}
+\SetKwFunction{Emit}{Emit}
+
+\KwIn{
+    Per-socket output buffers $\{o_0, o_1, \ldots, o_{N-1}\}$;
+    kernel role flag \texttt{is\_row\_parallel};
+    NUMA world size $N$
+}
+\KwOut{Emitted reduction code; full output tensor $o$}
+
+\BlankLine
+\If{\textbf{not} \texttt{is\_row\_parallel}}{\KwReturn}
+
+\BlankLine
+\tcc{All-reduce: each socket computed a partial-sum shard of the output projection.
+     For two sockets this is one add; for $N$ sockets it is a left-fold over additions.}
+$r \;\leftarrow\; o_0$\;
+\For{$i \leftarrow 1$ \KwTo $N-1$}{
+    $r \;\leftarrow\; r + o_i$
+        \tcp*{emits: \texttt{torch.ops.aten.add.Tensor}$(r,\;o_i)$}
+}
+$o \;\leftarrow\; r$\tcp*{final reduced output reassigned to the output variable}
+
+\BlankLine
+\tcc{(Optional) Re-distribute reduced result back to per-socket caches so
+     downstream NUMA kernels in the same layer (e.g., residual add, layer norm)
+     can consume the correct socket-local copy.}
+\For{$i \leftarrow 0$ \KwTo $N-1$}{
+    $\texttt{\_numa\_tensor\_cache}[o][i] \;\leftarrow\; \NUMAClone(r,\;\texttt{numa\_node}{=}i)$
+        \tcp*{cached for next NUMA kernel}
+}
+\end{algorithm}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% Algorithm 6 – NUMA Triton CPU Kernel Dispatch
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{algorithm}[t]
+\caption{NUMA-Aware Triton CPU Kernel Dispatch}
+\label{alg:numa-launcher}
+\small
+\DontPrintSemicolon
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKw{KwAnd}{and}
+\SetKwFunction{ReadCPUList}{ReadCPUList}
+\SetKwFunction{SpawnThread}{SpawnThread}
+\SetKwFunction{BindCPU}{BindCPUAffinity}
+\SetKwFunction{RunGrid}{RunGridSlice}
+
+\KwIn{
+    Triton kernel $K$;
+    \texttt{numa\_args} $= [(p^{(0)}_1,\ldots,p^{(0)}_m),\;\ldots,\;(p^{(N-1)}_1,\ldots,p^{(N-1)}_m)]$;
+    compute grid $\mathcal{G}$;
+    total thread count $T$
+}
+\KwOut{Kernel executed with per-socket thread groups and NUMA-local memory}
+
+\BlankLine
+\uIf{\texttt{numa\_args} is absent or $N < 2$}{
+    \tcc{Fallback: standard OpenMP parallel execution.}
+    $K.\texttt{run\_omp}(\mathcal{G},\;T)$\;
+    \KwReturn\;
+}
+
+\BlankLine
+\tcc{Step 1 – Read CPU affinity lists from the OS topology interface.}
+\For{$i \leftarrow 0$ \KwTo $N-1$}{
+    $\mathcal{L}_i \;\leftarrow\; \ReadCPUList(\texttt{/sys/devices/system/node/node}i\texttt{/cpulist})$\;
+}
+$t_\text{per} \;\leftarrow\; T / N$\tcp*{threads per socket}
+
+\BlankLine
+\tcc{Step 2 – Spawn $T$ \texttt{std::thread}s, partitioned across sockets.}
+\For{$i \leftarrow 0$ \KwTo $N-1$}{
+    $\mathcal{P}_i \;\leftarrow\; (p^{(i)}_1,\ldots,p^{(i)}_m)$\tcp*{per-socket pointer tuple from \texttt{numa\_args}}
+    \For{$j \leftarrow 0$ \KwTo $t_\text{per}-1$}{
+        \SpawnThread{
+            \BindCPU{$\mathcal{L}_i[j \bmod |\mathcal{L}_i|]$}\;
+            \tcc{Each thread iterates the grid slice $[\,i\cdot|\mathcal{G}|/N,\;(i{+}1)\cdot|\mathcal{G}|/N)$
+                 using socket-$i$ pointer arguments $\mathcal{P}_i$.}
+            $\RunGrid(K,\;\mathcal{G},\;\mathcal{P}_i,\;
+                \text{tile\_start}{=}i\cdot|\mathcal{G}|/N,\;
+                \text{tile\_end}{=}(i{+}1)\cdot|\mathcal{G}|/N)$\;
+        }
+    }
+}
+\tcc{Step 3 – Join all threads.}
+\textbf{join all spawned threads}\;
+\end{algorithm}

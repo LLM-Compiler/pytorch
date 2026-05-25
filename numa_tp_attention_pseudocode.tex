@@ -1,0 +1,370 @@
+\documentclass{article}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{amsmath,amssymb}
+\usepackage[margin=1.0in]{geometry}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{array}
+
+% Math operators
+\DeclareMathOperator{\cloneop}{clone}
+\DeclareMathOperator{\viewop}{view}
+\DeclareMathOperator{\bmmop}{bmm}
+\DeclareMathOperator{\sftmax}{softmax}
+\DeclareMathOperator{\EmptyNUMA}{EmptyStridedNUMA}
+% Shorthand for per-socket pointer tuple list
+\newcommand{\numaargs}[1]{\mathbf{n}^{(#1)}}
+
+\begin{document}
+
+\begin{center}
+  {\large\bfseries NUMA-TP Self-Attention Block Pseudocode}\\[6pt]
+  {\normalsize Standard (single-socket) vs.\ NUMA Tensor-Parallel ($N$-socket) Wrapper Execution}
+\end{center}
+
+\bigskip
+
+\noindent
+The algorithms below describe the Torch~Inductor wrapper-level execution of a single
+transformer self-attention block, contrasting the \emph{standard compiled path} (one
+socket, full dimensionality) with the \emph{NUMA tensor-parallel (TP) path} ($N$
+sockets, column-parallel Q/K/V and row-parallel output projection).
+The concrete reference is GPT-2 117M with input shape $(S,D)=(128,768)$, $H=12$
+attention heads, per-head dimension $E=64$, and NUMA world size $N=2$.
+
+%---------------------------------------------------------------------------
+\paragraph{Symbol definitions (carried through all algorithms below).}
+%---------------------------------------------------------------------------
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{} l p{9.0cm} @{}}
+\toprule
+Symbol & Definition \\
+\midrule
+$S,\;D,\;H,\;E$ &
+  Sequence length, hidden dim, head count, per-head dim ($E=D/H$) \\
+$N$ &
+  NUMA world size (number of physical sockets) \\
+$\delta = D/N$ &
+  Hidden-dim shard per socket (e.g.\ $384$ for $N{=}2$, $D{=}768$) \\
+$\hat{h} = H/N$ &
+  Head count per socket (e.g.\ $6$ for $N{=}2$, $H{=}12$) \\
+$\mathbf{X}\in\mathbb{R}^{S\times D}$ &
+  Input activation (post layer-norm); replicated across all sockets \\
+$W_Q,W_K,W_V\in\mathbb{R}^{D\times D}$ &
+  Query, Key, Value projection weight matrices \\
+$\mathbf{b}_Q,\mathbf{b}_K,\mathbf{b}_V\in\mathbb{R}^{D}$ &
+  Q/K/V projection bias vectors \\
+$W_O\in\mathbb{R}^{D\times D}$ &
+  Output projection weight matrix \\
+$\mathbf{b}_O\in\mathbb{R}^{D}$ &
+  Output projection bias vector \\
+$W^{[i]}$ &
+  Per-socket shard of weight $W$, NUMA-pinned to node $i$ \\
+$\mathcal{C}[\cdot]$ &
+  Persistent weight cache; entries survive across forward passes \\
+$\cloneop(T,\,i)$ &
+  Allocate a NUMA-local copy of tensor $T$ on node $i$ \\
+$\EmptyNUMA(\mathrm{shape},\,i)$ &
+  Allocate an uninitialised buffer on NUMA node $i$
+  (avoids cross-socket first-touch faults) \\
+$\mathbf{Z}\in\mathbb{R}^{H\times S\times E}$ &
+  Aggregated attention context: output of $\bmmop(\mathbf{A},\mathbf{V})$
+  (per socket: $\hat{h}\times S\times E$) \\
+$\mathbf{Z}_{2D}$ &
+  $\mathbf{Z}$ reshaped to 2-D: $(S,D)$ standard, $(S,\delta)$ per socket in NUMA-TP \\
+$\numaargs{k}$ &
+  \texttt{numa\_args} for kernel $k$: a list of $N$ per-socket pointer tuples
+  $\bigl[(\text{in-ptrs}^{[i]},\,\text{out-ptrs}^{[i]})\bigr]_{i=0}^{N-1}$
+  consumed by the Triton CPU launcher \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%---------------------------------------------------------------------------
+\paragraph{Shape comparison (GPT-2 117M, $S{=}128$, $N{=}2$).}
+%---------------------------------------------------------------------------
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{} l l l @{}}
+\toprule
+Intermediate buffer & Standard ($\times1$ socket, full dim) & NUMA-TP (per socket, shard dim) \\
+\midrule
+Q, K, V projections         & $(128,768)=(S,D)$           & $(128,384)=(S,\delta)$          \\
+Q scaled (head view)         & $(1,12,128,64)=(1,H,S,E)$  & $(1,6,128,64)=(1,\hat{h},S,E)$ \\
+Attention scores             & $(12,128,128)=(H,S,S)$      & $(6,128,128)=(\hat{h},S,S)$    \\
+Softmax output               & $(1,12,128,128)$            & $(1,6,128,128)$                \\
+Aggregated context $\mathbf{Z}$ (after value BMM) & $(12,128,64)=(H,S,E)$ & $(6,128,64)=(\hat{h},S,E)$ \\
+Context reshaped $\mathbf{Z}_{2D}$ & $(128,768)=(S,D)$   & $(128,384)=(S,\delta)$         \\
+Output projection (inner $K$)& $K=768=D$                   & $K=384=\delta$ \emph{(new kernel)}\\
+Output projection result     & $(128,768)=(S,D)$           & $(128,768)=(S,D)$ (partial sum)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\bigskip
+
+%%==========================================================================
+%% Algorithm 1 — Standard self-attention
+%%==========================================================================
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\caption{Standard Self-Attention Block --- Single-Socket Wrapper Execution}
+\label{alg:std-attn}
+\KwIn{%
+  $\mathbf{X}\in\mathbb{R}^{S\times D}$;\;
+  $W_Q,W_K,W_V,W_O\in\mathbb{R}^{D\times D}$;\;
+  $\mathbf{b}_Q,\mathbf{b}_K,\mathbf{b}_V,\mathbf{b}_O\in\mathbb{R}^{D}$%
+}
+\KwOut{$\mathbf{Y}\in\mathbb{R}^{S\times D}$}
+\BlankLine
+
+\tcp{--- Q/K/V projections (one Triton GEMM kernel per projection) ---}
+$\mathbf{Q} \;\leftarrow\; \mathbf{X}\,W_Q^{\top} + \mathbf{b}_Q$
+  \hfill\tcp*[r]{shape $(S,D)$}
+$\mathbf{K} \;\leftarrow\; \mathbf{X}\,W_K^{\top} + \mathbf{b}_K$
+  \hfill\tcp*[r]{shape $(S,D)$}
+$\mathbf{V} \;\leftarrow\; \mathbf{X}\,W_V^{\top} + \mathbf{b}_V$
+  \hfill\tcp*[r]{shape $(S,D)$}
+\BlankLine
+
+\tcp{--- Scale and reshape Q into head view ---}
+$\tilde{\mathbf{Q}} \;\leftarrow\;
+  \tfrac{1}{\sqrt{E}}\cdot\viewop\!\bigl(\mathbf{Q},\,(1,H,S,E)\bigr)$
+  \hfill\tcp*[r]{shape $(1,H,S,E)$}
+\BlankLine
+
+\tcp{--- Scaled dot-product attention scores ---}
+$\mathbf{S}_{\mathrm{att}} \;\leftarrow\;
+  \bmmop\!\Bigl(\tilde{\mathbf{Q}},\;\viewop\bigl(\mathbf{K},(H,S,E)\bigr)^{\!\top}\Bigr)$
+  \hfill\tcp*[r]{shape $(H,S,S)$}
+\BlankLine
+
+\tcp{--- Row-wise softmax normalisation ---}
+$\mathbf{A} \;\leftarrow\;
+  \sftmax\!\bigl(\mathbf{S}_{\mathrm{att}},\;\mathrm{dim}{=}{-1}\bigr)$
+  \hfill\tcp*[r]{shape $(1,H,S,S)$}
+\BlankLine
+
+\tcp{--- Weighted value aggregation ---}
+$\mathbf{Z} \;\leftarrow\;
+  \bmmop\!\Bigl(\mathbf{A},\;\viewop\bigl(\mathbf{V},(H,S,E)\bigr)\Bigr)$
+  \hfill\tcp*[r]{shape $(H,S,E)$}
+$\mathbf{Z}_{2D} \;\leftarrow\; \viewop\!\bigl(\mathbf{Z},\,(S,D)\bigr)$
+  \hfill\tcp*[r]{flatten heads; shape $(S,D)$}
+\BlankLine
+
+\tcp{--- Output projection (one GEMM kernel, inner dim $K=D$) ---}
+$\mathbf{Y} \;\leftarrow\; \mathbf{Z}_{2D}\,W_O^{\top} + \mathbf{b}_O$
+  \hfill\tcp*[r]{shape $(S,D)$}
+\BlankLine
+
+\KwRet{$\mathbf{Y}$}
+\end{algorithm}
+
+%%==========================================================================
+%% Algorithm 2 — Per-socket buffer allocation subroutine
+%%==========================================================================
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\caption{$\mathsf{AllocSocketBuffers}$ --- Per-Socket NUMA Buffer Allocation}
+\label{alg:alloc}
+\KwIn{%
+  $W_Q,W_K,W_V,W_O\in\mathbb{R}^{D\times D}$;\;
+  $\mathbf{b}_Q,\mathbf{b}_K,\mathbf{b}_V,\mathbf{b}_O\in\mathbb{R}^{D}$;\;
+  $N,\,\delta,\,D,\,S$;\; global cache $\mathcal{C}$%
+}
+\KwOut{(populates $\mathcal{C}$; no explicit return value)}
+\BlankLine
+
+\For{socket $i \;\leftarrow\; 0$ \KwTo $N{-}1$}{
+  \BlankLine
+  \tcp{Column-parallel weight shards for Q/K/V: clone a $\delta$-wide column slice}
+  \tcp{onto NUMA node $i$.  Cache persists indefinitely (weights are read-only).}
+  \lIf{$W_Q^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[W_Q^{[i]}]\leftarrow
+      \cloneop\!\bigl(W_Q[\,:,\,i\delta{:}(i{+}1)\delta],\;i\bigr)$}
+  \lIf{$W_K^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[W_K^{[i]}]\leftarrow
+      \cloneop\!\bigl(W_K[\,:,\,i\delta{:}(i{+}1)\delta],\;i\bigr)$}
+  \lIf{$W_V^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[W_V^{[i]}]\leftarrow
+      \cloneop\!\bigl(W_V[\,:,\,i\delta{:}(i{+}1)\delta],\;i\bigr)$}
+  \lIf{$\mathbf{b}_Q^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[\mathbf{b}_Q^{[i]}]\leftarrow
+      \cloneop\!\bigl(\mathbf{b}_Q[\,i\delta{:}(i{+}1)\delta],\;i\bigr)$}
+  \lIf{$\mathbf{b}_K^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[\mathbf{b}_K^{[i]}]\leftarrow
+      \cloneop\!\bigl(\mathbf{b}_K[\,i\delta{:}(i{+}1)\delta],\;i\bigr)$}
+  \lIf{$\mathbf{b}_V^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[\mathbf{b}_V^{[i]}]\leftarrow
+      \cloneop\!\bigl(\mathbf{b}_V[\,i\delta{:}(i{+}1)\delta],\;i\bigr)$}
+  \BlankLine
+
+  \tcp{Row-parallel weight shard for $W_O$: clone a $\delta$-row slice onto node $i$.}
+  \lIf{$W_O^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[W_O^{[i]}]\leftarrow
+      \cloneop\!\bigl(W_O[\,i\delta{:}(i{+}1)\delta,\;:],\;i\bigr)$}
+  \BlankLine
+
+  \tcp{Output bias: full copy on socket 0, zero on others (avoids double-counting}
+  \tcp{after the all-reduce that sums partial output projections).}
+  \If{$\mathbf{b}_O^{[i]}\notin\mathcal{C}$}{
+    \eIf{$i = 0$}{
+      $\mathcal{C}[\mathbf{b}_O^{[i]}]\leftarrow\cloneop(\mathbf{b}_O,\,i)$\;
+    }{
+      $\mathcal{C}[\mathbf{b}_O^{[i]}]\leftarrow\mathbf{0}_{D}$
+        \hfill\tcp*[r]{bias zeroed to suppress double-counting}
+    }
+  }
+  \BlankLine
+
+  \tcp{Per-socket activation output buffers: allocated once on node $i$, reused}
+  \tcp{each forward pass (overwritten in-place by each kernel call).}
+  \lIf{$\mathbf{Q}^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[\mathbf{Q}^{[i]}]\leftarrow\EmptyNUMA\!\bigl((S,\delta),\;i\bigr)$}
+  \lIf{$\mathbf{K}^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[\mathbf{K}^{[i]}]\leftarrow\EmptyNUMA\!\bigl((S,\delta),\;i\bigr)$}
+  \lIf{$\mathbf{V}^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[\mathbf{V}^{[i]}]\leftarrow\EmptyNUMA\!\bigl((S,\delta),\;i\bigr)$}
+  \lIf{$\mathbf{Y}^{[i]}\notin\mathcal{C}$}{%
+    $\mathcal{C}[\mathbf{Y}^{[i]}]\leftarrow\EmptyNUMA\!\bigl((S,D),\;i\bigr)$}
+}
+\end{algorithm}
+
+%%==========================================================================
+%% Algorithm 3 — NUMA-TP self-attention
+%%==========================================================================
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\caption{NUMA-TP Self-Attention Block --- $N$-Socket Column/Row-Parallel Wrapper Execution}
+\label{alg:numa-attn}
+\KwIn{same as Alg.~\ref{alg:std-attn}; NUMA world size $N$; global cache $\mathcal{C}$}
+\KwOut{$\mathbf{Y}\in\mathbb{R}^{S\times D}$}
+\KwData{$\delta \leftarrow D/N$;\quad $\hat{h} \leftarrow H/N$}
+\BlankLine
+
+\tcp{--- Phase 0: Populate cache on first forward pass (no-op thereafter) ---}
+$\mathsf{AllocSocketBuffers}(W_Q,W_K,W_V,W_O,\mathbf{b}_Q,\mathbf{b}_K,\mathbf{b}_V,
+  \mathbf{b}_O,N,\delta,D,S,\mathcal{C})$
+  \hfill\tcp*[r]{Alg.~\ref{alg:alloc}}
+\BlankLine
+
+\tcp{--- Phase 1: Clone input activation to each NUMA node ---}
+\tcp{(Activation changes every forward pass so it is not cached.)}
+\For{$i \;\leftarrow\; 0$ \KwTo $N{-}1$}{
+  $\mathbf{X}^{[i]} \leftarrow \cloneop(\mathbf{X},\;i)$
+    \hfill\tcp*[r]{shape $(S,D)$; socket-local copy to avoid cross-socket reads}
+}
+\BlankLine
+
+\tcp{--- Phase 2: Column-parallel Q/K/V projections ---}
+\tcp{All $N$ sockets execute in parallel.  Each socket $i$ multiplies $\mathbf{X}^{[i]}$}
+\tcp{(a local copy of the full activation) by its $\delta$-wide weight shard.}
+\tcp{The Triton CPU launcher reads $\numaargs{Q}$ to dispatch socket-local pointers.}
+\BlankLine
+$\numaargs{Q} \;\leftarrow\;
+  \bigl[(\mathbf{X}^{[i]},\;W_Q^{[i]},\;\mathbf{b}_Q^{[i]},\;\mathbf{Q}^{[i]})\bigr]_{i=0}^{N-1}$\;
+\textsc{GemmKernel}.run$\!\left(%
+  \mathbf{X},\,W_Q,\,\mathbf{b}_Q \;\to\; \mathbf{Q};\;
+  \mathrm{grid}{=}(S,\delta);\;
+  \mathtt{numa\_args}{=}\numaargs{Q}\right)$
+  \hfill\tcp*[r]{output shape $(S,\delta)$ per socket}
+\BlankLine
+
+$\numaargs{K} \;\leftarrow\;
+  \bigl[(\mathbf{X}^{[i]},\;W_K^{[i]},\;\mathbf{b}_K^{[i]},\;\mathbf{K}^{[i]})\bigr]_{i=0}^{N-1}$\;
+\textsc{GemmKernel}.run$\!\left(%
+  \mathbf{X},\,W_K,\,\mathbf{b}_K \;\to\; \mathbf{K};\;
+  \mathrm{grid}{=}(S,\delta);\;
+  \mathtt{numa\_args}{=}\numaargs{K}\right)$
+  \hfill\tcp*[r]{output shape $(S,\delta)$ per socket}
+\BlankLine
+
+$\numaargs{V} \;\leftarrow\;
+  \bigl[(\mathbf{X}^{[i]},\;W_V^{[i]},\;\mathbf{b}_V^{[i]},\;\mathbf{V}^{[i]})\bigr]_{i=0}^{N-1}$\;
+\textsc{GemmKernel}.run$\!\left(%
+  \mathbf{X},\,W_V,\,\mathbf{b}_V \;\to\; \mathbf{V};\;
+  \mathrm{grid}{=}(S,\delta);\;
+  \mathtt{numa\_args}{=}\numaargs{V}\right)$
+  \hfill\tcp*[r]{output shape $(S,\delta)$ per socket}
+\BlankLine
+
+\tcp{--- Phase 3: Per-socket scaled dot-product attention ($\hat{h}$ heads) ---}
+\tcp{Each socket independently computes attention over its $\hat{h}$ head shard.}
+\tcp{Scale, score, normalise, and aggregate kernels all receive per-socket $\numaargs{}$.}
+\BlankLine
+\For{socket $i \;\leftarrow\; 0$ \KwTo $N{-}1$ \tcp*[r]{(logically parallel; shown sequentially)}}{
+  $\tilde{\mathbf{Q}}^{[i]} \;\leftarrow\;
+    \tfrac{1}{\sqrt{E}}\cdot
+    \viewop\!\bigl(\mathbf{Q}^{[i]},\,(1,\hat{h},S,E)\bigr)$
+    \hfill\tcp*[r]{shape $(1,\hat{h},S,E)$}
+  $\mathbf{S}^{[i]}_{\mathrm{att}} \;\leftarrow\;
+    \bmmop\!\Bigl(\tilde{\mathbf{Q}}^{[i]},\;
+      \viewop\bigl(\mathbf{K}^{[i]},(\hat{h},S,E)\bigr)^{\!\top}\Bigr)$
+    \hfill\tcp*[r]{shape $(\hat{h},S,S)$}
+  $\mathbf{A}^{[i]} \;\leftarrow\;
+    \sftmax\!\bigl(\mathbf{S}^{[i]}_{\mathrm{att}},\;\mathrm{dim}{=}{-1}\bigr)$
+    \hfill\tcp*[r]{shape $(1,\hat{h},S,S)$}
+  $\mathbf{Z}^{[i]} \;\leftarrow\;
+    \bmmop\!\Bigl(\mathbf{A}^{[i]},\;
+      \viewop\bigl(\mathbf{V}^{[i]},(\hat{h},S,E)\bigr)\Bigr)$
+    \hfill\tcp*[r]{shape $(\hat{h},S,E)$}
+  $\mathbf{Z}_{2D}^{[i]} \;\leftarrow\;
+    \viewop\!\bigl(\mathbf{Z}^{[i]},\,(S,\delta)\bigr)$
+    \hfill\tcp*[r]{shape $(S,\delta)$}
+}
+\BlankLine
+
+\tcp{--- Phase 4: Row-parallel output projection ---}
+\tcp{Each socket $i$ projects its context shard $\mathbf{Z}_{2D}^{[i]}\!\in\!\mathbb{R}^{S\times\delta}$ through $W_O^{[i]}\!\in\!\mathbb{R}^{\delta\times D}$,}
+\tcp{producing a full-width partial sum $(S,D)$.  A new kernel specialisation is}
+\tcp{compiled with inner dimension $K=\delta$ (vs.\ $K=D$ in the standard path).}
+\BlankLine
+$\numaargs{O} \;\leftarrow\;
+  \bigl[(\mathbf{Z}_{2D}^{[i]},\;W_O^{[i]},\;\mathbf{b}_O^{[i]},\;\mathbf{Y}^{[i]})\bigr]_{i=0}^{N-1}$\;
+$\textsc{GemmKernel}_{\delta}$\!\!.run$\!\left(%
+  \mathbf{Z}_{2D},\,W_O,\,\mathbf{b}_O \;\to\; \mathbf{Y};\;
+  \mathrm{grid}{=}(S,D);\;
+  \mathtt{numa\_args}{=}\numaargs{O}\right)$
+  \hfill\tcp*[r]{partial output shape $(S,D)$ per socket}
+\BlankLine
+
+\tcp{--- Phase 5: All-reduce --- sum partial projections across sockets ---}
+\tcp{($\mathbf{b}_O$ contributes only from socket 0; all other sockets used $\mathbf{0}_D$.)}
+$\mathbf{Y} \;\leftarrow\;
+  \displaystyle\sum_{i=0}^{N-1}\mathbf{Y}^{[i]}$
+  \hfill\tcp*[r]{elementwise add; final shape $(S,D)$}
+\BlankLine
+
+\KwRet{$\mathbf{Y}$}
+\end{algorithm}
+
+\bigskip\noindent
+\textbf{Key differences vs.\ the standard path (Alg.~\ref{alg:std-attn}).}
+\begin{enumerate}
+  \item \textit{Dimension halving.}  Every intermediate buffer is $\delta$-wide (or
+        $\hat{h}$-headed) instead of $D$-wide ($H$-headed), reducing per-socket memory
+        traffic by factor $N$.
+  \item \textit{Persistent weight cache $\mathcal{C}$.}  Static weights are cloned to
+        NUMA-local memory once and reused across all forward passes.  Only the
+        activation $\mathbf{X}$ is re-cloned each pass (it changes with every input).
+  \item \textit{Output buffer re-use.}  Per-socket output buffers $\mathbf{Q}^{[i]},
+        \mathbf{K}^{[i]}, \ldots$ are allocated via $\EmptyNUMA$ (no zero-fill) and
+        placed in $\mathcal{C}$ so they are overwritten in-place each forward pass
+        without re-allocation.
+  \item \textit{New output-projection kernel.}  The standard path uses one GEMM with
+        inner dimension $K=D$.  The NUMA-TP path requires a kernel compiled with
+        $K=\delta$ (row-parallel, half the weight rows per socket); Inductor emits this
+        as a separate Triton kernel specialisation
+        ($\textsc{GemmKernel}_{\delta}$).
+  \item \textit{\texttt{numa\_args} dispatch.}  Every kernel call carries
+        $\numaargs{k}$, a list of per-socket pointer tuples.  The Triton CPU launcher
+        reads $\numaargs{k}$, spawns one thread group per socket with CPU affinity
+        pinned from \texttt{/sys/devices/system/node/node$i$/cpulist}, and supplies
+        each group with its socket-local pointers.
+\end{enumerate}
+
+\end{document}

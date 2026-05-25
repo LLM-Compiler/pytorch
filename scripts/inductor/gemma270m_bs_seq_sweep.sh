@@ -55,9 +55,14 @@ if [[ ! -f "${CLI}" ]]; then
   exit 1
 fi
 
+CSV_OUT="gemma270m_sweep_results.csv"
+if [[ ! -f "${CSV_OUT}" ]]; then
+  echo "B,S,std_ms,numa_ms,speedup" > "${CSV_OUT}"
+fi
+
 printf 'Gemma-3 270M end-to-end prefill (L=%s)  NUMA-TP vs standard\n' "${NUM_LAYERS}"
-printf '%-4s %-6s %-12s\n' "B" "S" "speedup"
-printf '%-4s %-6s %-12s\n' "----" "------" "------------"
+printf '%-4s %-6s %-10s %-10s %-10s\n' "B" "S" "std(ms)" "numa(ms)" "speedup"
+printf '%-4s %-6s %-10s %-10s %-10s\n' "----" "------" "----------" "----------" "----------"
 
 for cfg in "${CONFIGS[@]}"; do
   B="${cfg% *}"
@@ -72,10 +77,20 @@ for cfg in "${CONFIGS[@]}"; do
             --head-dim "${HEAD_DIM}" \
             --mlp-hidden "${MLP_HIDDEN}" \
             --warmup "${WARMUP}" \
-            --iters "${ITERS}" 2>/tmp/gemma270m_sweep_err.log)"; then
-    printf '%-4s %-6s %-12s\n' "${B}" "${S}" "${out}"
+            --iters "${ITERS}" \
+            --detailed 2>/tmp/gemma270m_sweep_err.log)"; then
+    read std_mean numa_mean speedup <<< "${out}"
+    printf '%-4s %-6s %-10s %-10s %-10s\n' "${B}" "${S}" "${std_mean}" "${numa_mean}" "${speedup}"
+    echo "${B},${S},${std_mean},${numa_mean},${speedup}" >> "${CSV_OUT}"
+    git add "${CSV_OUT}"
+    git commit -m "Auto-commit: Gemma 270M benchmark result B=${B} S=${S}" || true
+    git push origin feature/niman_gemma_prefil_pass || true
   else
-    printf '%-4s %-6s %-12s\n' "${B}" "${S}" "FAIL"
+    printf '%-4s %-6s %-10s %-10s %-10s\n' "${B}" "${S}" "FAIL" "FAIL" "FAIL"
+    echo "${B},${S},FAIL,FAIL,FAIL" >> "${CSV_OUT}"
+    git add "${CSV_OUT}"
+    git commit -m "Auto-commit: Gemma 270M benchmark result B=${B} S=${S} (FAIL)" || true
+    git push origin feature/niman_gemma_prefil_pass || true
     echo "  (stderr → /tmp/gemma270m_sweep_err.log)" >&2
   fi
 done
