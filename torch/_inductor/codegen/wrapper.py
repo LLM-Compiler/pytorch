@@ -98,6 +98,47 @@ class _NumaReassembleLine(DeferredLineBase):
         return _NumaReassembleLine(line, self.name, self._consumed_set)
 
 
+class _NumaAllReduceLine(DeferredLineBase):
+    """Emit one line of a cross-socket all-reduce only if the reduced tensor
+    is actually read afterwards -- either by a non-NUMA consumer of ``name``
+    (tracked in ``_numa_reassemble_consumed``) or by a downstream NUMA kernel
+    that reads one of the post-reduce per-socket re-clones in
+    ``reclone_names`` (tracked in ``_numa_reclone_consumed``). If neither
+    holds, the whole reduction is dead and is elided at flush time.
+    """
+
+    def __init__(
+        self,
+        line: str,
+        name: str,
+        consumed_set: "Set[str]",
+        reclone_names: "List[str]",
+        reclone_consumed: "Set[str]",
+    ) -> None:
+        super().__init__(line)
+        self.name = name
+        self._consumed_set = consumed_set
+        self._reclone_names = reclone_names
+        self._reclone_consumed = reclone_consumed
+
+    def _is_live(self) -> bool:
+        if self.name in self._consumed_set:
+            return True
+        return any(n in self._reclone_consumed for n in self._reclone_names)
+
+    def __call__(self) -> Optional[str]:
+        return self.line if self._is_live() else None
+
+    def _new_line(self, line: str) -> "_NumaAllReduceLine":
+        return _NumaAllReduceLine(
+            line,
+            self.name,
+            self._consumed_set,
+            self._reclone_names,
+            self._reclone_consumed,
+        )
+
+
 class _NUMAFreshAllocLine(DeferredLineBase):
     """Emit a per-NUMA-node empty_strided allocation only if it was NOT
     superseded by a reinterpret alias propagated from a buffer-reuse chain.
@@ -1927,54 +1968,62 @@ class PythonWrapperCodegen(CodeGen):
                         if len(per_node_outs) < 2:
                             continue
                         ws = len(per_node_outs)
-                        # M-split reassembly: the Triton-CPU launcher splits the
-                        # kernel grid linearly across sockets in row-major
-                        # (M-major) tile order.  Socket ``i`` therefore owns the
-                        # contiguous row shard [i * M//W : (i+1) * M//W] of every
-                        # output buffer.  Rather than summing per-socket outputs
-                        # (which would double-count rows), we concatenate the
-                        # valid shard from each socket along dim-0 to reconstruct
-                        # the full output tensor.
+                        # Cross-socket all-reduce: Z = sum_i Z^i.
                         #
-                        # The per-socket kernel outputs stay in _numa_tensor_cache
-                        # so downstream NUMA kernels still access their own
-                        # M-shard directly — no broadcast clone needed.
-                        split_var = f"_numa_msplit_{out_arg}"
-                        first_out = per_node_outs[0]
-                        # In-place reassembly into the already-allocated
-                        # out_arg buffer: each socket copies its M-shard
-                        # into the corresponding slice. Avoids the per-
-                        # forward allocation that ``torch.cat`` would do.
-                        # Wrapped in ``_NumaReassembleLine`` so the whole
-                        # reassembly is elided when ``out_arg`` has no
-                        # non-NUMA consumer (downstream NUMA kernels read
-                        # per-socket M-shards from ``_numa_tensor_cache``
-                        # directly and never reference ``out_arg`` as a
-                        # plain Python var).
+                        # The Triton-CPU launcher uses ``node_i`` only to pick
+                        # the socket-local operand set -- it never narrows the
+                        # grid range -- so every socket sweeps the *full*
+                        # kernel grid. A row-parallel kernel therefore leaves
+                        # each socket holding a complete-shape PARTIAL product
+                        # built from that socket's K-shard alone.
+                        #
+                        # These partials must be summed. Slicing a disjoint
+                        # row block out of each socket (the previous "M-split"
+                        # reassembly) silently dropped the other ws-1 shards'
+                        # contribution to those rows, and threw away the rest
+                        # of the work each socket had already done.
+                        reclone_names = [
+                            f"_numa_ar_{out_arg}_n{sid}" for sid in range(ws)
+                        ]
                         self._numa_reassemble_candidates.add(out_arg)
                         consumed_set = self._numa_reassemble_consumed
-                        self.writeline(
-                            _NumaReassembleLine(
-                                f"{split_var} = {first_out}.shape[0] // {ws}",
-                                out_arg,
-                                consumed_set,
-                            )
-                        )
-                        for sid in range(ws):
-                            start_s = f"{split_var}*{sid}" if sid > 0 else ""
-                            end_s = f"{split_var}*{sid + 1}" if sid < ws - 1 else ""
+                        reclone_consumed = self._numa_reclone_consumed
+
+                        # In-place into the already-allocated ``out_arg``, so
+                        # the reduction adds no per-forward allocation.
+                        reduce_lines = [f"{out_arg}.copy_({per_node_outs[0]})"]
+                        reduce_lines += [
+                            f"{out_arg}.add_({per_node_outs[sid]})"
+                            for sid in range(1, ws)
+                        ]
+                        for reduce_line in reduce_lines:
                             self.writeline(
-                                _NumaReassembleLine(
-                                    f"{out_arg}[{start_s}:{end_s}].copy_("
-                                    f"{per_node_outs[sid]}[{start_s}:{end_s}])",
+                                _NumaAllReduceLine(
+                                    reduce_line,
                                     out_arg,
                                     consumed_set,
+                                    reclone_names,
+                                    reclone_consumed,
                                 )
                             )
-                        # Keep per-socket kernel outputs in cache so downstream
-                        # NUMA kernels receive their correct M-shard without
-                        # an extra clone or re-broadcast.
-                        self._numa_tensor_cache[out_arg] = per_node_outs
+
+                        # Hand every socket its own copy of the reduced tensor
+                        # so a downstream NUMA kernel still reads socket-local
+                        # memory. Each re-clone is deferred and survives only
+                        # if that socket's copy is actually consumed.
+                        for sid in range(ws):
+                            self.writeline(
+                                _NumaReCloneLine(
+                                    f"{reclone_names[sid]} = "
+                                    f"torch.ops.aten.clone.default("
+                                    f"{out_arg}, numa_node={sid})",
+                                    reclone_names[sid],
+                                    reclone_consumed,
+                                )
+                            )
+                        # Downstream NUMA kernels must read the reduced value,
+                        # never the pre-reduction partials.
+                        self._numa_tensor_cache[out_arg] = reclone_names
             else:
                 self.writeline(
                     f"{kernel_name}.run({call_args_str}, grid={grid_str}, stream={stream_name})"
