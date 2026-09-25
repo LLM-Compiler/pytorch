@@ -1,0 +1,778 @@
+
+> I worked for a research project and did changes on the repo
+  https://github.com/LLM-Compiler/pytorch-private. But I cannot remeber in
+  which exact branch which I used as the successfull one. Since there are
+  different branches you need to go through each one and find what is the exact
+  branch which is the latest one which can be asured as the correct one which
+  has the correct changes done by me. This code is the relevant one which is
+  used to write this research paper.
+
+● I'll start by looking at the repository state and enumerating the branches.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Let me gather metadata for every branch — dates, authors, and how much each
+  diverges from main.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now let me map the branch topology — which branches descend from which — and
+  check ahead/behind counts.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Clear progression visible. Let me check ancestry containment among the top
+  candidates.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Lineage is clear: feature-prefill-full-model → BERT_bench → {Llama-1B (+1),
+  niman_gemma_prefil_pass (+35)}. Let me see what those distinguishing commits
+  actually contain.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Decisive finding: the Gemma GeGLU + MQA passes exist only beyond BERT_bench.
+  Let me verify feature presence across all candidates by inspecting actual
+  files.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Confirmed: numa_gemma_attention_tp.py exists only on
+  feature/niman_gemma_prefil_pass. Let me verify it's a complete superset and
+  check the final "backup" commit for WIP damage.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The final "backup" commit touched zero files under torch/ — it's benchmark
+  artifacts only, so the compiler code is intact. Let me verify full feature and
+  model coverage on this branch.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All paper components present. Now let me confirm the model and
+  benchmark-platform coverage matches the paper's evaluation.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Those are upstream. Let me find the project's own scripts directory.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● This branch carries the Intel Advisor roofline data (paper Fig. 2). Let me
+  check the model sweep scripts and per-platform results.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All three model families have speedup CLIs here. Let me cross-check the
+  recorded speedup numbers against the paper's headline claims (2.63× Haswell,
+  1.87× Cascade Lake).
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Exact match found. Let me confirm these numbers are unique to this branch and
+  verify GPT-2 too.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Conclusive. Let me do a final integrity check — confirm the Gemma work didn't
+  regress the GPT-2/BERT paths inherited from BERT_bench.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● I went through all 25 remote branches. Here's the answer.
+
+  The branch: feature/niman_gemma_prefil_pass
+
+  Tip: 54581fbdb4abd70852842f3b17edfec8147bd801 — "Before server restart all
+  backup", 2026-05-25
+
+  This is the only branch that contains the complete set of work described in
+  the paper.
+
+  How the branches relate
+
+  The NUMA-TP work is one long chain. The relevant tail is:
+
+  triton_cpu_backend → feature-numa-clone-extension → feature-numa-fx-pass-mlp
+    → feature-attention-pass → feature-model-tp-pass → feature-gpt-2
+    → fix-4-node → gpt2-prefill-without-LM → feature-prefill-full-model
+        ├─ BERT_bench  ──┬─ Llama-1B                      (+1 commit)
+        │                └─ feature/niman_gemma_prefil_pass (+35 commits)  ←
+  THIS ONE
+        └─ scaleway-bench (side branch, diverged)
+
+  feature/niman_gemma_prefil_pass is a strict descendant of BERT_bench, so it
+  inherits all the GPT-2 and BERT work and adds Gemma on top.
+
+  Why it's the one — the Gemma evidence is decisive
+
+  The paper evaluates Gemma 3 270M with Multi-Query Attention and a GeGLU-gated
+  MLP. That support exists nowhere else:
+
+  ┌─────────────────────┬────────────────────────┬─────────────────────────┐
+  │       Branch        │ numa_gemma_attention_t │ gemma270m_sweep_results │
+  │                     │          p.py          │          .csv           │
+  ├─────────────────────┼────────────────────────┼─────────────────────────┤
+  │ BERT_bench          │ absent                 │ absent                  │
+  ├─────────────────────┼────────────────────────┼─────────────────────────┤
+  │ Llama-1B            │ absent                 │ absent                  │
+  ├─────────────────────┼────────────────────────┼─────────────────────────┤
+  │ scaleway-bench      │ absent                 │ absent                  │
+  ├─────────────────────┼────────────────────────┼─────────────────────────┤
+  │ feature-gemma-tp    │ absent                 │ absent                  │
+  ├─────────────────────┼────────────────────────┼─────────────────────────┤
+  │ niman_gemma_prefil_ │ PRESENT (905 lines)    │ PRESENT                 │
+  │ pass                │                        │                         │
+  └─────────────────────┴────────────────────────┴─────────────────────────┘
+
+  The published numbers match this branch exactly
+
+  Two independent confirmations against the paper's Figure 8:
+
+  - gemma270m_sweep_results.csv — B=1: 1.931, 1.944 → paper Fig. 8a Gemma row
+    reads 1.93, 1.94. B=8: 1.851, 1.757, 1.680, 1.838, 1.927 → paper reads 1.85,
+    1.76, 1.68, 1.84, 1.93.
+  - bert_compile_debug_large_B8_S128_2048/speedup_by_config.csv — 1.2609,
+    1.4215, 1.5376, 1.5397, 1.4890 → paper Fig. 8b BERT (Large) B=8 reads 1.26,
+    1.42, 1.54, 1.54, 1.49.
+
+  Every paper component is present
+
+  - §II-A extended clone — numa_node param in TensorFactories.cpp:1743
+    (aten/src/ATen/native/TensorFactories.cpp#L1743), mbind/MPOL_BIND in
+    c10/util/numa.cpp:91 (c10/util/numa.cpp#L91)
+  - §II-C FX passes — numa_mlp_tp, numa_attention_tp, numa_gemma_attention_tp,
+    numa_layer_norm_tp, numa_residual_tp, numa_lm_head_tp, numa_tp_common
+  - §II-E wrapper codegen — _emit_slice_clone in codegen/wrapper.py
+  - §II-F NUMA-aware dispatch — numa_args launcher path in
+    runtime/triton_heuristics.py
+  - MQA (n_kv=1) KV-replication — _numa_attention_tp_slice_kv: bool = False
+    (config.py:597 (torch/_inductor/config.py#L597)), exactly the replicated
+    path the paper describes
+  - Fig. 2 roofline — scripts/inductor/advisor_b1_s2048_762M/ Intel Advisor
+    database, matching the paper's B=1/S=2048 762M profile
+  - All three model families — gpt2_multi_size_speedup_cli.py,
+    bert_multi_size_speedup_cli.py, gemma270m_bs_seq_sweep.sh
+
+  Two things worth knowing
+
+  The tip commit is safe. "Before server restart all backup" sounds alarming and
+  touches 6803 files, but it changed zero files under torch/, aten/, or c10/ —
+  it's purely benchmark artifacts plus a 7-line tweak to a demo CLI. The
+  compiler code at the tip is identical to 7a30149b3d (2026-05-12), the last
+  real code commit. If you want a clean commit to cite or tag, use 7a30149b3d;
+  if you want the benchmark data too, use the tip.
+
+  No regression to GPT-2/BERT. The diff from BERT_bench to the tip is +1512/−14
+  across only 5 files — essentially additive. The commit message explicitly
+  confirms it: "2-tuple plans from other passes (numa_attention_tp /
+  numa_mlp_tp) fall back to shard_d so this change is backwards compatible."
+
+  To get on it:
+
+  git checkout -b numa-torch-paper origin/feature/niman_gemma_prefil_pass
+
+  One caveat on scope: Llama-1B (2026-06-11) and the decode branch
+  feature/niman_decording_layer_support_tp_with_kv_cache are chronologically
+  later or separate, but both fall outside the paper — the paper is prefill-only
+  and evaluates no Llama model. Llama-1B is BERT_bench plus a single "Adding
+  temp Llama 1B" commit and, critically, has no Gemma support at all, so it
+  cannot be the branch behind the published results.
+
+> can you chekcout into the feature/niman_gemma_prefil_pass branch
+
+● Working tree is clean, so this is safe. Checking out now.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+> /model sonnet
+  ⎿  Set model to claude-sonnet-5
+
+> /model opus[1m]
+  ⎿  Set model to claude-opus-5[1m]
+> Now I want to understand that the pytorch-private is part of the NUMA Torch
+  implementation, the modified Triton CPU backend is at
+  https://github.com/LLM-Compiler/triton-cpu-private  But I cannot remeber in
+  which exact branch which I used as the successfull one. Since there are
+  different branches you need to go through each one and find what is the exact
+  branch which is the latest one which can be asured as the correct one which
+  has the correct changes done by me.
+
+● The strongest evidence will be the submodule pointer in this repo — it pins an
+  exact triton-cpu commit. Let me start there.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Not a submodule here. Let me search the repo docs for how triton-cpu is wired
+  in, and check whether it's cloned locally.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● triton-cpu is a separate sibling repo. Let me check whether it's cloned
+  locally on this machine.
+
+  Listed 1 directory (ctrl+o to expand)
+
+● Not cloned locally — I'll need to fetch it. Let me clone into the scratchpad.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● 18 branches. The paper-relevant ones cluster in Apr–May 2026. Let me map
+  ancestry and commit counts.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Perfectly linear chain, advisor-fix at the tip = feature-attention-pass + 1
+  commit. Let me see all 7 commits and what that final commit changes.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All NUMA work lives in third_party/cpu/backend/driver.py. Let me inspect the
+  final advisor commit to see if it alters execution semantics.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Purely a profiling change (persists .so for Intel Advisor symbol resolution) —
+  no effect on kernel execution or NUMA dispatch. This matches the paper's Fig.
+  2 roofline setup exactly. Now let me verify the NUMA dispatch implementation
+  (Algorithm 4) at the tip.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All of Algorithm 4 is present. Now the key cross-check — the interface
+  contract between the two repos.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Exact interface handshake confirmed. Let me verify which branches actually
+  carry the NUMA dispatch code.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● I went through all 18 branches of triton-cpu-private. Here's the answer.
+
+  The branch: advisor-fix
+
+  Tip: 7e394470db5c0bf64be1c11e7e979d378115bafd — "Keep .so files for advisor to
+  benchmark", 2026-05-01
+
+  This is the newest branch in the repo and a strict superset of every other
+  NUMA branch.
+
+  How the branches relate
+
+  Unlike the PyTorch repo, this one is a short, perfectly linear chain — only 7
+  commits off main:
+
+  main → de452318 (triton cpu integration)
+       → 5d346212 / a274cb00 (debug symbols)
+       → db7bdf43  triton_cpu_backend            (stable base)
+       → 01446998  feature-numa-fx-pass-mlp      (NUMA support for CPU launcher)
+       → 3977db5e  feature-attention-pass        (Thread pool - stable for TP)
+       → 7e394470  advisor-fix                   ← THIS ONE (+1 commit)
+
+  advisor-fix = feature-attention-pass + exactly one commit. All the NUMA work
+  is concentrated in a single file, third_party/cpu/backend/driver.py.
+
+  Feature matrix — only advisor-fix has everything
+
+  ┌────────────────────────────┬───────────┬────────────────┬───────────────┐
+  │           Branch           │ numa_args │ NumaThreadPool │     .so       │
+  │                            │           │                │  persistence  │
+  ├────────────────────────────┼───────────┼────────────────┼───────────────┤
+  │ advisor-fix                │ 13        │ 7              │ 1             │
+  ├────────────────────────────┼───────────┼────────────────┼───────────────┤
+  │ feature-attention-pass     │ 13        │ 7              │ 0             │
+  ├────────────────────────────┼───────────┼────────────────┼───────────────┤
+  │ feature-numa-fx-pass-mlp   │ 13        │ 0              │ 0             │
+  ├────────────────────────────┼───────────┼────────────────┼───────────────┤
+  │ triton_cpu_backend         │ 0         │ 0              │ 0             │
+  ├────────────────────────────┼───────────┼────────────────┼───────────────┤
+  │ numa_llm / NUMA_Triton /   │ 0         │ 0              │ 0             │
+  │ NUMA                       │           │                │               │
+  ├────────────────────────────┼───────────┼────────────────┼───────────────┤
+  │ dev / main                 │ 0         │ 0              │ 0             │
+  └────────────────────────────┴───────────┴────────────────┴───────────────┘
+
+  Note the trap: the branches named NUMA, NUMA_Triton, and numa_llm contain zero
+  NUMA launcher code — those are the early attempts, and their own commit
+  messages say so ("NUMA aware implementation [Wrong]", "Change unsure
+  reconsider it").
+
+  The decisive proof — the interface handshake
+
+  The two repos are locked together by a concrete contract I verified on both
+  sides:
+
+  - PyTorch (feature/niman_gemma_prefil_pass): wrapper codegen emits
+    numa_args=[...] on kernel calls (wrapper.py:1901
+    (torch/_inductor/codegen/wrapper.py#L1901)) and the launcher attaches it to
+    kernel metadata (triton_heuristics.py:656
+    (torch/_inductor/runtime/triton_heuristics.py#L656))
+  - Triton (advisor-fix): the C++ launcher reads
+    PyObject_HasAttrString(kernel_metadata, "numa_args") at driver.py:671
+
+  That attribute name appears on both sides and nowhere else. These are the
+  matched pair.
+
+  Additionally, a274cb00 — the commit your PyTorch LOCAL_SETUP.md records as the
+  pinned triton-cpu-stable worktree — is an ancestor of advisor-fix, confirming
+  the same lineage.
+
+  Everything the paper's §II-F / Algorithm 4 describes is present
+
+  - get_numa_node_cpus(node_id) → Alg. 4 line 6, "cores belonging to socket i //
+    OS topology"
+  - pthread_setaffinity_np (driver.py:369) → Alg. 4 line 8, "bind worker j to a
+    core in Cᵢ // affinity"
+  - NumaThreadPool + get_or_init_numa_pool, process-lifetime → contribution #2's
+    "persistent, NUMA-aware thread pool"
+  - launched_numa flag with if (!launched_numa) fallback at line 813 → Alg. 4
+    lines 11–12, "else run K through the default, NUMA-oblivious launch"
+
+  Why advisor-fix and not feature-attention-pass
+
+  The one extra commit is what makes the paper's Figure 2 roofline possible. It
+  replaces NamedTemporaryFile(delete=True) with deterministic hash-named .so
+  paths, and the commit's own comment explains why:
+
+  ▎ NamedTemporaryFile's default delete=True unlinks the file the moment this
+  ▎ method returns, leaving Pin / Advisor with "Cannot locate file" errors and
+  ▎ zero FLOP attribution → empty roofline.
+
+  That matches the symptom recorded in your PyTorch-side advisor_latest_fix.md:
+  "(Cannot locate file '/tmp/tmpXXXX.so')".
+
+  Importantly, this change touches only where the .so is written — it does not
+  alter kernel execution or NUMA dispatch. So advisor-fix produces identical
+  speedup numbers to feature-attention-pass while additionally supporting the
+  Advisor profiling run. It's the safe superset.
+
+  To get it
+
+  git clone https://github.com/LLM-Compiler/triton-cpu-private.git
+  cd triton-cpu-private
+  git checkout -b numa-torch-paper origin/advisor-fix
+
+  The complete paper pair
+
+  ┌────────────────────┬─────────────────────────────────┬────────────┐
+  │        Repo        │             Branch              │    Tip     │
+  ├────────────────────┼─────────────────────────────────┼────────────┤
+  │ pytorch-private    │ feature/niman_gemma_prefil_pass │ 54581fbdb4 │
+  ├────────────────────┼─────────────────────────────────┼────────────┤
+  │ triton-cpu-private │ advisor-fix                     │ 7e394470db │
+  └────────────────────┴─────────────────────────────────┴────────────┘
+
+  One note on dates: the Triton tip (2026-05-01) predates the PyTorch tip
+  (2026-05-25). That's expected and not a mismatch — the backend stabilized
+  first, and all subsequent Gemma work was PyTorch-side only (FX passes and
+  buffer materialization). The driver defaults shard i → NUMA node i when
+  PyTorch sends only numa_args, which is exactly right for the dual-socket
+  setup, so the pairing stays compatible.
+
+  I cloned the repo into the scratchpad for this analysis — say the word if
+  you'd like it placed somewhere permanent alongside pytorch-private.
+
+> yes place in Dekstop
+
+● Let me check the destination is free, then do a proper full clone (not the
+  blobless one) so it's actually usable for building.
+
+  Ran 4 shell commands (ctrl+o to expand)
+
+● There's a sleef submodule the CPU backend needs — initializing it so the clone
+  is build-ready.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Done. Both repos are now on your Desktop, each on its paper branch.
+
+  ┌────────────────────────┬─────────────────────────────┬──────────┬──────┐
+  │          Path          │           Branch            │   HEAD   │ Stat │
+  │                        │                             │          │  e   │
+  ├────────────────────────┼─────────────────────────────┼──────────┼──────┤
+  │ Desktop/pytorch-privat │ feature/niman_gemma_prefil_ │ 54581fbd │ clea │
+  │ e (../pytorch-private) │ pass                        │ b4       │ n    │
+  ├────────────────────────┼─────────────────────────────┼──────────┼──────┤
+  │ Desktop/triton-cpu-pri │                             │ 7e394470 │ clea │
+  │ vate (../triton-cpu-pr │ advisor-fix                 │ db       │ n    │
+  │ ivate)                 │                             │          │      │
+  └────────────────────────┴─────────────────────────────┴──────────┴──────┘
+
+  The new clone:
+  - Checked out directly on advisor-fix, tracking origin/advisor-fix, working
+    tree clean
+  - Full clone (89 MB) with complete history — not the blobless one I used for
+    analysis, so it's usable for building
+  - third_party/sleef submodule initialized at 3.6.1-10-g93f04d8 — the CPU
+    backend needs it to build, so I pulled it in
+  - NUMA launcher code confirmed in place at third_party/cpu/backend/driver.py
+
+  Build wiring for the pair is documented in triton-cpu-private/LOCAL_SETUP.md
+  (../triton-cpu-private/LOCAL_SETUP.md), which drives the build from the Triton
+  repo root against the sibling PyTorch tree via
+  scripts/build_bench_triton_cpu_integrated.sh all. Note those paths are written
+  for the original Linux server (/home/shavin/llm-cpu-compiler/...) with conda
+  env bench_triton_cpu_integrated, so they'd need adjusting for these Desktop
+  locations — and the build itself needs Linux plus libnuma for
+  mbind/pthread_setaffinity_np, which won't compile natively on Windows.
+
+> When I tested the current NUMA Torch implementation on Dual Socket CPU, it
+  gives the expected results, but when I checked it on 4 socket CPU, the NUMA
+  Torch implementation showed slower/same prefill time comparing with the given
+  baseline. I want you to analyse the implementation and find is there any bug
+  in the implementation which gives such results (note that currently you do
+  not have a runnable machine, so I want you to analyse it statically)
+
+● This is a great question to attack statically — and there's a strong lead: the
+  repo has a branch literally named fix-4-node. Let me check whether its fixes
+  made it into the paper branch.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Despite its name, fix-4-node is mostly Advisor setup — no actual 4-node fix
+  landed. Let me now read the dispatch path in the Triton launcher, the most
+  likely place for an N=2 assumption.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Dispatch itself looks N-generic. The critical question is whether PyTorch
+  actually emits N shards. Let me check how world_size is determined.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● world_size detection is generic. Now the prime suspect — the all-reduce and
+  buffer materialization in wrapper codegen.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Major finding — the reassembly is a concatenation, not a sum. Let me verify
+  against what the launcher actually does by reading the thread pool's dispatch.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The launcher has every socket sweep the full grid, yet the wrapper assumes
+  sockets own disjoint row-blocks. Let me resolve this by reading how the
+  per-node buffers are built.
+  Ran 1 shell command (ctrl+o to expand)
+
+● Let me examine the CPU topology parsing and the pool-reuse logic — both are
+  N-sensitive.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Found one: on any node-list mismatch the pool returns nullptr permanently —
+  never rebuilt. Let me see what the fallback path costs.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Let me settle how the reduction actually happens — searching the FX passes for
+  the partial-sum logic.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Let me check whether activation replication is amortized across kernels, and
+  confirm the per-forward cost.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Let me check the repo's own notes — there's a BUG.md and analysis docs at
+  root.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Let me make the central finding airtight — confirming node_i never influences
+  which grid items a socket executes.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Let me verify two secondary suspects: per-pass world-size config keys, and any
+  NUMA-distance awareness.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I found a concrete root cause. Here's the static analysis.
+
+  Primary bug: the launcher and the wrapper disagree about who computes what
+
+  There is a hard contract mismatch between the two repos.
+
+  What the Triton launcher does — in both the pool path and the fallback path,
+  node_i selects only the pointer set, never the grid range:
+
+  [&](int node_i, int local_tid, int node_threads) {
+    size_t start = (N * local_tid)       / node_threads;   // no node_i
+    size_t end   = (N * (local_tid + 1)) / node_threads;   // no node_i
+    const std::vector<void*>& numa_ptrs = per_node_ptrs[node_i];  // node_i used
+  ONLY here
+    for (size_t i = start; i < end; ++i) { kernel(...); }
+  }
+
+  Within socket i, the local threads partition [0, G) among themselves — so
+  every socket sweeps the entire grid. This matches Algorithm 4 in the paper
+  ("each socket sweeps G").
+
+  What the PyTorch wrapper assumes — wrapper.py:1932-1940
+  (torch/_inductor/codegen/wrapper.py#L1932-L1940):
+
+  ▎ "the Triton-CPU launcher splits the kernel grid linearly across sockets in
+  ▎ row-major (M-major) tile order. Socket i therefore owns the contiguous row
+  ▎ shard [i*M//W : (i+1)*M//W]"
+
+  and it reassembles accordingly:
+
+  out_arg[split*sid : split*(sid+1)].copy_( per_node_outs[sid][split*sid :
+  split*(sid+1)] )
+
+  That premise is false. Socket i computed all M rows; the wrapper keeps only
+  rows [i·M/W, (i+1)·M/W) and discards the rest.
+
+  Why this specifically kills 4-socket scaling
+
+  For a row-parallel kernel, per-socket work is M · N_out · (d/W) over the full
+  output grid, running on C/W cores:
+
+  t_socket ∝ (M · N_out · d / W) / (C / W)  =  M · N_out · d / C   =  t_baseline
+
+  The W cancels. Row-parallel kernels get zero compute scaling at any socket
+  count — their entire gain comes from weight locality, not parallelism.
+  Meanwhile the discarded fraction is (W−1)/W:
+
+  ┌─────────┬────────────────────────────────┐
+  │ Sockets │ Row-parallel compute discarded │
+  ├─────────┼────────────────────────────────┤
+  │ 2       │ 50%                            │
+  ├─────────┼────────────────────────────────┤
+  │ 4       │ 75%                            │
+  └─────────┴────────────────────────────────┘
+
+  At W=2, locality alone (halving remote DRAM traffic in a bandwidth-bound
+  regime) is worth ~2×, so it masks the 50% waste. At W=4 locality is already
+  saturated — you cannot do better than "all local" — while the waste grows to
+  75% and the O(W) overheads below pile on. Net: a wash or a regression, exactly
+  what you measured.
+
+  Correctness caveat worth checking: row-block i taken from socket i contains
+  only K-shard i's contribution, missing the other W−1 shards. That reads as
+  numerically wrong, yet the bias handling elsewhere implies true sum semantics
+  — zero_on_nonzero_nodes keeps the output bias on node 0 and zeroes it
+  elsewhere (numa_attention_tp.py:1092
+  (torch/_inductor/fx_passes/numa_attention_tp.py#L1092)), which is only correct
+  if partials are summed. Two mechanisms in the same codebase assume opposite
+  reassembly semantics. Please re-run your correctness check at W=2 — if it
+  passes, my reading of which kernels reach this path is incomplete, but the
+  redundant full-grid sweep is real regardless.
+
+  The fix, either direction:
+  - (a) Make the launcher split the grid across sockets — fold a global tid into
+    the range so socket i sweeps only its slice. Then M-split reassembly
+    becomes correct and the waste disappears.
+  - (b) Keep full-grid-per-socket and replace the concat with a true Z = Σᵢ Zⁱ
+    all-reduce — this is what the paper describes (Algorithm 1 line 5, Algorithm
+    2 line 6).
+
+  (a) is the smaller change and directly recovers the lost parallelism.
+
+  Secondary findings, all O(W)
+
+  1. Permanent pool loss on node-list mismatch — driver.py:550
+  (third_party/cpu/backend/driver.py#L550). The pool is built for the first node
+  list seen; any later mismatch returns nullptr and is never rebuilt, dropping
+  every subsequent launch onto spawn-and-join-per-launch. This is live risk for
+  you because each pass reads its own world-size knob — _numa_mlp_tp_world_size,
+  _numa_attention_tp_world_size, _numa_layer_norm_tp_world_size,
+  _numa_lm_head_tp_world_size. If any is left at its default while others are
+  set to 4, the world sizes diverge, numa_count differs, and you silently pay
+  thread construction + pthread_setaffinity_np + join on every kernel — with 4
+  sockets' worth of threads. Worth logging pool == nullptr to confirm on your
+  4-socket runs.
+
+  2. Activation replication grows linearly — wrapper.py:2351-2352
+  (torch/_inductor/codegen/wrapper.py#L2351-L2352). The block input is cloned to
+  every socket each forward (cache=False, correctly so — it changes per
+  forward). Weights are hoisted and cached, but activations are not: W full
+  copies of X per NUMA block per forward. W=4 doubles this traffic versus W=2,
+  and the clones run on PyTorch's unpinned OpenMP pool, so the copies themselves
+  generate cross-socket traffic.
+
+  3. Replicated normalization scales as W — Algorithm 3 duplicates the full norm
+  on every socket. The paper's justification (redundant compute beats
+  communication) was measured at W=2; the redundancy grows linearly with W while
+  the communication it avoids does not.
+
+  4. Grid starvation on shrinking shards — with start = G·tid/nt, any thread
+  gets zero work once G < nt. Column-parallel grids shrink as 1/W, so at W=4
+  with 15 cores/socket a small model (d_model 768–1280 → 320-column shards) can
+  leave cores idle and pushes GEMMs into tile sizes too small to vectorize well.
+
+  5. No NUMA-distance awareness — neither repo reads a distance matrix;
+  numa_nodes[i] = i assumes shard i ↔ node i and treats all nodes as
+  equidistant. That holds on a 2-socket box where remote is a single QPI/UPI
+  hop. On 4-socket systems the interconnect is often a ring or
+  partially-connected mesh, so "remote" is no longer uniform — some pairs are
+  two hops. Your reassembly and replication traffic then pays varying, and
+  sometimes double, latency that the cost model doesn't represent.
+
+  Suggested order of attack
+
+  Fix the launcher/wrapper contract first (finding 1) — it's the only one that
+  explains a complete loss of scaling rather than a constant-factor tax, and
+  it's the cheapest to change. Then instrument for finding 2, since a silent
+  fallback to spawn-per-launch would compound it. Findings 3–5 are design-level
+  and would shape how far NUMA-TP can scale past two sockets even once the
+  contract is repaired.
+
+  I should flag that all of this is read-only reasoning — no machine to confirm
+  on — so the ranking is by strength of static evidence. Finding 1 is directly
+  verifiable from the two code paths I quoted; finding 2 depends on your actual
+  config values at benchmark time.
+
+> apply that fix and commit and push in proper manner. Note that when
+  committing do not include claude as co author. Only include
+  thisara.weerakoon2001@gmail.com as email and ThisaraWeerakoon as git user
+  name.
+
+● Before editing, one correction to my earlier recommendation: option (a) would
+  align the grid split with the reassembly but leaves the math wrong — a
+  row-parallel socket holds only K-shard i, so no grid split can produce
+  complete rows. The correct fix is option (b), the true sum all-reduce, which
+  is also what the paper specifies. Let me read the surrounding machinery first.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Confirmed — _NumaReCloneLine exists for "post-all-reduce per-node re-clone",
+  so the true-sum machinery is still there. Let me read the rest of the block.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now let me verify the elision bookkeeping I need to hook into.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Now I'll apply the fix. First, adding a deferred-line class for the
+  all-reduce.
+
+  Ran 5 shell commands (ctrl+o to expand)
+
+● Perl is available. Applying both edits.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● CRLF line endings — let me account for that and preserve them.
+
+  Ran 7 shell commands (ctrl+o to expand)
+
+● The extract lost the CRs. Let me splice by verified line numbers instead,
+  which avoids the encoding issue entirely.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Let me verify the result syntactically. First, finding any Python interpreter.
+
+  Listed 1 directory (ctrl+o to expand)
+
+● No real Python interpreter available, so I'll verify by careful inspection.
+  Let me review the spliced block in context.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Let me confirm no line-ending churn crept in — that would show as a whole-file
+  diff.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Clean, localized diff with no line-ending churn. Let me review it in full
+  before committing.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Diff is clean. Now let me check the git identity setup before committing.
+  Ran 1 shell command (ctrl+o to expand)
+
+● No identity configured — I'll pass it explicitly per-commit rather than
+  changing your global config. I'll also put this on a dedicated branch rather
+  than committing straight onto the paper's reference branch.
+
+  Committed 24f44419b9, ran 1 shell command (ctrl+o to expand)
+
+● Author and committer both correct. Let me confirm no co-author trailer slipped
+  in, then push.
+
+  Pushed to fix/numa-tp-row-parallel-allreduce, ran 2 shell commands (ctrl+o to expand)
+
+● Pushed. Commit 24f44419b9 on fix/numa-tp-row-parallel-allreduce, authored and
+  committed as ThisaraWeerakoon <thisara.weerakoon2001@gmail.com>, with no
+  Claude or Anthropic attribution anywhere in the message.
+
+  PR link: https://github.com/LLM-Compiler/pytorch-private/pull/new/fix/numa-tp-
+  row-parallel-allreduce
+
+  One correction to what I told you last turn
+
+  I'd ranked option (a) — splitting the grid across sockets in the launcher — as
+  the cheaper fix. That was wrong, and I didn't implement it. No grid split can
+  make the M-split concatenation correct, because socket i holds only K-shard
+  i; its rows are partial no matter which rows it computes. Row-parallel TP
+  inherently requires the sum. So I implemented option (b), which is also what
+  the paper specifies (Algorithm 1 line 5, Algorithm 2 line 6, Figure 6b).
+
+  What changed
+
+  One file, torch/_inductor/codegen/wrapper.py, +89/−40:
+
+  - Replaced the M-split concatenation with Z = Σᵢ Zⁱ — summed in place into the
+    already-allocated output (copy_ then add_), so no per-forward allocation is
+    added, preserving the original code's intent of avoiding a torch.cat.
+  - Re-clone the reduced tensor per socket through the existing _NumaReCloneLine
+    machinery, so downstream NUMA kernels still read socket-local memory.
+    _numa_tensor_cache now publishes those re-clones instead of the
+    pre-reduction partials.
+  - Added _NumaAllReduceLine for the dead-code elision. This was necessary: the
+    old _NumaReassembleLine only tracked non-NUMA consumers of the output, which
+    would have silently dropped a live reduction whose only consumer was a
+    downstream NUMA kernel. The new class keeps the reduction if either a
+    non-NUMA consumer or any per-socket re-clone is consumed.
+
+  No Triton-CPU change was needed — full-grid-per-socket is the correct launcher
+  behavior for row-parallel TP once the partials are actually summed. So
+  triton-cpu-private is untouched.
+
+  Verification status — please read before trusting this
+
+  I could not run anything. There's no Python interpreter on this machine (only
+  the WindowsApps stubs), so there is no syntax check, no lint, and no test run
+  behind this commit. What I did verify is limited to: the diff is confined to
+  the intended region, indentation and block structure align with the
+  surrounding code, List/Optional/Set are already imported, and CRLF line
+  endings are preserved with zero line-ending churn.
+
+  Before merging, on your Linux box:
+
+  python -c "import ast,io; ast.parse(io.open('torch/_inductor/codegen/wrapper.p
+  y',encoding='utf-8').read())"
+
+  then a correctness run at W=2 — that's the important one. If your existing
+  2-socket correctness check passed against the old concatenation, that
+  contradicts my analysis and means some row-parallel kernels don't reach this
+  path; I'd want to see that before you trust the 4-socket numbers. If it passes
+  at W=2 and now also at W=4, the fix is confirmed.
+
+  Branch choice
+
+  I put this on a new branch rather than committing onto
+  feature/niman_gemma_prefil_pass. That branch is the reproducibility artifact
+  for the published results, and this commit changes numerical output —
+  overwriting it would make the paper's figures no longer reproducible from
+  their own branch. origin/feature/niman_gemma_prefil_pass is confirmed still at
+  54581fbdb4. Merge or fast-forward whenever you're ready.
+
+  Two caveats on expectations: this fixes the correctness bug and recovers the
+  discarded work, but it does not address findings 2–5 from the analysis — the
+  O(W) activation replication, the permanently-lost thread pool on node-list
+  mismatch, W× replicated normalization, or the absent NUMA-distance model.
+  Those are independent and still cap 4-socket scaling. And note that
+  row-parallel kernels have no compute speedup even when correct — total FLOPs
+  are conserved across the same core count, so the entire win there is locality.
+  That's inherent to single-machine TP, not a defect.
