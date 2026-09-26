@@ -1,0 +1,8 @@
+warning: seq_length=4096 > default context=1024; position table size uses max(seq_length, 1024).
+NUMA enabled=True nodes=4
+GPT-2 117M (117m) prefill: B=1 S=4096 L=12 H=12 E=64 D=768 FFN=3072 world_size=4
+Running standard ...
+Running NUMA-TP (tp_lm_head=False) ...
+correctness: max_abs=1.025e-05 max_rel=1.988e+01 PASS (atol=0.001 rtol=0.001)
+standard mean_ms=13122.429 median=13121.026 min=12629.325
+numa_tp mean_ms=7430.319 median=7433.447 min=7368.119

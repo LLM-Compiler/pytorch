@@ -1,387 +1,42 @@
 diff --git a/torch/_inductor/codegen/wrapper.py b/torch/_inductor/codegen/wrapper.py
-index c8a5f381fa..6203cec005 100644
+index 6203cec005..4dcb7196e2 100644
 --- a/torch/_inductor/codegen/wrapper.py
 +++ b/torch/_inductor/codegen/wrapper.py
-@@ -139,6 +139,32 @@ class _NumaAllReduceLine(DeferredLineBase):
-         )
- 
- 
-+class _NumaGraphOutputCopyLine(DeferredLineBase):
-+    """Reconcile a replicated per-socket result that is also a graph output.
-+
-+    The two reconciliation paths cover terminal partial sums (all-reduce) and
-+    intermediate activations (stay socket-local, forwarded to the next local
-+    kernel). A replicated result that is returned from the graph fits neither:
-+    it has no downstream local kernel, so nothing would ever write the buffer
-+    the caller receives, and the model returns unwritten memory.
-+
-+    Every socket holds a COMPLETE copy of a replicated result (Algorithm 3), so
-+    a single copy from node 0 reconciles it. Summing would scale the value by
-+    the socket count. Emitted only if ``name`` really is a graph output at
-+    flush time, when ``V.graph.graph_outputs`` is final.
-+    """
-+
-+    def __init__(self, line: str, name: str) -> None:
-+        super().__init__(line)
-+        self.name = name
-+
-+    def __call__(self) -> Optional[str]:
-+        return self.line if self.name in V.graph.get_output_names() else None
-+
-+    def _new_line(self, line: str) -> "_NumaGraphOutputCopyLine":
-+        return _NumaGraphOutputCopyLine(line, self.name)
-+
-+
- class _NUMAFreshAllocLine(DeferredLineBase):
-     """Emit a per-NUMA-node empty_strided allocation only if it was NOT
-     superseded by a reinterpret alias propagated from a buffer-reuse chain.
-@@ -626,6 +652,11 @@ class PythonWrapperCodegen(CodeGen):
-         # time; names absent at flush time stay "unwritten". This elides
-         # dead re-clone copies when the row-parallel output is terminal.
-         self._numa_reclone_consumed: Set[str] = set()
-+        # Post-all-reduce per-socket names, keyed by the reduced buffer.
-+        # Kept separate from ``_numa_tensor_cache`` because buffer-reuse
-+        # aliasing overwrites that cache entry, which would otherwise point
-+        # downstream consumers back at the pre-reduction partials.
-+        self._numa_reduction_reclones: Dict[str, List[str]] = {}
-         # Per-NUMA-node allocation variable names that have been superseded by
-         # a reinterpret alias from a buffer-reuse chain. When a name appears
-         # here, the corresponding _NUMAFreshAllocLine is suppressed at flush
-@@ -1898,9 +1929,15 @@ class PythonWrapperCodegen(CodeGen):
-             getattr(config, "_numa_mlp_tp", False)
-             or getattr(config, "_numa_attention_tp", False)
-         ):
--            full_plan = getattr(config, "_numa_attention_tp_shard_plan", None)
--            if not (isinstance(full_plan, dict) and full_plan.get("world_size", 0) >= 2):
--                full_plan = getattr(config, "_numa_mlp_tp_shard_plan", None)
-+            # Union of every pass's plan. Preferring one slot over the other
-+            # described the MLP's template kernels with the attention plan
-+            # whenever both passes were on, dropping the MLP's sharding and
-+            # its all-reduce. See ``merged_global_shard_plan``.
-+            from torch._inductor.fx_passes.numa_tp_common import (
-+                merged_global_shard_plan,
-+            )
-+
-+            full_plan = merged_global_shard_plan()
-             if isinstance(full_plan, dict) and full_plan.get("world_size", 0) >= 2:
-                 numa_shard_plan = full_plan
-             else:
-@@ -2024,6 +2061,23 @@ class PythonWrapperCodegen(CodeGen):
-                         # Downstream NUMA kernels must read the reduced value,
-                         # never the pre-reduction partials.
-                         self._numa_tensor_cache[out_arg] = reclone_names
-+                        self._numa_reduction_reclones[out_arg] = reclone_names
-+                else:
-+                    # Not a row-parallel kernel, so there is no partial sum to
-+                    # reduce. But if one of these per-socket results is the
-+                    # graph's own output (e.g. the final replicated LayerNorm
-+                    # of a Pre-LN stack) there is no downstream local kernel to
-+                    # forward it to either, and the returned buffer would never
-+                    # be written. Reconcile it with a single copy from node 0.
-+                    for out_arg, per_node_outs in numa_output_clones.items():
-+                        if not per_node_outs:
-+                            continue
-+                        self.writeline(
-+                            _NumaGraphOutputCopyLine(
-+                                f"{out_arg}.copy_({per_node_outs[0]})",
-+                                out_arg,
-+                            )
-+                        )
-             else:
-                 self.writeline(
-                     f"{kernel_name}.run({call_args_str}, grid={grid_str}, stream={stream_name})"
-@@ -2196,7 +2250,12 @@ class PythonWrapperCodegen(CodeGen):
-         )
- 
-         normalized_plan = ensure_generalized_lists(shard_plan)
--        x_node = normalized_plan.get("x_node")
-+        # Activation inputs: replicated, but re-cloned every forward rather
-+        # than hoisted into the persistent weight cache. A merged plan carries
-+        # one per contributing block/pass.
-+        x_nodes = set(normalized_plan.get("x_nodes") or [])
-+        if isinstance(normalized_plan.get("x_node"), str):
-+            x_nodes.add(normalized_plan["x_node"])
-         shard_d = int(normalized_plan.get("shard_d", 0))
- 
-         # column_parallel_nodes / row_parallel_nodes entries are 2-tuples
-@@ -2383,20 +2442,36 @@ class PythonWrapperCodegen(CodeGen):
-                 # tensors directly on the target NUMA node (uninitialized).
-                 # The kernel fully overwrites these, so skip the wasteful
-                 # ``clone + copy`` of undefined bytes that _emit_replicate
--                # would do. Applied to pure-output args and also to the
--                # first occurrence of an in_out_ptr arg (no cache hit).
--                if is_out_only or is_in_out:
-+                # would do. Pure outputs only.
-+                if is_out_only:
-                     out_name = _emit_numa_empty_strided(arg_name, sid)
-                     per_node_arg_names[sid].append(out_name)
-                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = out_name
-                     continue
- 
-+                # ``in_out_ptr`` with no cache entry. Unlike ``out_ptr``, the
-+                # kernel may READ this buffer before overwriting it, so its
-+                # incoming value is live -- Inductor picks ``in_out_ptr`` for
-+                # exactly the in-place accumulate case (``buf += ...``).
-+                # Allocating uninitialized per-socket storage discards that
-+                # value on every socket. That is how an all-reduced row-parallel
-+                # result feeding a fused residual add vanished: each socket read
-+                # a fresh zero page instead of the reconciled sum, so the whole
-+                # sublayer contributed nothing. Replicate the master buffer,
-+                # which holds the reconciled data. Not cached across forwards:
-+                # an accumulator's contents change every call.
-+                if is_in_out:
-+                    name = _emit_replicate(arg_name, sid, cache=False)
-+                    per_node_arg_names[sid].append(name)
-+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
-+                    continue
-+
-                 # Generalized plan semantics:
-                 # - replicate X and any tensor in ``replicated_nodes``
-                 #   (zero-on-nonzero-socket when in ``zero_on_nonzero_nodes``
-                 #   AND the kernel is row-parallel output ``z_shard``)
-                 # - shard-slice tensors in column_parallel_nodes / row_parallel_nodes
--                if arg_name == x_node:
-+                if arg_name in x_nodes:
-                     # Activation changes every forward: do NOT cache.
-                     name = _emit_replicate(arg_name, sid, cache=False)
-                     per_node_arg_names[sid].append(name)
-@@ -2558,6 +2633,15 @@ class PythonWrapperCodegen(CodeGen):
+@@ -2633,6 +2633,13 @@ class PythonWrapperCodegen(CodeGen):
          if not cache or old_name not in cache:
              return
          per_node_old = cache[old_name]
-+        # If ``old_name`` was all-reduced, its authoritative per-socket view is
-+        # the post-reduction re-clone, not whatever the reuse cache now holds.
-+        # Aliasing off the re-clones also marks them consumed, which is what
-+        # keeps the reduction from being elided as dead code.
-+        reduced = getattr(self, "_numa_reduction_reclones", {}).get(old_name)
-+        if reduced:
-+            per_node_old = reduced
-+            for _rn in reduced:
-+                self._numa_reclone_consumed.add(_rn)
++        # The naming prefix has to come from the ORIGINAL cache entry
++        # (``_numa_p{plan_id}``), because that is the prefix
++        # ``generate_numa_shard_allocations`` used for the placeholder
++        # allocations this alias is meant to supersede. Keep a reference to it
++        # before the re-clone substitution below rewrites ``per_node_old``.
++        prefix_source = per_node_old
++
+         # If ``old_name`` was all-reduced, its authoritative per-socket view is
+         # the post-reduction re-clone, not whatever the reuse cache now holds.
+         # Aliasing off the re-clones also marks them consumed, which is what
+@@ -2645,12 +2652,21 @@ class PythonWrapperCodegen(CodeGen):
          if not per_node_old:
              return
  
-diff --git a/torch/_inductor/fx_passes/numa_attention_tp.py b/torch/_inductor/fx_passes/numa_attention_tp.py
-index e52e4bfc1c..e6198b99de 100644
---- a/torch/_inductor/fx_passes/numa_attention_tp.py
-+++ b/torch/_inductor/fx_passes/numa_attention_tp.py
-@@ -47,6 +47,7 @@ from .numa_tp_common import (
-     clone_meta,
-     get_compute_shard_id,
-     get_numa_world_size,
-+    merge_global_shard_plan,
-     resize_node_val_and_tensor_meta,
-     set_numa_meta,
-     shape_2d,
-@@ -1099,7 +1100,7 @@ def numa_attention_tp_pass(graph: torch.fx.Graph) -> None:
-             }
-             # Persist the latest full plan so wrapper codegen can recover
-             # semantics even if a backend path drops direct origin metadata.
--            setattr(config, "_numa_attention_tp_shard_plan", dict(shard_plan))
-+            merge_global_shard_plan("_numa_attention_tp_shard_plan", shard_plan)
++        # Deriving the prefix from the post-reduction re-clones instead yields
++        # ``_numa_ar``, which matches no placeholder. The alias is then never
++        # consumed, the placeholder allocation it should have superseded
++        # survives, and the re-clone becomes dead weight -- a full-tensor
++        # per-socket clone nothing reads. Measured cost of getting this wrong,
++        # GPT-2 117M W=4 (bench_2026-09-25/stage1fix/): 232 _numa_ar_ names of
++        # which 12 dead, versus 96 with none dead; NUMA arm -9.6% at S=2048
++        # and -6.3% at S=4096.
++
+         # Extract the naming prefix (e.g. "_numa_p0") from the first cached
+         # entry so alias names match what generate_numa_shard_allocations
+         # already emitted as _NUMAFreshAllocLine placeholders.
+         expected_suffix_0 = f"_{old_name}_n0"
+-        if per_node_old[0].endswith(expected_suffix_0):
+-            prefix = per_node_old[0][: -len(expected_suffix_0)]
++        if prefix_source and prefix_source[0].endswith(expected_suffix_0):
++            prefix = prefix_source[0][: -len(expected_suffix_0)]
+         else:
+             prefix = None  # unusual naming; fall back to _as_ style
  
-             # Propagate the shard plan to all per-shard slice nodes so
-             # downstream passes and wrapper codegen can recover the layout
-diff --git a/torch/_inductor/fx_passes/numa_gemma_attention_tp.py b/torch/_inductor/fx_passes/numa_gemma_attention_tp.py
-index c6065901c3..150df3367f 100644
---- a/torch/_inductor/fx_passes/numa_gemma_attention_tp.py
-+++ b/torch/_inductor/fx_passes/numa_gemma_attention_tp.py
-@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
- import torch
- 
- from .. import config
-+from .numa_tp_common import merge_global_shard_plan
- 
- aten = torch.ops.aten
- 
-@@ -862,7 +863,7 @@ def _apply_plan(
-         "slice_kv": slice_kv,
-         "head_dim": head_dim,
-     }
--    setattr(config, "_numa_attention_tp_shard_plan", dict(shard_plan))
-+    merge_global_shard_plan("_numa_attention_tp_shard_plan", shard_plan)
-     for n in itertools.chain(wq_shards, wo_shards, wk_shards, wv_shards, [mm_q, mm_k, mm_v, mm_o]):
-         n.meta["numa_shard_plan"] = shard_plan
-     return True
-diff --git a/torch/_inductor/fx_passes/numa_mlp_tp.py b/torch/_inductor/fx_passes/numa_mlp_tp.py
-index 57b238bfe0..74009a5a20 100644
---- a/torch/_inductor/fx_passes/numa_mlp_tp.py
-+++ b/torch/_inductor/fx_passes/numa_mlp_tp.py
-@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
- import torch
- 
- from .. import config
-+from .numa_tp_common import merge_global_shard_plan
- 
- aten = torch.ops.aten
- 
-@@ -865,7 +866,7 @@ def _apply_geglu_plan(
-         "h": h,
-         "d": d,
-     }
--    setattr(config, "_numa_mlp_tp_shard_plan", dict(shard_plan))
-+    merge_global_shard_plan("_numa_mlp_tp_shard_plan", shard_plan)
- 
-     for sn in itertools.chain(gate_shards, up_shards, down_shards):
-         sn.meta["numa_shard_plan"] = shard_plan
-@@ -1128,7 +1129,7 @@ def numa_mlp_tp_pass(graph: torch.fx.Graph) -> None:
-         }
-         # Persist latest full plan so wrapper codegen can recover semantics even
-         # if a backend path drops direct origin-node metadata.
--        setattr(config, "_numa_mlp_tp_shard_plan", dict(shard_plan))
-+        merge_global_shard_plan("_numa_mlp_tp_shard_plan", shard_plan)
- 
-         # Propagate the shard plan to all per-shard slice nodes so downstream
-         # passes and wrapper codegen can recover the layout from any of them.
-diff --git a/torch/_inductor/fx_passes/numa_tp_common.py b/torch/_inductor/fx_passes/numa_tp_common.py
-index 8bb769021c..6df4d408de 100644
---- a/torch/_inductor/fx_passes/numa_tp_common.py
-+++ b/torch/_inductor/fx_passes/numa_tp_common.py
-@@ -303,3 +303,147 @@ def ensure_generalized_lists(plan: Dict[str, Any]) -> Dict[str, Any]:
-     out["zero_on_nonzero_nodes"] = zn
- 
-     return out
-+
-+
-+def _normalize_pp_entries(entries, shard_d):
-+    """Return ``(name, dim, shard_size)`` 3-tuples for a plan's node list.
-+
-+    2-tuple entries implicitly inherit the plan-wide ``shard_d``. Once several
-+    blocks share one accumulated plan that implicit value is no longer
-+    meaningful -- blocks can have different hidden sizes -- so bind each entry
-+    to the ``shard_d`` of the plan it came from before merging.
-+    """
-+    out = []
-+    for entry in entries or []:
-+        if len(entry) == 3:
-+            name, dim, size = entry
-+        else:
-+            name, dim = entry
-+            size = shard_d
-+        out.append((str(name), int(dim), int(size)))
-+    return out
-+
-+
-+def merge_global_shard_plan(config_key: str, shard_plan: Dict[str, Any]) -> None:
-+    """Accumulate ``shard_plan`` into the graph-wide plan at ``config_key``.
-+
-+    Wrapper codegen recovers a plan from this slot whenever a kernel loses its
-+    origin-node metadata, which template (matmul) kernels routinely do. Every
-+    kernel in the graph therefore reads this one slot, so it must describe
-+    every block the pass rewrote.
-+
-+    Overwriting it left only the last block described. Earlier blocks'
-+    row-parallel weights were absent from ``row_parallel_nodes``, so the
-+    wrapper's ``has_row and not has_col`` test could not recognize their
-+    outputs as partial sums, and their cross-socket reductions were never
-+    emitted -- silently dropping every shard but one.
-+    """
-+    new = ensure_generalized_lists(dict(shard_plan))
-+    new_shard_d = int(new.get("shard_d", 0))
-+    prev = getattr(config, config_key, None)
-+
-+    merged = dict(new)
-+    for key in (
-+        "column_parallel_nodes",
-+        "row_parallel_nodes",
-+    ):
-+        merged[key] = _normalize_pp_entries(new.get(key), new_shard_d)
-+    for key in ("replicated_nodes", "zero_on_nonzero_nodes"):
-+        merged[key] = [str(n) for n in (new.get(key) or [])]
-+    # ``x_node`` is the per-block activation input. It is replicated like a
-+    # weight but, unlike a weight, changes every forward, so the wrapper must
-+    # not hoist its clone into the persistent weight cache. Keeping only the
-+    # newest block's name left every earlier block's activation looking like a
-+    # weight. Accumulate them all.
-+    merged["x_nodes"] = _merge_x_nodes(new, [])
-+
-+    if isinstance(prev, dict) and int(prev.get("world_size", 0)) >= 2:
-+        prev_norm = ensure_generalized_lists(dict(prev))
-+        prev_shard_d = int(prev_norm.get("shard_d", 0))
-+        for key in ("column_parallel_nodes", "row_parallel_nodes"):
-+            seen = {e[0] for e in merged[key]}
-+            for entry in _normalize_pp_entries(prev_norm.get(key), prev_shard_d):
-+                if entry[0] not in seen:
-+                    merged[key].append(entry)
-+                    seen.add(entry[0])
-+        for key in ("replicated_nodes", "zero_on_nonzero_nodes"):
-+            seen = set(merged[key])
-+            for name in (prev_norm.get(key) or []):
-+                if str(name) not in seen:
-+                    merged[key].append(str(name))
-+                    seen.add(str(name))
-+        merged["x_nodes"] = _merge_x_nodes(prev_norm, merged["x_nodes"])
-+
-+    setattr(config, config_key, merged)
-+
-+
-+def _merge_x_nodes(plan: Dict[str, Any], into: List[str]) -> List[str]:
-+    """Union of ``plan``'s activation-input names into ``into``."""
-+    out = list(into)
-+    names = list(plan.get("x_nodes") or [])
-+    if isinstance(plan.get("x_node"), str):
-+        names.append(plan["x_node"])
-+    for name in names:
-+        if str(name) not in out:
-+            out.append(str(name))
-+    return out
-+
-+
-+# Every config slot holding an accumulated graph-wide plan, in no
-+# significant order -- the merge below is a union.
-+GLOBAL_PLAN_KEYS = (
-+    "_numa_attention_tp_shard_plan",
-+    "_numa_mlp_tp_shard_plan",
-+)
-+
-+
-+def merged_global_shard_plan() -> Optional[Dict[str, Any]]:
-+    """Union of every pass's accumulated graph-wide plan, or ``None``.
-+
-+    Template (matmul) kernels routinely lose their origin-node metadata during
-+    scheduling, so wrapper codegen falls back to a graph-wide plan to classify
-+    their arguments. Reading a single pass's slot and ignoring the others is
-+    not a fallback but a misclassification: with attention and MLP TP both
-+    enabled, the MLP's ``addmm`` templates were described by the *attention*
-+    plan, in which no MLP weight appears. Every MLP argument then took the
-+    "replicate unknown tensor" path -- no column/row slicing -- and the
-+    ``has_row and not has_col`` test saw no row-parallel weight, so the MLP's
-+    all-reduce was never emitted. The sublayer silently collapsed to shard 0.
-+    Either pass alone was correct, which is why this only showed up in the
-+    combined configuration the benchmarks actually run.
-+
-+    Node names are unique within an FX graph, so unioning the generalized
-+    lists is unambiguous. Per-entry shard sizes (3-tuples) let plans with
-+    different ``shard_d`` merge without losing their own chunk size.
-+    """
-+    merged: Optional[Dict[str, Any]] = None
-+    for key in GLOBAL_PLAN_KEYS:
-+        plan = getattr(config, key, None)
-+        if not isinstance(plan, dict) or int(plan.get("world_size", 0)) < 2:
-+            continue
-+        norm = ensure_generalized_lists(dict(plan))
-+        shard_d = int(norm.get("shard_d", 0))
-+        if merged is None:
-+            merged = dict(norm)
-+            for k in ("column_parallel_nodes", "row_parallel_nodes"):
-+                merged[k] = _normalize_pp_entries(norm.get(k), shard_d)
-+            for k in ("replicated_nodes", "zero_on_nonzero_nodes"):
-+                merged[k] = [str(n) for n in (norm.get(k) or [])]
-+            merged["x_nodes"] = _merge_x_nodes(norm, [])
-+            continue
-+        for k in ("column_parallel_nodes", "row_parallel_nodes"):
-+            seen = {e[0] for e in merged[k]}
-+            for entry in _normalize_pp_entries(norm.get(k), shard_d):
-+                if entry[0] not in seen:
-+                    merged[k].append(entry)
-+                    seen.add(entry[0])
-+        for k in ("replicated_nodes", "zero_on_nonzero_nodes"):
-+            seen = set(merged[k])
-+            for name in (norm.get(k) or []):
-+                if str(name) not in seen:
-+                    merged[k].append(str(name))
-+                    seen.add(str(name))
-+        merged["x_nodes"] = _merge_x_nodes(norm, merged["x_nodes"])
-+        if not int(merged.get("shard_d", 0)):
-+            merged["shard_d"] = shard_d
-+    return merged

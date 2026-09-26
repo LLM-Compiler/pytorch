@@ -136,3 +136,57 @@ is therefore CLOSED, not deferred.
 
 Consequence for Stage 3: the sweep is single-world-size. The plan's
 "reduced W=2 control" arm is dropped, roughly halving the total wall time.
+
+--------------------------------------------------------------------------
+STEP 1 DONE (2026-09-26 20:24-22:05 IST). bench_2026-09-25/stage1fix/
+  progress.log  full trace incl. the final analysis block
+  timing.csv    12 timing cells (3 reps x {off,on} x S{2048,4096})
+  reclone_*.txt generated-code scans per variant
+  phaseA_compare.txt  correctness matrix
+
+DEFECT 6 FIXED: alias-prefix derivation in _numa_propagate_buffer_alias.
+
+  The prefix was taken from the post-reduction re-clone names (_numa_ar)
+  instead of the plan prefix (_numa_p{plan_id}) that
+  generate_numa_shard_allocations used for the placeholder allocations the
+  alias is meant to supersede. Consequences: the alias matched no
+  placeholder, so it was never consumed; the placeholder allocation
+  survived; and the accumulator clones added by defect-4's fix stayed as
+  full per-socket copies instead of collapsing into cheap reinterprets.
+
+  Generated code, GPT-2 117M W=4 (identical at S=2048 and S=4096):
+    before   232 _numa_ar_ names, 12 dead, 96 clone defs
+    after     96 _numa_ar_ names,  0 dead, 96 clone defs
+
+  Measured, GPT-2 117M B=1 W=4, 3 reps, variants INTERLEAVED within each
+  repetition so drift hits both equally:
+
+    S      variant  n  numa mean_ms       std mean_ms        speedup
+    2048   off      3  3319.6 +/- 46.4    4067.9 +/- 136.6   1.2259
+    2048   on       3  3001.5 +/- 40.0    4100.7 +/- 175.8   1.3663
+             -> NUMA arm -9.58%
+    4096   off      3  7790.1 +/- 240.0  13140.9 +/- 268.4   1.6877
+    4096   on       3  7297.1 +/- 121.5  13300.5 +/- 245.3   1.8234
+             -> NUMA arm -6.33%
+
+  Effect is well clear of the spread. The BASELINE arm is unchanged between
+  variants (4067.9 vs 4100.7; 13140.9 vs 13300.5) -- control for drift.
+  Smaller gain at S=4096 because the fixed clone cost is a smaller fraction
+  once the quadratic attention term dominates.
+
+  Numerically inert, as expected -- it only rebinds a name to the same
+  memory. Correctness matrix W=4 {mlp,attn,both} x layers{1,2}: 6 of 6 at
+  corr=1.000000 with max_abs values IDENTICAL to the pre-fix run.
+
+REVISED HEADLINE NUMBERS (supersede stage2b for S=2048 and S=4096):
+  GPT-2 117M B=1 W=4   S=2048  1.37x     S=4096  1.82x
+
+  The rest of the stage2b curve (S 512..3072) was measured WITHOUT this fix
+  and is now pessimistic. Re-measure if the curve goes in the paper.
+
+NEXT: Stage 3 sweep, W=4 only, Gemma excluded (user decision 2026-09-26).
+  Prerequisites still open:
+    - sweep runner needs BOTH guards: B*H*S^2 <= 5.37e8 (2GB SDPA-MATH
+      segfault) AND the memory ceiling B*H*S^2 <~ 3.0e8, plus per-cell RSS
+      cap and crash isolation.
+    - estimate ~60-65 h for GPT-2 117M/345M/762M + BERT base/large.

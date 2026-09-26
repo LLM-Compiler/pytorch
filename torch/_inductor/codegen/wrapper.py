@@ -2633,6 +2633,13 @@ class PythonWrapperCodegen(CodeGen):
         if not cache or old_name not in cache:
             return
         per_node_old = cache[old_name]
+        # The naming prefix has to come from the ORIGINAL cache entry
+        # (``_numa_p{plan_id}``), because that is the prefix
+        # ``generate_numa_shard_allocations`` used for the placeholder
+        # allocations this alias is meant to supersede. Keep a reference to it
+        # before the re-clone substitution below rewrites ``per_node_old``.
+        prefix_source = per_node_old
+
         # If ``old_name`` was all-reduced, its authoritative per-socket view is
         # the post-reduction re-clone, not whatever the reuse cache now holds.
         # Aliasing off the re-clones also marks them consumed, which is what
@@ -2645,12 +2652,21 @@ class PythonWrapperCodegen(CodeGen):
         if not per_node_old:
             return
 
+        # Deriving the prefix from the post-reduction re-clones instead yields
+        # ``_numa_ar``, which matches no placeholder. The alias is then never
+        # consumed, the placeholder allocation it should have superseded
+        # survives, and the re-clone becomes dead weight -- a full-tensor
+        # per-socket clone nothing reads. Measured cost of getting this wrong,
+        # GPT-2 117M W=4 (bench_2026-09-25/stage1fix/): 232 _numa_ar_ names of
+        # which 12 dead, versus 96 with none dead; NUMA arm -9.6% at S=2048
+        # and -6.3% at S=4096.
+
         # Extract the naming prefix (e.g. "_numa_p0") from the first cached
         # entry so alias names match what generate_numa_shard_allocations
         # already emitted as _NUMAFreshAllocLine placeholders.
         expected_suffix_0 = f"_{old_name}_n0"
-        if per_node_old[0].endswith(expected_suffix_0):
-            prefix = per_node_old[0][: -len(expected_suffix_0)]
+        if prefix_source and prefix_source[0].endswith(expected_suffix_0):
+            prefix = prefix_source[0][: -len(expected_suffix_0)]
         else:
             prefix = None  # unusual naming; fall back to _as_ style
 
