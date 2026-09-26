@@ -1,5 +1,138 @@
-state as of 2026-09-25T16:43:11+05:30
-branch : fix/numa-tp-row-parallel-allreduce
-commit : 3de9d2bd045633f3c57e78d3fa53a726692071c4
-uncommitted: torch/_inductor/codegen/wrapper.py (_NumaGraphOutputCopyLine)
-restore with: git apply bench_2026-09-25/graph_output_copy_fix.patch
+NUMA-TP correctness work -- state as of 2026-09-26
+
+STATUS: ALL CORRECTNESS CHECKS PASS, end to end, with the NUMA path firing.
+
+  GPT-2 117m (12 blocks) W=4   max_abs=8.8e-06  169 numa_args sites, 96 reductions
+  GPT-2 117m (12 blocks) W=2   max_abs=9.2e-06  169 numa_args sites, 48 reductions
+  BERT base  (12 blocks) W=4   max_abs=2.4e-06  169 numa_args sites, 96 reductions
+
+  Pass-isolation matrix (GPT-2 117m, seq 128, vs standard Inductor):
+    passes x world_size x layers = {mlp, attn, both} x {2, 4} x {1, 2}
+    all 12 combinations: corr = 1.000000, max_abs <= 1.05e-05
+
+  NOTE: scripts/inductor/*_speedup_cli.py --profile reports
+  "numa_args_calls=0 ... TP did NOT fire". That warning is FALSE -- it
+  scrapes the wrong directory and reports files=0 for both arms. Count
+  numa_args in the cache_dir it prints instead.
+
+FIXES (uncommitted; backup in numa_tp_correctness_fixes.patch)
+
+  1. wrapper.py  _NumaGraphOutputCopyLine
+     A replicated per-socket result that is also a graph output was never
+     reconciled -- the caller got unwritten memory.
+
+  2. numa_tp_common.py  merge_global_shard_plan
+     One global shard plan per pass was OVERWRITTEN per block, so only the
+     last block was described and earlier blocks' reductions were never
+     emitted.
+
+  3. wrapper.py  _numa_reduction_reclones
+     Buffer-reuse aliasing clobbered the post-reduction cache entry, pointing
+     consumers back at pre-reduction partials.
+
+  4. wrapper.py  in_out_ptr args  [THIS SESSION]
+     A first-seen in_out_ptr arg was given uninitialized per-socket storage
+     on the theory that the kernel overwrites it. Inductor picks in_out_ptr
+     for the in-place accumulate case, so the incoming value is live. The
+     all-reduced MLP output feeding the fused residual add was replaced by a
+     fresh zero page on every socket: the MLP contributed exactly nothing.
+     Proof: NUMA output was bit-identical (max_abs=0.0) to a standard compile
+     with mlp_fc2_w zeroed.
+     Fix: replicate the master buffer (clone, uncached) instead.
+
+  5. numa_tp_common.py  merged_global_shard_plan  [THIS SESSION]
+     The graph-wide fallback plan read _numa_attention_tp_shard_plan and fell
+     back to the MLP slot only if that was absent. With BOTH passes on -- the
+     configuration the benchmarks actually run -- the MLP's template kernels
+     were described by the attention plan, in which no MLP weight appears.
+     Every MLP arg took the "replicate unknown tensor" path (no sharding) and
+     has_row was false, so no all-reduce. The MLP collapsed to shard 0.
+     Either pass ALONE was correct, which is why isolation testing missed it.
+     Fix: union the generalized lists from every pass's plan.
+     Also: x_nodes is now a set, so each block/pass keeps its activation
+     input out of the persistent weight cache.
+
+NEXT: Stage 2 of the benchmark plan (speedup spot-check). Not started.
+
+  Carry into any write-up: reconciliation is not free. Per reduction point
+  the generated code now does W-1 full-tensor add_ passes, W re-clones, and
+  (fix 4) W clones of any accumulator feeding a fused residual add. On a
+  12-block model at W=4 that is 96 reductions per forward.
+
+restore with: git apply bench_2026-09-25/numa_tp_correctness_fixes.patch
+
+--------------------------------------------------------------------------
+STAGE 2 DONE (2026-09-26 18:01-19:10 IST). See bench_2026-09-25/stage2/
+  STAGE2_SUMMARY.md   full table + gate assessment + reading
+  stage2_results.csv  raw rows (NOTE: the binding column contains a comma,
+                      so that one field spills; parse on the cell name)
+  <cell>.log/.log.err per-cell stdout (speedup) and stderr (absolute means)
+
+HEADLINE: first speedups > 1.0 ever measured on this machine.
+  W=4, S=2048:  GPT-2 117M 1.31x   GPT-2 345M 1.25x   BERT large 1.23x
+  W=4, S=1024:  GPT-2 117M 0.70x            (below the crossover)
+  W=2 (numactl-confined, both arms 40 CPUs): 0.69x-0.99x, i.e. no gain.
+  Pre-fix recorded W=2 values on this branch were 0.93x / 0.95x -- W=2 is
+  essentially unchanged by the correctness work. The gain is W=4 only.
+
+OPEN -- GEMMA IS NUMERICALLY WRONG (new, 2 more defects, distinct from the 5)
+  gemma attention TP alone  W=4  corr=0.541
+  GeGLU MLP TP alone        W=4  corr=0.767
+  both                      W=4  corr=0.541 (BIT-IDENTICAL to attn-only:
+                                  the GeGLU MLP contributes nothing)
+  Reproduce: bench_2026-09-25/gemma_check.py {std|attn|mlp|numa} {2|4}
+  The two Gemma cells in stage2_results.csv are VOID -- wrong output.
+  scripts/inductor/simple_gemma_decoder_block_speedup_cli.py cannot catch
+  this: it builds a fresh unseeded model per arm, so the arms never share
+  weights.
+
+GPT-2 and BERT remain correct at every world size / layer count tested.
+
+NEXT DECISION: (a) chase the two Gemma defects, (b) go to Stage 3 full sweep
+with Gemma excluded, or (c) widen Stage 2 first to find the S crossover.
+
+--------------------------------------------------------------------------
+STAGE 2b DONE (2026-09-26 19:28-20:04 IST). bench_2026-09-25/stage2b/
+  CROSSOVER_SUMMARY.md   table, mechanism, memory ceiling, caveats
+  crossover_results.csv  raw rows (incl. peak_rss_kb per cell)
+
+GPT-2 117M, B=1, W=4, sequence-length sweep. All cells PASS, 338 numa_args
+in the NUMA arm and 0 in the standard arm, monotone in S, no inversions.
+
+  S      512   1024   1280   1536   2048   3072   4096
+  speed 0.605  0.700  0.935  1.050  1.232  1.347  1.679
+
+CROSSOVER ~ S=1400 (between 1280 and 1536).
+
+MECHANISM: baseline per-token cost grows 1.14 -> 3.24 ms/token across the
+sweep; the NUMA arm's is nearly flat, 1.89 -> 1.93. NUMA-TP wins by SCALING
+better in S, not by being faster per unit work. Reconciliation overhead is
+roughly constant per token, so it dominates at short S and is amortised away
+once the baseline's quadratic attention term takes over.
+
+NEW CONSTRAINT FOR STAGE 3 -- MEMORY CEILING, TIGHTER THAN THE 2GB GUARD
+  RSS_MB ~= 4700 + 1.49e-4 * (B*H*S^2)      [fit, 3 points, 117M, W=4]
+  memory ceiling (<=50 GB of 62 GB):  B*H*S^2 <~ 3.0e8
+  existing 2GB SDPA-MATH guard:       B*H*S^2 <=  5.37e8
+  The memory ceiling bites FIRST (~1.8x tighter). B=2,S=4096 on 117M passes
+  the 2GB guard but projects to ~64 GB and would OOM. The sweep drivers
+  guard NEITHER. Stage 3 must pre-filter on both. Confirm the fit first.
+
+REPRODUCIBILITY: S=1024 0.6999 vs 0.6990 in Stage 2 (0.13%). S=2048 1.2316
+vs 1.3081 (5.9%). Short cells stable, S=2048 is not. Do not quote Stage 2/2b
+speedups to 3 significant figures; Stage 3's warmup 10 / iters 50 will help.
+
+UNTESTED, AND THE MOST DIRECT PAPER-REPRODUCTION QUESTION LEFT:
+  does W=2 cross 1.0 at S=3072/4096? W=2 at S=2048 was 0.97x. The paper is
+  dual-socket, so this is the comparison that actually matches it.
+
+--------------------------------------------------------------------------
+SCOPE DECISION (2026-09-26, user): W=2 IS OUT OF SCOPE.
+All further benchmarking targets the 4-socket / W=4 configuration only.
+
+The W=2 cells already recorded in stage2/ are kept for the record but are
+not to be extended. The open question "does W=2 cross 1.0 at S=3072/4096"
+is therefore CLOSED, not deferred.
+
+Consequence for Stage 3: the sweep is single-world-size. The plan's
+"reduced W=2 control" arm is dropped, roughly halving the total wall time.

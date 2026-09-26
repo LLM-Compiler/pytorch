@@ -1,0 +1,11 @@
+cell,model,batch,seq,world_size,binding,speedup,std_mean_ms,numa_mean_ms,correctness,numa_args_numa,numa_args_std,status
+c1_gpt2_117m_b1_s1024_w4,gpt2-117m,1,1024,4,none,0.698961071773101,1161.460,1661.695,PASS,338,0,ok
+c2_gpt2_117m_b1_s2048_w4,gpt2-117m,1,2048,4,none,1.3081131876941852,4282.357,3273.690,PASS,338,0,ok
+c3_gpt2_345m_b1_s2048_w4,gpt2-345m,1,2048,4,none,1.248495473278055,12676.542,10153.455,PASS,674,0,ok
+c4_bert_large_b1_s2048_w4,bert-large,1,2048,4,none,1.2348427383616705,11792.002,9549.396,PASS,674,0,ok
+c5_gemma_270m_b1_s2048_w4,gemma-270m,1,2048,4,none,0.762,10023.11,13150.58,n/a,0,0,ok
+c1_gpt2_117m_b1_s1024_w2,gpt2-117m,1,1024,2,cpunodebind=0,1,0.6926122852945885,1332.856,1924.389,PASS,338,0,ok
+c2_gpt2_117m_b1_s2048_w2,gpt2-117m,1,2048,2,cpunodebind=0,1,0.9703512339042936,4345.341,4478.111,PASS,338,0,ok
+c3_gpt2_345m_b1_s2048_w2,gpt2-345m,1,2048,2,cpunodebind=0,1,0.9467738235859819,13325.990,14075.157,PASS,674,0,ok
+c4_bert_large_b1_s2048_w2,bert-large,1,2048,2,cpunodebind=0,1,0.9917234005779216,13368.502,13480.072,PASS,674,0,ok
+c5_gemma_270m_b1_s2048_w2,gemma-270m,1,2048,2,cpunodebind=0,1,0.820,12592.12,15355.13,n/a,0,0,ok
