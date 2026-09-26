@@ -1,0 +1,7 @@
+NUMA enabled=True nodes=4
+GPT-2 117M (117m) prefill: B=8 S=256 L=12 H=12 E=64 D=768 FFN=3072 world_size=4
+Running standard ...
+Running NUMA-TP (tp_lm_head=False) ...
+correctness: max_abs=1.073e-05 max_rel=3.125e+00 PASS (atol=0.001 rtol=0.001)
+standard mean_ms=1497.947 median=1445.371 min=1268.046
+numa_tp mean_ms=2382.024 median=2384.099 min=2269.458
