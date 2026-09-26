@@ -1,0 +1,1 @@
+model,batch,seq,world_size,speedup,std_mean_ms,numa_mean_ms,correctness,numa_args_numa,numa_args_std,peak_rss_kb,wall_s,status
