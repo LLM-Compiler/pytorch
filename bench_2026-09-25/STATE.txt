@@ -190,3 +190,62 @@ NEXT: Stage 3 sweep, W=4 only, Gemma excluded (user decision 2026-09-26).
       segfault) AND the memory ceiling B*H*S^2 <~ 3.0e8, plus per-cell RSS
       cap and crash isolation.
     - estimate ~60-65 h for GPT-2 117M/345M/762M + BERT base/large.
+
+--------------------------------------------------------------------------
+STAGE 2c DONE (2026-09-26 22:26-23:06 IST). bench_2026-09-25/stage2c/
+Crossover curve RE-MEASURED with the alias-prefix fix in. SUPERSEDES stage2b.
+
+  S      pre-fix  fixed   delta
+  512     0.605   0.561   -0.044
+  1024    0.700   0.822   +0.122
+  1152      -     1.029   (new point)
+  1280    0.935   1.088   +0.153
+  1536    1.050   1.145   +0.095
+  2048    1.232   1.334   +0.102
+  3072    1.347   1.448   +0.101
+  4096    1.679   1.820   +0.141
+
+  CROSSOVER MOVED: S ~= 1400  ->  S ~= 1134.
+  All cells PASS, 338 numa_args in the NUMA arm, 0 in the standard arm.
+
+  S=512 is the one cell that got WORSE as a ratio. Both arms moved (std
+  584.7 -> 497.3, numa 966.6 -> 886.2): the NUMA arm improved 8.3% as
+  expected, but the baseline improved 15%. At S=512 the absolute times are
+  ~0.5 s and baseline run-to-run noise swamps the effect. Do not read the
+  S=512 delta as a regression.
+
+STAGE 3 READY, NOT LAUNCHED (awaiting go-ahead).
+  bench_2026-09-25/stage3_plan.py   grid + both guards + cost projection
+  bench_2026-09-25/stage3.sh        executor: one subprocess per cell,
+                                    resumable, per-cell timeout, free-memory
+                                    precheck, integrity columns, summary
+
+  Plan: 98 cells, 7 skipped, W=4 only, Gemma excluded, warmup 10 iters 50.
+  Models: gpt2 117m/345m/762m, bert base/large. B {1,2,4,8}, S {128..4096},
+  tiered S <= 8192/B.
+
+  Skipped by guard:
+    gpt2-117m  B=2 S=4096   4.03e8  memory-ceiling
+    gpt2-345m  B=2 S=4096   5.37e8  memory-ceiling
+    gpt2-762m  B=1 S=4096   3.36e8  memory-ceiling
+    gpt2-762m  B=2 S=4096   6.71e8  segfault-guard
+    gpt2-762m  B=4 S=2048   3.36e8  memory-ceiling
+    bert-base  B=2 S=4096   4.03e8  memory-ceiling
+    bert-large B=2 S=4096   5.37e8  memory-ceiling
+
+  Projected 45.1 h. This is a LOWER BOUND -- the cost model's residuals on
+  its calibration points run 8-14% low, so budget 50-65 h.
+  Largest projected cell 138 min; peak projected RSS 43.6 GB of 62 GB.
+
+  Smoke-tested on 2 small cells: both ran, correctness PASS, integrity
+  columns correct (numa 338 / std 0), RSS and wall time captured, summary
+  generated, and a relaunch correctly skipped both as already recorded.
+
+  Launch with:
+    cd /home/shavin/llm-cpu-compiler/pytorch
+    python bench_2026-09-25/stage3_plan.py --out /tmp/stage3_plan.txt
+    setsid nohup env PLAN=/tmp/stage3_plan.txt bash bench_2026-09-25/stage3.sh \
+      > /tmp/stage3_outer.log 2>&1 < /dev/null &
+  Watch:  tail -f bench_2026-09-25/stage3/progress.log
+  Done when the last line reads STAGE3DONE. Relaunch the same command after
+  any interruption; completed cells are skipped.
