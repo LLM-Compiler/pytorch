@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from .. import config
+from .numa_tp_common import merge_global_shard_plan
 
 aten = torch.ops.aten
 
@@ -862,7 +863,7 @@ def _apply_plan(
         "slice_kv": slice_kv,
         "head_dim": head_dim,
     }
-    setattr(config, "_numa_attention_tp_shard_plan", dict(shard_plan))
+    merge_global_shard_plan("_numa_attention_tp_shard_plan", shard_plan)
     for n in itertools.chain(wq_shards, wo_shards, wk_shards, wv_shards, [mm_q, mm_k, mm_v, mm_o]):
         n.meta["numa_shard_plan"] = shard_plan
     return True

@@ -47,6 +47,7 @@ from .numa_tp_common import (
     clone_meta,
     get_compute_shard_id,
     get_numa_world_size,
+    merge_global_shard_plan,
     resize_node_val_and_tensor_meta,
     set_numa_meta,
     shape_2d,
@@ -1099,7 +1100,7 @@ def numa_attention_tp_pass(graph: torch.fx.Graph) -> None:
             }
             # Persist the latest full plan so wrapper codegen can recover
             # semantics even if a backend path drops direct origin metadata.
-            setattr(config, "_numa_attention_tp_shard_plan", dict(shard_plan))
+            merge_global_shard_plan("_numa_attention_tp_shard_plan", shard_plan)
 
             # Propagate the shard plan to all per-shard slice nodes so
             # downstream passes and wrapper codegen can recover the layout

@@ -139,6 +139,32 @@ class _NumaAllReduceLine(DeferredLineBase):
         )
 
 
+class _NumaGraphOutputCopyLine(DeferredLineBase):
+    """Reconcile a replicated per-socket result that is also a graph output.
+
+    The two reconciliation paths cover terminal partial sums (all-reduce) and
+    intermediate activations (stay socket-local, forwarded to the next local
+    kernel). A replicated result that is returned from the graph fits neither:
+    it has no downstream local kernel, so nothing would ever write the buffer
+    the caller receives, and the model returns unwritten memory.
+
+    Every socket holds a COMPLETE copy of a replicated result (Algorithm 3), so
+    a single copy from node 0 reconciles it. Summing would scale the value by
+    the socket count. Emitted only if ``name`` really is a graph output at
+    flush time, when ``V.graph.graph_outputs`` is final.
+    """
+
+    def __init__(self, line: str, name: str) -> None:
+        super().__init__(line)
+        self.name = name
+
+    def __call__(self) -> Optional[str]:
+        return self.line if self.name in V.graph.get_output_names() else None
+
+    def _new_line(self, line: str) -> "_NumaGraphOutputCopyLine":
+        return _NumaGraphOutputCopyLine(line, self.name)
+
+
 class _NUMAFreshAllocLine(DeferredLineBase):
     """Emit a per-NUMA-node empty_strided allocation only if it was NOT
     superseded by a reinterpret alias propagated from a buffer-reuse chain.
@@ -626,6 +652,11 @@ class PythonWrapperCodegen(CodeGen):
         # time; names absent at flush time stay "unwritten". This elides
         # dead re-clone copies when the row-parallel output is terminal.
         self._numa_reclone_consumed: Set[str] = set()
+        # Post-all-reduce per-socket names, keyed by the reduced buffer.
+        # Kept separate from ``_numa_tensor_cache`` because buffer-reuse
+        # aliasing overwrites that cache entry, which would otherwise point
+        # downstream consumers back at the pre-reduction partials.
+        self._numa_reduction_reclones: Dict[str, List[str]] = {}
         # Per-NUMA-node allocation variable names that have been superseded by
         # a reinterpret alias from a buffer-reuse chain. When a name appears
         # here, the corresponding _NUMAFreshAllocLine is suppressed at flush
@@ -1898,9 +1929,15 @@ class PythonWrapperCodegen(CodeGen):
             getattr(config, "_numa_mlp_tp", False)
             or getattr(config, "_numa_attention_tp", False)
         ):
-            full_plan = getattr(config, "_numa_attention_tp_shard_plan", None)
-            if not (isinstance(full_plan, dict) and full_plan.get("world_size", 0) >= 2):
-                full_plan = getattr(config, "_numa_mlp_tp_shard_plan", None)
+            # Union of every pass's plan. Preferring one slot over the other
+            # described the MLP's template kernels with the attention plan
+            # whenever both passes were on, dropping the MLP's sharding and
+            # its all-reduce. See ``merged_global_shard_plan``.
+            from torch._inductor.fx_passes.numa_tp_common import (
+                merged_global_shard_plan,
+            )
+
+            full_plan = merged_global_shard_plan()
             if isinstance(full_plan, dict) and full_plan.get("world_size", 0) >= 2:
                 numa_shard_plan = full_plan
             else:
@@ -2024,6 +2061,23 @@ class PythonWrapperCodegen(CodeGen):
                         # Downstream NUMA kernels must read the reduced value,
                         # never the pre-reduction partials.
                         self._numa_tensor_cache[out_arg] = reclone_names
+                        self._numa_reduction_reclones[out_arg] = reclone_names
+                else:
+                    # Not a row-parallel kernel, so there is no partial sum to
+                    # reduce. But if one of these per-socket results is the
+                    # graph's own output (e.g. the final replicated LayerNorm
+                    # of a Pre-LN stack) there is no downstream local kernel to
+                    # forward it to either, and the returned buffer would never
+                    # be written. Reconcile it with a single copy from node 0.
+                    for out_arg, per_node_outs in numa_output_clones.items():
+                        if not per_node_outs:
+                            continue
+                        self.writeline(
+                            _NumaGraphOutputCopyLine(
+                                f"{out_arg}.copy_({per_node_outs[0]})",
+                                out_arg,
+                            )
+                        )
             else:
                 self.writeline(
                     f"{kernel_name}.run({call_args_str}, grid={grid_str}, stream={stream_name})"
@@ -2196,7 +2250,12 @@ class PythonWrapperCodegen(CodeGen):
         )
 
         normalized_plan = ensure_generalized_lists(shard_plan)
-        x_node = normalized_plan.get("x_node")
+        # Activation inputs: replicated, but re-cloned every forward rather
+        # than hoisted into the persistent weight cache. A merged plan carries
+        # one per contributing block/pass.
+        x_nodes = set(normalized_plan.get("x_nodes") or [])
+        if isinstance(normalized_plan.get("x_node"), str):
+            x_nodes.add(normalized_plan["x_node"])
         shard_d = int(normalized_plan.get("shard_d", 0))
 
         # column_parallel_nodes / row_parallel_nodes entries are 2-tuples
@@ -2383,12 +2442,28 @@ class PythonWrapperCodegen(CodeGen):
                 # tensors directly on the target NUMA node (uninitialized).
                 # The kernel fully overwrites these, so skip the wasteful
                 # ``clone + copy`` of undefined bytes that _emit_replicate
-                # would do. Applied to pure-output args and also to the
-                # first occurrence of an in_out_ptr arg (no cache hit).
-                if is_out_only or is_in_out:
+                # would do. Pure outputs only.
+                if is_out_only:
                     out_name = _emit_numa_empty_strided(arg_name, sid)
                     per_node_arg_names[sid].append(out_name)
                     generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = out_name
+                    continue
+
+                # ``in_out_ptr`` with no cache entry. Unlike ``out_ptr``, the
+                # kernel may READ this buffer before overwriting it, so its
+                # incoming value is live -- Inductor picks ``in_out_ptr`` for
+                # exactly the in-place accumulate case (``buf += ...``).
+                # Allocating uninitialized per-socket storage discards that
+                # value on every socket. That is how an all-reduced row-parallel
+                # result feeding a fused residual add vanished: each socket read
+                # a fresh zero page instead of the reconciled sum, so the whole
+                # sublayer contributed nothing. Replicate the master buffer,
+                # which holds the reconciled data. Not cached across forwards:
+                # an accumulator's contents change every call.
+                if is_in_out:
+                    name = _emit_replicate(arg_name, sid, cache=False)
+                    per_node_arg_names[sid].append(name)
+                    generated_by_arg.setdefault(arg_name, [""] * world_size)[sid] = name
                     continue
 
                 # Generalized plan semantics:
@@ -2396,7 +2471,7 @@ class PythonWrapperCodegen(CodeGen):
                 #   (zero-on-nonzero-socket when in ``zero_on_nonzero_nodes``
                 #   AND the kernel is row-parallel output ``z_shard``)
                 # - shard-slice tensors in column_parallel_nodes / row_parallel_nodes
-                if arg_name == x_node:
+                if arg_name in x_nodes:
                     # Activation changes every forward: do NOT cache.
                     name = _emit_replicate(arg_name, sid, cache=False)
                     per_node_arg_names[sid].append(name)
@@ -2558,6 +2633,15 @@ class PythonWrapperCodegen(CodeGen):
         if not cache or old_name not in cache:
             return
         per_node_old = cache[old_name]
+        # If ``old_name`` was all-reduced, its authoritative per-socket view is
+        # the post-reduction re-clone, not whatever the reuse cache now holds.
+        # Aliasing off the re-clones also marks them consumed, which is what
+        # keeps the reduction from being elided as dead code.
+        reduced = getattr(self, "_numa_reduction_reclones", {}).get(old_name)
+        if reduced:
+            per_node_old = reduced
+            for _rn in reduced:
+                self._numa_reclone_consumed.add(_rn)
         if not per_node_old:
             return
 

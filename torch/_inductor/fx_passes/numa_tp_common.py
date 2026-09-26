@@ -303,3 +303,147 @@ def ensure_generalized_lists(plan: Dict[str, Any]) -> Dict[str, Any]:
     out["zero_on_nonzero_nodes"] = zn
 
     return out
+
+
+def _normalize_pp_entries(entries, shard_d):
+    """Return ``(name, dim, shard_size)`` 3-tuples for a plan's node list.
+
+    2-tuple entries implicitly inherit the plan-wide ``shard_d``. Once several
+    blocks share one accumulated plan that implicit value is no longer
+    meaningful -- blocks can have different hidden sizes -- so bind each entry
+    to the ``shard_d`` of the plan it came from before merging.
+    """
+    out = []
+    for entry in entries or []:
+        if len(entry) == 3:
+            name, dim, size = entry
+        else:
+            name, dim = entry
+            size = shard_d
+        out.append((str(name), int(dim), int(size)))
+    return out
+
+
+def merge_global_shard_plan(config_key: str, shard_plan: Dict[str, Any]) -> None:
+    """Accumulate ``shard_plan`` into the graph-wide plan at ``config_key``.
+
+    Wrapper codegen recovers a plan from this slot whenever a kernel loses its
+    origin-node metadata, which template (matmul) kernels routinely do. Every
+    kernel in the graph therefore reads this one slot, so it must describe
+    every block the pass rewrote.
+
+    Overwriting it left only the last block described. Earlier blocks'
+    row-parallel weights were absent from ``row_parallel_nodes``, so the
+    wrapper's ``has_row and not has_col`` test could not recognize their
+    outputs as partial sums, and their cross-socket reductions were never
+    emitted -- silently dropping every shard but one.
+    """
+    new = ensure_generalized_lists(dict(shard_plan))
+    new_shard_d = int(new.get("shard_d", 0))
+    prev = getattr(config, config_key, None)
+
+    merged = dict(new)
+    for key in (
+        "column_parallel_nodes",
+        "row_parallel_nodes",
+    ):
+        merged[key] = _normalize_pp_entries(new.get(key), new_shard_d)
+    for key in ("replicated_nodes", "zero_on_nonzero_nodes"):
+        merged[key] = [str(n) for n in (new.get(key) or [])]
+    # ``x_node`` is the per-block activation input. It is replicated like a
+    # weight but, unlike a weight, changes every forward, so the wrapper must
+    # not hoist its clone into the persistent weight cache. Keeping only the
+    # newest block's name left every earlier block's activation looking like a
+    # weight. Accumulate them all.
+    merged["x_nodes"] = _merge_x_nodes(new, [])
+
+    if isinstance(prev, dict) and int(prev.get("world_size", 0)) >= 2:
+        prev_norm = ensure_generalized_lists(dict(prev))
+        prev_shard_d = int(prev_norm.get("shard_d", 0))
+        for key in ("column_parallel_nodes", "row_parallel_nodes"):
+            seen = {e[0] for e in merged[key]}
+            for entry in _normalize_pp_entries(prev_norm.get(key), prev_shard_d):
+                if entry[0] not in seen:
+                    merged[key].append(entry)
+                    seen.add(entry[0])
+        for key in ("replicated_nodes", "zero_on_nonzero_nodes"):
+            seen = set(merged[key])
+            for name in (prev_norm.get(key) or []):
+                if str(name) not in seen:
+                    merged[key].append(str(name))
+                    seen.add(str(name))
+        merged["x_nodes"] = _merge_x_nodes(prev_norm, merged["x_nodes"])
+
+    setattr(config, config_key, merged)
+
+
+def _merge_x_nodes(plan: Dict[str, Any], into: List[str]) -> List[str]:
+    """Union of ``plan``'s activation-input names into ``into``."""
+    out = list(into)
+    names = list(plan.get("x_nodes") or [])
+    if isinstance(plan.get("x_node"), str):
+        names.append(plan["x_node"])
+    for name in names:
+        if str(name) not in out:
+            out.append(str(name))
+    return out
+
+
+# Every config slot holding an accumulated graph-wide plan, in no
+# significant order -- the merge below is a union.
+GLOBAL_PLAN_KEYS = (
+    "_numa_attention_tp_shard_plan",
+    "_numa_mlp_tp_shard_plan",
+)
+
+
+def merged_global_shard_plan() -> Optional[Dict[str, Any]]:
+    """Union of every pass's accumulated graph-wide plan, or ``None``.
+
+    Template (matmul) kernels routinely lose their origin-node metadata during
+    scheduling, so wrapper codegen falls back to a graph-wide plan to classify
+    their arguments. Reading a single pass's slot and ignoring the others is
+    not a fallback but a misclassification: with attention and MLP TP both
+    enabled, the MLP's ``addmm`` templates were described by the *attention*
+    plan, in which no MLP weight appears. Every MLP argument then took the
+    "replicate unknown tensor" path -- no column/row slicing -- and the
+    ``has_row and not has_col`` test saw no row-parallel weight, so the MLP's
+    all-reduce was never emitted. The sublayer silently collapsed to shard 0.
+    Either pass alone was correct, which is why this only showed up in the
+    combined configuration the benchmarks actually run.
+
+    Node names are unique within an FX graph, so unioning the generalized
+    lists is unambiguous. Per-entry shard sizes (3-tuples) let plans with
+    different ``shard_d`` merge without losing their own chunk size.
+    """
+    merged: Optional[Dict[str, Any]] = None
+    for key in GLOBAL_PLAN_KEYS:
+        plan = getattr(config, key, None)
+        if not isinstance(plan, dict) or int(plan.get("world_size", 0)) < 2:
+            continue
+        norm = ensure_generalized_lists(dict(plan))
+        shard_d = int(norm.get("shard_d", 0))
+        if merged is None:
+            merged = dict(norm)
+            for k in ("column_parallel_nodes", "row_parallel_nodes"):
+                merged[k] = _normalize_pp_entries(norm.get(k), shard_d)
+            for k in ("replicated_nodes", "zero_on_nonzero_nodes"):
+                merged[k] = [str(n) for n in (norm.get(k) or [])]
+            merged["x_nodes"] = _merge_x_nodes(norm, [])
+            continue
+        for k in ("column_parallel_nodes", "row_parallel_nodes"):
+            seen = {e[0] for e in merged[k]}
+            for entry in _normalize_pp_entries(norm.get(k), shard_d):
+                if entry[0] not in seen:
+                    merged[k].append(entry)
+                    seen.add(entry[0])
+        for k in ("replicated_nodes", "zero_on_nonzero_nodes"):
+            seen = set(merged[k])
+            for name in (norm.get(k) or []):
+                if str(name) not in seen:
+                    merged[k].append(str(name))
+                    seen.add(str(name))
+        merged["x_nodes"] = _merge_x_nodes(norm, merged["x_nodes"])
+        if not int(merged.get("shard_d", 0)):
+            merged["shard_d"] = shard_d
+    return merged

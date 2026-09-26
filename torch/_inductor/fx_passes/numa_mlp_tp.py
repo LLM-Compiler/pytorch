@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from .. import config
+from .numa_tp_common import merge_global_shard_plan
 
 aten = torch.ops.aten
 
@@ -865,7 +866,7 @@ def _apply_geglu_plan(
         "h": h,
         "d": d,
     }
-    setattr(config, "_numa_mlp_tp_shard_plan", dict(shard_plan))
+    merge_global_shard_plan("_numa_mlp_tp_shard_plan", shard_plan)
 
     for sn in itertools.chain(gate_shards, up_shards, down_shards):
         sn.meta["numa_shard_plan"] = shard_plan
@@ -1128,7 +1129,7 @@ def numa_mlp_tp_pass(graph: torch.fx.Graph) -> None:
         }
         # Persist latest full plan so wrapper codegen can recover semantics even
         # if a backend path drops direct origin-node metadata.
-        setattr(config, "_numa_mlp_tp_shard_plan", dict(shard_plan))
+        merge_global_shard_plan("_numa_mlp_tp_shard_plan", shard_plan)
 
         # Propagate the shard plan to all per-shard slice nodes so downstream
         # passes and wrapper codegen can recover the layout from any of them.
