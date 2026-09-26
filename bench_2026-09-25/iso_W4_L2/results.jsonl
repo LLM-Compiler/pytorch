@@ -1,0 +1,12 @@
+{"mode": "ref", "sites": 0, "codehash": "df4744ed83a2", "files": 20, "shape": [1, 128, 768]}
+{"mode": "combo", "combo": "(none)", "sites": 0, "codehash": "649bc1fa999d", "files": 20, "max_abs": 0.0, "max_rel": 0.0, "finite": true, "verdict": "PASS"}
+{"mode": "combo", "combo": "mlp", "sites": 29, "codehash": "5d26146e1e69", "files": 18, "max_abs": 4.288293361663818, "max_rel": 1.0, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "attention", "sites": 29, "codehash": "a95e68600754", "files": 22, "max_abs": 4.288293361663818, "max_rel": 1.0, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "layer_norm", "sites": 0, "codehash": "835210642240", "files": 20, "max_abs": 0.0, "max_rel": 0.0, "finite": true, "verdict": "NOFIRE"}
+{"mode": "combo", "combo": "residual", "sites": 0, "codehash": "3c6a7a7a918b", "files": 20, "max_abs": 6.496906280517578e-06, "max_rel": 0.20944112539291382, "finite": true, "verdict": "NOFIRE"}
+{"mode": "combo", "combo": "mlp+residual", "sites": 29, "codehash": "7630cc514efb", "files": 18, "max_abs": 4.288293361663818, "max_rel": 1.0, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "attention+residual", "sites": 29, "codehash": "0a7698ec7987", "files": 22, "max_abs": 26432805797888.0, "max_rel": 50617796001792.0, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "layer_norm+attention", "sites": 29, "codehash": "ea3edd0cc2d5", "files": 22, "max_abs": 4.288293361663818, "max_rel": 1.0, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "layer_norm+mlp", "sites": 29, "codehash": "22f1636eaf70", "files": 18, "max_abs": 4.288293361663818, "max_rel": 1.0, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "attention+mlp", "sites": 29, "codehash": "d80aa5a95bd3", "files": 22, "max_abs": 4.288293361663818, "max_rel": 1.0, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "layer_norm+attention+mlp+residual", "sites": 29, "codehash": "d97e7521e196", "files": 22, "max_abs": 4.288293361663818, "max_rel": 1.0, "finite": true, "verdict": "FAIL"}

@@ -1,0 +1,12 @@
+{"mode": "ref", "sites": 0, "codehash": "4e35cce43736", "files": 20, "shape": [1, 128, 768]}
+{"mode": "combo", "combo": "(none)", "sites": 0, "codehash": "f6673511eee0", "files": 20, "max_abs": 0.0, "max_rel": 0.0, "finite": true, "verdict": "PASS"}
+{"mode": "combo", "combo": "mlp", "sites": 29, "codehash": "4bb1af950b2b", "files": 18, "max_abs": 4.384153366088867, "max_rel": 64866.4921875, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "attention", "sites": 29, "codehash": "c8a202a55cae", "files": 22, "max_abs": 1.9007930755615234, "max_rel": 90528.5546875, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "layer_norm", "sites": 0, "codehash": "b3ba923a196e", "files": 20, "max_abs": 6.496906280517578e-06, "max_rel": 0.20944112539291382, "finite": true, "verdict": "NOFIRE"}
+{"mode": "combo", "combo": "residual", "sites": 0, "codehash": "26dc584fea1c", "files": 20, "max_abs": 6.496906280517578e-06, "max_rel": 0.20944112539291382, "finite": true, "verdict": "NOFIRE"}
+{"mode": "combo", "combo": "mlp+residual", "sites": 29, "codehash": "87b50118a2c6", "files": 18, "max_abs": 4.384153366088867, "max_rel": 64866.4921875, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "attention+residual", "sites": 29, "codehash": "22482d7feea4", "files": 22, "max_abs": 1.9007930755615234, "max_rel": 90528.5546875, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "layer_norm+attention", "sites": 29, "codehash": "99d19b4c5ec0", "files": 22, "max_abs": 1.9007930755615234, "max_rel": 90528.5546875, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "layer_norm+mlp", "sites": 29, "codehash": "7c570e1dabc1", "files": 18, "max_abs": 4.384153366088867, "max_rel": 64866.4921875, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "attention+mlp", "sites": 29, "codehash": "3ce541103b0b", "files": 22, "max_abs": 5.064675331115723, "max_rel": 213993.09375, "finite": true, "verdict": "FAIL"}
+{"mode": "combo", "combo": "layer_norm+attention+mlp+residual", "sites": 29, "codehash": "06bebd506bc6", "files": 22, "max_abs": 5.064675331115723, "max_rel": 213993.09375, "finite": true, "verdict": "FAIL"}

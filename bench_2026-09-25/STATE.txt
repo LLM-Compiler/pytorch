@@ -1,0 +1,5 @@
+state as of 2026-09-25T16:43:11+05:30
+branch : fix/numa-tp-row-parallel-allreduce
+commit : 3de9d2bd045633f3c57e78d3fa53a726692071c4
+uncommitted: torch/_inductor/codegen/wrapper.py (_NumaGraphOutputCopyLine)
+restore with: git apply bench_2026-09-25/graph_output_copy_fix.patch
