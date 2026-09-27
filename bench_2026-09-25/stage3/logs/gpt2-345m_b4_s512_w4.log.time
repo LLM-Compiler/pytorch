@@ -1,0 +1,23 @@
+	Command being timed: "python scripts/inductor/gpt2_multi_size_speedup_cli.py --model 345m --batch-size 4 --seq-length 512 --world-size 4 --warmup 10 --iters 50 --check-correctness"
+	User time (seconds): 37909.58
+	System time (seconds): 550.32
+	Percent of CPU this job got: 3536%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 18:07.42
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 11982864
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 20312876
+	Voluntary context switches: 3853816
+	Involuntary context switches: 587411
+	Swaps: 0
+	File system inputs: 176
+	File system outputs: 131120
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
