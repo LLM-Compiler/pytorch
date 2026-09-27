@@ -1,0 +1,24 @@
+Command terminated by signal 9
+	Command being timed: "python scripts/inductor/gpt2_multi_size_speedup_cli.py --model 345m --batch-size 2 --seq-length 4096 --world-size 4 --warmup 10 --iters 50 --check-correctness"
+	User time (seconds): 150758.66
+	System time (seconds): 2686.62
+	Percent of CPU this job got: 2462%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:43:51
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 62888212
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 8232
+	Minor (reclaiming a frame) page faults: 118232052
+	Voluntary context switches: 1303681
+	Involuntary context switches: 210467
+	Swaps: 0
+	File system inputs: 227096
+	File system outputs: 146240
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
