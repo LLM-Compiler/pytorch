@@ -1,0 +1,45 @@
+warning: seq_length=2048 > default context=1024; position table size uses max(seq_length, 1024).
+NUMA enabled=True nodes=4
+GPT-2 762M (762m) prefill: B=1 S=2048 L=36 H=20 E=64 D=1280 FFN=5120 world_size=4
+Running standard ...
+Running NUMA-TP (tp_lm_head=False) ...
+Traceback (most recent call last):
+  File "/home/shavin/llm-cpu-compiler/pytorch/scripts/inductor/gpt2_multi_size_speedup_cli.py", line 739, in <module>
+    raise SystemExit(main())
+  File "/home/shavin/llm-cpu-compiler/pytorch/scripts/inductor/gpt2_multi_size_speedup_cli.py", line 663, in main
+    numa_timing, numa_out, numa_info = _run_path(
+  File "/home/shavin/llm-cpu-compiler/pytorch/scripts/inductor/gpt2_multi_size_speedup_cli.py", line 439, in _run_path
+    timing = _time_forward(
+  File "/home/shavin/llm-cpu-compiler/pytorch/scripts/inductor/gpt2_multi_size_speedup_cli.py", line 319, in _time_forward
+    compiled(input_ids)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/eval_frame.py", line 465, in _fn
+    return fn(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/scripts/inductor/gpt2_multi_size_speedup_cli.py", line 196, in forward
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/eval_frame.py", line 632, in _fn
+    return fn(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/aot_autograd.py", line 1106, in forward
+    return compiled_fn(full_args)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 321, in runtime_wrapper
+    all_outs = call_func_at_runtime_with_args(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/_aot_autograd/utils.py", line 124, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 667, in inner_fn
+    outs = compiled_fn(args)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 488, in wrapper
+    return compiled_fn(runtime_args)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/codecache.py", line 1562, in __call__
+    return self.current_callable(inputs)
+  File "/tmp/gpt2_speedup_inductor_cache_y3iivg58/qy/cqyc43k2fhrxeligfpuezo7wrjsys6okbkyzfus3lilhzvx6i2pj.py", line 9126, in call
+    _numa_ar_buf502_n2 = torch.ops.aten.clone.default(buf502, numa_node=2)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_ops.py", line 720, in __call__
+    return self._op(*args, **kwargs)
+RuntimeError: Could not move memory to a NUMA node
