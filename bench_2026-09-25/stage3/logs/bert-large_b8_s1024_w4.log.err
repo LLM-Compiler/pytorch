@@ -1,0 +1,8 @@
+warning: seq_length=1024 > default context=512; position table size uses max(seq_length, 512).
+NUMA enabled=True nodes=4
+BERT-Large (~340M) (large) prefill: B=8 S=1024 L=24 H=16 E=64 D=1024 FFN=4096 world_size=4
+Running standard ...
+Running NUMA-TP (tp_lm_head=False) ...
+correctness: max_abs=3.815e-06 max_rel=6.310e+00 PASS (atol=0.001 rtol=0.001)
+standard mean_ms=31498.456 median=31462.884 min=30093.401
+numa_tp mean_ms=21671.337 median=21696.573 min=21023.068
