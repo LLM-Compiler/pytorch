@@ -1,0 +1,32 @@
+cells recorded: 104   ok: 89   not ok: 15
+   gpt2-117m   B=2  S=4096  TIMEOUT-OR-KILLED
+   gpt2-345m   B=1  S=4096  TIMEOUT-OR-KILLED
+   gpt2-345m   B=2  S=2048  rc=1
+   gpt2-345m   B=2  S=4096  TIMEOUT-OR-KILLED
+   gpt2-345m   B=4  S=2048  TIMEOUT-OR-KILLED
+   gpt2-762m   B=1  S=2048  rc=1
+   gpt2-762m   B=1  S=4096  TIMEOUT-OR-KILLED
+   gpt2-762m   B=2  S=2048  TIMEOUT-OR-KILLED
+   gpt2-762m   B=4  S=1024  rc=1
+   gpt2-762m   B=4  S=2048  TIMEOUT-OR-KILLED
+   gpt2-762m   B=8  S=1024  TIMEOUT-OR-KILLED
+   bert-base   B=2  S=4096  rc=1
+   bert-large  B=1  S=4096  TIMEOUT-OR-KILLED
+   bert-large  B=2  S=4096  TIMEOUT-OR-KILLED
+   bert-large  B=4  S=2048  TIMEOUT-OR-KILLED
+
+integrity: all ok cells have numa_args>0 in the NUMA arm and 0 in the standard arm
+
+speedup by model (min / median / max over its ok cells):
+   bert-base   n=20   0.268 / 0.644 / 1.630   above 1.0x: 4 of 20
+   bert-large  n=18   0.438 / 0.801 / 1.453   above 1.0x: 4 of 18
+   gpt2-117m   n=20   0.300 / 0.648 / 1.774   above 1.0x: 5 of 20
+   gpt2-345m   n=17   0.416 / 0.762 / 1.467   above 1.0x: 4 of 17
+   gpt2-762m   n=14   0.428 / 0.782 / 1.054   above 1.0x: 1 of 14
+
+best cell per model:
+   bert-base   B=1  S=4096  1.630x
+   bert-large  B=8  S=1024  1.453x
+   gpt2-117m   B=1  S=4096  1.774x
+   gpt2-345m   B=8  S=1024  1.467x
+   gpt2-762m   B=2  S=1024  1.054x
