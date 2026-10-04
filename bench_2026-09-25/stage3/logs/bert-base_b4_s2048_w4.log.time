@@ -1,0 +1,23 @@
+	Command being timed: "python scripts/inductor/bert_multi_size_speedup_cli.py --model base --batch-size 4 --seq-length 2048 --world-size 4 --warmup 10 --iters 50 --check-correctness"
+	User time (seconds): 64005.22
+	System time (seconds): 1553.22
+	Percent of CPU this job got: 3710%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 29:26.94
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 32227600
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1238
+	Minor (reclaiming a frame) page faults: 59242289
+	Voluntary context switches: 2133620
+	Involuntary context switches: 392501
+	Swaps: 0
+	File system inputs: 599624
+	File system outputs: 89824
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
