@@ -1,0 +1,7 @@
+NUMA enabled=True nodes=4
+BERT-Base (~110M) (base) prefill: B=8 S=128 L=12 H=12 E=64 D=768 FFN=3072 world_size=4
+Running standard ...
+Running NUMA-TP (tp_lm_head=False) ...
+correctness: max_abs=2.384e-06 max_rel=3.747e+00 PASS (atol=0.001 rtol=0.001)
+standard mean_ms=612.123 median=585.546 min=516.373
+numa_tp mean_ms=1415.466 median=1396.328 min=1340.558
