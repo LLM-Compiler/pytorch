@@ -1,0 +1,13 @@
+{
+  "model": "bert-large",
+  "batch": 1,
+  "seq": 4096,
+  "world_size": 4,
+  "arm": "standard",
+  "mean_ms": 41046.604200281436,
+  "median_ms": 41091.608664020896,
+  "min_ms": 39371.49877101183,
+  "iters": 50,
+  "peak_rss_gb": 4.8,
+  "numa_args_cache_dir": "/tmp/bert_speedup_inductor_cache_r78o55ve"
+}
