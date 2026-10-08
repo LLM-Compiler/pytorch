@@ -1,0 +1,1 @@
+{"model": "bert-base", "batch": 2, "seq": 4096, "world_size": 4, "speedup": 2.2738936115589587, "std_mean_ms": 25769.732793077128, "numa_mean_ms": 11332.866525540594, "correctness": "PASS", "max_abs": 2.86102294921875e-06, "max_rel": 3.4219255447387695, "corr": 1.0003565549850464, "std_peak_rss_gb": 5.52, "numa_peak_rss_gb": 52.53}

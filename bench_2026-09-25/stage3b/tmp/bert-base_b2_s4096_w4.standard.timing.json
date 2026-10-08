@@ -1,0 +1,13 @@
+{
+  "model": "bert-base",
+  "batch": 2,
+  "seq": 4096,
+  "world_size": 4,
+  "arm": "standard",
+  "mean_ms": 25769.732793077128,
+  "median_ms": 25918.049936997704,
+  "min_ms": 21535.016209003516,
+  "iters": 50,
+  "peak_rss_gb": 5.52,
+  "numa_args_cache_dir": "/tmp/bert_speedup_inductor_cache_ms_lyda_"
+}
