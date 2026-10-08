@@ -9,3 +9,4 @@ gpt2-762m,8,1024,4,,,,,,numa-arm-failed
 gpt2-345m,1,4096,4,,,,,,numa-arm-failed
 gpt2-345m,4,2048,4,,,,,,numa-arm-failed
 bert-large,1,4096,4,,,,,,numa-arm-failed
+bert-large,4,2048,4,,,,,,numa-arm-failed
