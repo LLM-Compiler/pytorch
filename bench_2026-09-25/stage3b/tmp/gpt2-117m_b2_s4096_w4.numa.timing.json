@@ -1,0 +1,13 @@
+{
+  "model": "gpt2-117m",
+  "batch": 2,
+  "seq": 4096,
+  "world_size": 4,
+  "arm": "numa",
+  "mean_ms": 15956.331591121852,
+  "median_ms": 15437.180265027564,
+  "min_ms": 11923.772211011965,
+  "iters": 50,
+  "peak_rss_gb": 58.92,
+  "numa_args_cache_dir": "/tmp/gpt2_speedup_inductor_cache_ts7xqpre"
+}
