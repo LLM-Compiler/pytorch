@@ -1,0 +1,1 @@
+{"model": "gpt2-762m", "batch": 4, "seq": 1024, "world_size": 4, "speedup": 1.3743196170652328, "std_mean_ms": 33455.23230977589, "numa_mean_ms": 24343.12360411277, "correctness": "PASS", "max_abs": 1.4007091522216797e-05, "max_rel": 7.177966594696045, "corr": 1.000282883644104, "std_peak_rss_gb": 4.22, "numa_peak_rss_gb": 38.46}
