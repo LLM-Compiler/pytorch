@@ -5,6 +5,7 @@ NL   = int(os.environ.get("NLAYERS", 2))
 SEQ  = int(os.environ.get("SEQ", 128))
 TAG  = "%s_w%d_L%d_s%d" % (MODE, WS, NL, SEQ)
 if os.environ.get("NOROPE"): TAG += "_norope"
+if os.environ.get("REALROPE"): TAG += "_realrope"
 CACHE = "/tmp/gc_cache_" + TAG
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE
 
@@ -23,6 +24,23 @@ from simple_gemma_decoder_block_torch_compile_demo import (
 # comparison valid while removing that op class from the graph.
 if os.environ.get("NOROPE"):
     _D.apply_rotary_emb = lambda x, freqs_cis: x
+
+# Same rotation, expressed in REAL arithmetic instead of complex.
+#   (a + bi)(c + di) = (ac - bd) + (ad + bc)i
+# Mathematically identical to the view_as_complex form, but it lowers to
+# ordinary Triton kernels, which the NUMA per-socket machinery already handles.
+# The complex form falls back to bare aten calls that never receive numa_args,
+# so every socket but the compute shard keeps un-rotated q/k.
+if os.environ.get("REALROPE"):
+    def _rope_real(x, freqs_cis):
+        import torch as _t
+        xt = x.transpose(1, 2).float()
+        a, b = _t.chunk(xt, 2, dim=-1)
+        fr, fi = freqs_cis.real, freqs_cis.imag
+        out_r = a * fr - b * fi
+        out_i = a * fi + b * fr
+        return _t.cat([out_r, out_i], dim=-1).type_as(x).transpose(1, 2)
+    _D.apply_rotary_emb = _rope_real
 
 ic.max_autotune_gemm_backends = "TRITON"
 cpu_mod = torch._C._cpu

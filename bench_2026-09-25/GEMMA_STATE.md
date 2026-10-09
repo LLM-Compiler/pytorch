@@ -103,3 +103,59 @@ wrapper codegen, NOT in numa_mlp_tp.py / numa_gemma_attention_tp.py.
 ### Reproduce
     NOROPE=1 NLAYERS=1 python bench_2026-09-25/gemma_check.py {std|mlp|attn} 4
     python bench_2026-09-25/cmp.py /tmp/gc_std_w4_L1_s128_norope.pt /tmp/gc_mlp_w4_L1_s128_norope.pt
+
+## REFINED (2026-10-09, same session) — it is the rotary CHAIN, not the complex ops
+
+Two further experiments sharpen the root cause:
+
+### 1. Real-arithmetic rotary does NOT fix it
+Reformulated `apply_rotary_emb` without complex ops, using
+(a+bi)(c+di) = (ac-bd) + (ad+bc)i. Verified mathematically exact:
+    standard(real-rope) vs standard(complex-rope): max_abs 8.58e-06, corr 1.000000
+
+But NUMA stays broken, and one case gets worse:
+| config (1 layer, W=4) | complex rope | real rope |
+|---|---|---|
+| attention TP | corr 0.844 | corr 0.770 |
+| GeGLU MLP TP | corr 0.770 | **NaN** |
+
+So the defect is NOT the complex-operator fallback. Removing rotary entirely
+(NOROPE) gives corr 1.000000; expressing the SAME rotation in real arithmetic
+does not. The problem is the rotary region's buffer structure, not its op type.
+
+### 2. The rotary chain is never NUMA-tracked
+In the generated code the rotary input is a PLAIN allocation with no per-socket
+versions at all:
+    buf6 = empty_strided_cpu((1,1,128,128,2), (32768,32768,256,2,1), float32)
+    buf4 = reinterpret_tensor(buf6, ...)  # alias
+    buf5 = reinterpret_tensor(buf6, ...)  # alias
+    grep -c "_numa_p._buf6_n" -> 0
+The chunk/stack/alias pattern feeding rotary sits outside the NUMA machinery,
+so per-socket execution reads and writes inconsistent buffers -> divergence,
+and NaN once the shapes interact badly.
+
+### 3. The pass walks PAST rotary instead of sharding it
+`numa_gemma_attention_tp.py` references rotary in exactly one place -- a BFS
+comment about traversing "reshape/permute/clone/expand/mul/cat/unsqueeze/
+split/getitem/view_as_complex/view_as_real/index_put" to locate the Q/K mm
+upstream. It never tags, resizes, or shards the rotary chain nodes.
+
+Compare `numa_mlp_tp.py`, which DOES handle its activation chain: it collects
+`gelu_chain` and runs `_resize_node_val_and_tensor_meta` over every node plus
+rewrites reshape target-shape literals. The Gemma attention pass has no
+equivalent for the rotary chain.
+
+### THE FIX
+Extend `numa_gemma_attention_tp_pass` to treat the rotary chain the way
+`numa_mlp_tp_pass` treats `gelu_chain`: collect the chain nodes between the Q/K
+mm and the attention matmul, resize their meta to the sharded head count,
+rewrite any reshape literals, and tag them with the shard plan so wrapper
+codegen emits per-socket buffers for them.
+
+### Also in the tree (unvalidated)
+`PythonWrapperCodegen._numa_extern_per_socket` replicates extern/fallback aten
+calls across sockets. Correct by construction (it only fires when an operand
+already has per-socket versions) but NOT exercised by this bug, because the
+rotary operands are not NUMA-tracked in the first place. Keep it: it closes a
+real gap for extern ops whose inputs ARE tracked. Remove it if it ever gets in
+the way.

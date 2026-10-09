@@ -165,6 +165,12 @@ class _NumaGraphOutputCopyLine(DeferredLineBase):
         return _NumaGraphOutputCopyLine(line, self.name)
 
 
+# Measurement gate: emit column-parallel per-node operands as views of the
+# original weight instead of full per-node clones. Trades locality for
+# memory; default OFF so committed behaviour is unchanged.
+_NUMA_COLPAR_VIEW = bool(__import__('os').environ.get('NUMA_COLPAR_VIEW'))
+
+
 class _NUMAFreshAllocLine(DeferredLineBase):
     """Emit a per-NUMA-node empty_strided allocation only if it was NOT
     superseded by a reinterpret alias propagated from a buffer-reuse chain.
@@ -990,6 +996,7 @@ class PythonWrapperCodegen(CodeGen):
             self.writeline(
                 f"{self.declare}{output_name} = {kernel_name}({', '.join(args)}){ending}"
             )
+            self._numa_extern_per_socket(output_name, kernel_name, args, ending)
             if (
                 self.supports_intermediate_hooks
                 and config.generate_intermediate_hooks
@@ -999,6 +1006,60 @@ class PythonWrapperCodegen(CodeGen):
                 self.writeline(
                     f"run_intermediate_hooks({origin_node.name!r}, {output_name})"
                 )
+
+
+    def _numa_extern_per_socket(
+        self, output_name: str, kernel_name: str, args: List[str], ending: str
+    ) -> None:
+        """Replicate an extern/fallback aten call across NUMA sockets.
+
+        ``numa_args`` only rides along with Triton kernel launches. An op that
+        Inductor cannot codegen -- notably the complex ops behind rotary
+        embedding, ``view_as_complex`` / complex ``mul`` / ``view_as_real``,
+        which log "does not support code generation for complex operators" --
+        is emitted here instead, as a bare ``torch.ops.aten.*`` call. Without
+        this, that call runs ONCE against the master buffers and the per-socket
+        buffers keep their pre-op values, so every socket but the compute shard
+        silently diverges.
+
+        That was the whole of the Gemma defect: with rotary disabled both the
+        GeGLU MLP and attention paths go from corr 0.770 / 0.844 to 1.000000.
+        A broadcast from the master would NOT be correct here, because under
+        attention TP the master holds only the compute shard's heads.
+
+        Emits one call per socket, substituting each argument's socket-local
+        buffer where one exists, and registers the outputs so downstream
+        kernels resolve them through ``_numa_tensor_cache``.
+        """
+        cache = getattr(self, "_numa_tensor_cache", None)
+        if not cache:
+            return
+        if not (
+            getattr(config, "_numa_mlp_tp", False)
+            or getattr(config, "_numa_attention_tp", False)
+        ):
+            return
+        # Only meaningful if at least one operand is actually sharded/replicated
+        # per socket; otherwise the master result is already correct for all.
+        shared = [a for a in args if isinstance(a, str) and a in cache]
+        if not shared:
+            return
+        ws = len(cache[shared[0]])
+        if ws < 2:
+            return
+
+        per_node: List[str] = []
+        for sid in range(ws):
+            sargs = [
+                cache[a][sid] if isinstance(a, str) and a in cache else a
+                for a in args
+            ]
+            name = f"_numa_ext_{output_name}_n{sid}"
+            self.writeline(f"{name} = {kernel_name}({', '.join(sargs)}){ending}")
+            # Mark live so the deferred-line elision does not drop it.
+            getattr(self, "_numa_reclone_consumed", set()).add(name)
+            per_node.append(name)
+        cache[output_name] = per_node
 
     def generate_extern_kernel_out(
         self, kernel: str, out: str, out_view: Optional[str], args: List[str]
@@ -2351,8 +2412,31 @@ class PythonWrapperCodegen(CodeGen):
                 )
                 return shard_name
 
-            full_clone_name = f"{prefix}_{var_name}_full_n{sid}"
             slice_name = f"{prefix}_{var_name}_n{sid}"
+
+            # A column slice of a C-contiguous parent keeps the PARENT's
+            # strides, so the only way to give a node a compact copy is to
+            # change the stride -- which the MM template has already baked as a
+            # constant. Hence the clone-full-then-slice below: every node holds
+            # the whole weight and uses 1/W of it. Measured on gpt2-762m W=4:
+            # 144 weights full-cloned, 6.61 GB held where 1.65 GB is needed,
+            # i.e. 4.95 GB wasted (bench_2026-09-25/measure_waste.py).
+            #
+            # Under NUMA_COLPAR_VIEW the per-node operand is instead a plain
+            # VIEW of the original weight: identical data, identical strides
+            # (so the baked constants still match), and no extra memory at all.
+            # What it gives up is locality -- those reads become cross-socket.
+            # That trade is worth measuring directly, since it isolates how
+            # much of NUMA-TP's gain comes from weight locality as opposed to
+            # activation locality.
+            if _NUMA_COLPAR_VIEW:
+                self.writeline(
+                    f"{slice_name} = torch.ops.aten.slice.Tensor("
+                    f"{var_name}, {dim}, {start}, {end}, 1)"
+                )
+                return slice_name
+
+            full_clone_name = f"{prefix}_{var_name}_full_n{sid}"
             # Cache the full clone (malloc + memcpy) so it runs only once.
             key = full_clone_name
             init_expr = f"torch.ops.aten.clone.default({var_name}, numa_node={sid})"
