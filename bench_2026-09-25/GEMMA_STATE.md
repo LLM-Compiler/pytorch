@@ -320,3 +320,63 @@ that pass's contribution.
 Raised from `view_as_complex` during lowering (fake-tensor stage), i.e. BEFORE
 wrapper codegen, so it is not the alias-chain fix. S=1024/2048/4096 all compile.
 Needs confirming against NUMA_ALIAS_CHAIN=0 and then diagnosing separately.
+
+## FINAL — Gemma works, with speedup (2026-10-10)
+
+### Correctness: 19 configurations validated
+Gemma (rotary ENABLED), vs standard Inductor:
+  L1 mlp / attn / both, W=4      corr 1.000000 (max_abs 1.5e-05 / 9.1e-06 / 1.6e-05)
+  L2 mlp / attn / both, W=4      corr 1.000001 (max_abs 1.8e-05 / 1.5e-05 / 1.8e-05)
+  L2 both, W=2                   corr 1.000001 (max_abs 1.9e-05)
+GPT-2 regression, 12 cells {mlp,attn,both} x W{2,4} x L{1,2}: all corr 1.000000,
+max_abs unchanged from the pre-fix baseline. No regression.
+
+### Speedup: Gemma 270M, W=4, B=1, L=18
+| S | std ms | numa ms | speedup |
+|---|---|---|---|
+| 512  | 2194  | 3472  | 0.632x |
+| 1024 | 4361  | 7150  | 0.610x |
+| 2048 | 11497 | 11760 | 0.978x |
+| 4096 | 27013 | 22338 | **1.209x** |
+
+Crossover between S=2048 and S=4096. Independently reproduced: a separate run
+gave 1.206x at S=4096 (0.3% apart).
+
+Later crossover and lower peak than GPT-2/BERT (~S=1134, up to 1.774x), which
+is structural: Gemma 270M has 4 heads, so at W=4 each socket gets ONE head --
+the most fragmented sharding in the study -- and num_kv_heads=1 (MQA) means K/V
+cannot be sharded at all and is replicated on every socket. GPT-2 117M has 12
+heads (3/socket), BERT-large 16 (4/socket).
+
+W=2 is worse (0.805x at S=2048), consistent with every other model here.
+
+### The fix, in four parts (all must be active together)
+In `PythonWrapperCodegen`:
+ 1. `codegen_deferred_allocation` records view -> (parent, size, stride, offset),
+    parsed from the generated reinterpret_tensor string. It must NOT walk the IR:
+    an earlier version called `layout.view.data.get_name()`, which realizes
+    buffers and perturbs layout decisions, breaking S=512/L18 with a
+    view_as_complex stride error. A codegen hook must not influence lowering.
+ 2. `_emit_numa_empty_strided` carves such a view out of a PER-SOCKET parent,
+    preserving the interleaved real/imag layout `stack` builds.
+ 3. `codegen_multi_output` carries the per-socket cache entry across bare
+    `bufN = bufM` renames -- the step whose absence caused the NaN.
+ 4. `_numa_extern_per_socket` replicates extern/fallback aten calls
+    (view_as_complex, complex mul, view_as_real) per socket.
+
+Set `NUMA_ALIAS_CHAIN=0` to disable for bisecting.
+
+### Why only Gemma needed it
+Rotary is the only place in these benchmarks combining `stack`-built interleaved
+aliases with ops Inductor cannot codegen. GPT-2/BERT never hit either.
+
+### Methodology warning for the write-up
+`simple_gemma_decoder_block_speedup_cli.py` builds a FRESH UNSEEDED model per
+arm, so its two arms do not share weights. Its numbers (0.919x at S=4096) are
+not comparable. Use `bench_2026-09-25/gemma_time.py`, which builds one seeded
+model and times both arms against it.
+
+Also: never read a single-pass number as that pass's contribution. At W=4
+S=2048, MLP-only is 0.676x and attention-only 0.524x, both far WORSE than
+both-on 0.978x, because under whole-graph per-socket execution any unsharded
+region becomes duplicated work.
