@@ -1,0 +1,5 @@
+model,batch,seq,world_size,std_mean_ms,numa_mean_ms,speedup,status
+gemma-270m,1,512,4,,,,rc=1
+gemma-270m,1,1024,4,4268.85,7608.94,0.561,ok
+gemma-270m,1,2048,4,10644.75,11971.74,0.889,ok
+gemma-270m,1,4096,4,21550.25,23438.88,0.919,ok

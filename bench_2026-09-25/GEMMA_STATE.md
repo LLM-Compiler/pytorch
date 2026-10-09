@@ -275,3 +275,48 @@ worse than none (measured: attention 0.844 -> NaN with only two of them).
 GPT-2 and BERT never build interleaved aliases and never hit an op Inductor
 cannot codegen, so their buffers were always tracked. Rotary is the only place
 in these benchmarks that combines `stack`-built aliasing with extern fallbacks.
+
+## SPEEDUP, now that Gemma is correct (2026-10-09/10)
+
+Methodology note: `simple_gemma_decoder_block_speedup_cli.py` builds a FRESH
+UNSEEDED model per arm, so its two arms do not even share weights. All numbers
+below come from `bench_2026-09-25/gemma_time.py`, which builds ONE seeded model
+and times both arms against it. Gemma 270M: L=18 h=1152 heads=4 kv=1 hd=256
+mlp=6912, B=1, warmup 3 / iters 10.
+
+| config | std ms | numa ms | speedup |
+|---|---|---|---|
+| W=4, S=2048 | 11717 | 11821 | 0.991x |
+| W=4, S=4096 | 28103 | 23309 | **1.206x** |
+| W=2, S=2048 | 12121 | 15047 | 0.805x |
+
+Gemma crosses 1.0 between S=2048 and S=4096 at W=4 -- later than GPT-2/BERT
+(~S=1134), and the peak is lower (1.206x vs 1.774x for gpt2-117m at the same
+S=4096, W=4). W=2 loses, consistent with every other model on this machine.
+
+### Why Gemma gains less, structurally
+`num_heads=4`. At W=4 each socket gets exactly ONE head, which is the most
+fragmented attention sharding in the whole study. And `num_kv_heads=1` (MQA)
+means K/V cannot be sharded at all, so that work is replicated on every socket.
+GPT-2 117M has 12 heads (3 per socket) and BERT-large 16 (4 per socket).
+
+### Per-pass isolation (W=4, S=2048) -- a result worth keeping
+| mode | mean ms | vs std |
+|---|---|---|
+| std | 11717 | - |
+| MLP TP only | 17339 | 0.676x |
+| attention TP only | 22371 | 0.524x |
+| both | 11821 | 0.991x |
+
+Either pass ALONE is far worse than both together. Under whole-graph per-socket
+execution every kernel runs on all W sockets; a region that is not sharded
+becomes pure duplicated work. Only with both passes on does the per-socket work
+actually divide. Do not benchmark a single pass in isolation and read it as
+that pass's contribution.
+
+### Open: S=512 fails to compile
+    LoweringException: RuntimeError: Tensor must have a stride divisible by 2
+    for all but last dimension
+Raised from `view_as_complex` during lowering (fake-tensor stage), i.e. BEFORE
+wrapper codegen, so it is not the alias-chain fix. S=1024/2048/4096 all compile.
+Needs confirming against NUMA_ALIAS_CHAIN=0 and then diagnosing separately.

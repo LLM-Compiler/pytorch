@@ -1,0 +1,67 @@
+/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/lowering.py:1725: UserWarning: Torchinductor does not support code generation for complex operators. Performance may be worse than eager.
+  warnings.warn(
+E1009 23:46:08.190077 207193 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0] failed while attempting to run meta for aten.view_as_complex.default
+E1009 23:46:08.190077 207193 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0] Traceback (most recent call last):
+E1009 23:46:08.190077 207193 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py", line 2042, in _dispatch_impl
+E1009 23:46:08.190077 207193 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     r = func(*args, **kwargs)
+E1009 23:46:08.190077 207193 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/_ops.py", line 720, in __call__
+E1009 23:46:08.190077 207193 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     return self._op(*args, **kwargs)
+E1009 23:46:08.190077 207193 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0] RuntimeError: Tensor must have a stride divisible by 2 for all but last dimension
+benchmark failed L=18 B=1 S=512: backend='inductor' raised:
+LoweringException: RuntimeError: Tensor must have a stride divisible by 2 for all but last dimension
+  target: aten.view_as_complex.default
+  args[0]: TensorBox(StorageBox(
+    ConcatKernel(name='buf6', layout=FixedLayout('cpu', torch.float32, size=[1, 1, 512, 128, 2], stride=(131072, 1, 256, 2, 1)), inputs=[ComputedBuffer(name='buf4', layout=NonOwningLayout('cpu', torch.float32, size=[1, 1, 512, 128, 1], stride=[131072, 1, 256, 2, 1]), data=Pointwise(
+      'cpu',
+      torch.float32,
+      def inner_fn(index):
+          _, _, i2, i3, _ = index
+          tmp0 = ops.load(buf2, i3 + 256 * i2)
+          tmp1 = ops.load(buf3, i2)
+          tmp2 = ops.index_expr(256, torch.float32)
+          tmp3 = tmp1 / tmp2
+          tmp4 = ops.constant(1e-06, torch.float32)
+          tmp5 = tmp3 + tmp4
+          tmp6 = ops.rsqrt(tmp5)
+          tmp7 = tmp0 * tmp6
+          tmp8 = ops.load(arg5_1, i3)
+          tmp9 = ops.constant(1, torch.float32)
+          tmp10 = tmp8 + tmp9
+          tmp11 = tmp7 * tmp10
+          return tmp11
+      ,
+      ranges=[1, 1, 512, 128, 1],
+      origin_node=None,
+      origins=OrderedSet([cat])
+    )), ComputedBuffer(name='buf5', layout=NonOwningLayout('cpu', torch.float32, size=[1, 1, 512, 128, 1], stride=[131072, 1, 256, 2, 1]), data=Pointwise(
+      'cpu',
+      torch.float32,
+      def inner_fn(index):
+          _, _, i2, i3, _ = index
+          tmp0 = ops.load(buf2, 128 + i3 + 256 * i2)
+          tmp1 = ops.load(buf3, i2)
+          tmp2 = ops.index_expr(256, torch.float32)
+          tmp3 = tmp1 / tmp2
+          tmp4 = ops.constant(1e-06, torch.float32)
+          tmp5 = tmp3 + tmp4
+          tmp6 = ops.rsqrt(tmp5)
+          tmp7 = tmp0 * tmp6
+          tmp8 = ops.load(arg5_1, 128 + i3)
+          tmp9 = ops.constant(1, torch.float32)
+          tmp10 = tmp8 + tmp9
+          tmp11 = tmp7 * tmp10
+          return tmp11
+      ,
+      ranges=[1, 1, 512, 128, 1],
+      origin_node=None,
+      origins=OrderedSet([cat])
+    ))])
+  ))
+
+Set TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information
+
+
+You can suppress this exception and fall back to eager by setting:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+
