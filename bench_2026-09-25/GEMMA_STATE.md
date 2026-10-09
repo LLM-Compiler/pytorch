@@ -234,3 +234,44 @@ regression, since all four hooks are shared code.
 ### Ground truth to check against
 With rotary disabled (NOROPE=1) every Gemma path is already correct
 (corr 1.000000 / 1.000001). That is the target the fix must reach with rotary on.
+
+## FIXED (2026-10-09) — all four alias-chain hooks, together
+
+Gemma is numerically correct with rotary ENABLED, under `NUMA_ALIAS_CHAIN=1`:
+
+| config (S=128, vs standard Inductor) | before | after |
+|---|---|---|
+| L1 GeGLU MLP TP, W=4 | corr 0.770 | **1.000000** (max_abs 1.53e-05) |
+| L1 attention TP, W=4 | corr 0.844 | **1.000000** (max_abs 9.12e-06) |
+| L1 both, W=4         | corr 0.844 | **1.000000** (max_abs 1.57e-05) |
+| L2 GeGLU MLP TP, W=4 | corr 0.767 | **1.000001** (max_abs 1.76e-05) |
+| L2 attention TP, W=4 | corr 0.541 | **1.000001** (max_abs 1.50e-05) |
+| L2 both, W=4         | corr 0.541 | **1.000001** (max_abs 1.79e-05) |
+| L2 both, W=2         | corr 0.498 | **1.000001** (max_abs 1.86e-05) |
+
+The residuals are float reduction-order noise, the same order as GPT-2/BERT.
+
+### What the fix is
+Four wrapper-codegen hooks that must ALL be active together. Enabling a subset
+leaves sockets reading a mix of master and socket-local data, which is strictly
+worse than none (measured: attention 0.844 -> NaN with only two of them).
+
+1. `codegen_deferred_allocation` records `name -> (parent, size, stride, offset)`
+   for buffers that are VIEWS into a larger parent.
+2. `_emit_numa_empty_strided` carves such a view out of a PER-SOCKET parent
+   (allocating the parent per socket on first use and caching it) instead of
+   allocating it standalone. This is what preserves the interleaved real/imag
+   layout that `stack` builds for `view_as_complex`.
+3. `codegen_multi_output` carries the per-socket cache entry across bare
+   `bufN = bufM` renames. THIS was the step missing in the failed attempt; the
+   replication chain broke at `buf8 = buf7`.
+4. `_numa_extern_per_socket` replicates extern/fallback aten calls
+   (`view_as_complex`, complex `mul`, `view_as_real`) per socket. It only fires
+   once (1) and (2) have made its operands socket-local.
+
+`make_buffer_reuse` already handled the fourth path (`reinterpret_tensor` reuse).
+
+### Why only Gemma needed it
+GPT-2 and BERT never build interleaved aliases and never hit an op Inductor
+cannot codegen, so their buffers were always tracked. Rotary is the only place
+in these benchmarks that combines `stack`-built aliasing with extern fallbacks.

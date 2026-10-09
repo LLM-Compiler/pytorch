@@ -171,6 +171,14 @@ class _NumaGraphOutputCopyLine(DeferredLineBase):
 _NUMA_COLPAR_VIEW = bool(__import__('os').environ.get('NUMA_COLPAR_VIEW'))
 
 
+# Replicate the ALIAS/EXTERN/PASS-THROUGH chain across sockets. Needed for
+# rotary embedding, whose buffers never otherwise get socket-local copies.
+# Gated while under validation; all four paths must be on together, because
+# replicating only some leaves sockets reading a mix of master and
+# socket-local data (measured: attention corr 0.844 -> NaN).
+_NUMA_ALIAS_CHAIN = bool(__import__('os').environ.get('NUMA_ALIAS_CHAIN'))
+
+
 class _NUMAFreshAllocLine(DeferredLineBase):
     """Emit a per-NUMA-node empty_strided allocation only if it was NOT
     superseded by a reinterpret alias propagated from a buffer-reuse chain.
@@ -652,6 +660,11 @@ class PythonWrapperCodegen(CodeGen):
         # Maps a tensor variable name in wrapper code (e.g. "buf1") to a list of
         # per-NUMA-node tensor variables produced for that logical tensor.
         self._numa_tensor_cache: Dict[str, List[str]] = {}
+        # name -> (parent, size, stride, offset) for buffers that are VIEWS
+        # into a larger parent. ``stack`` builds interleaved real/imag pairs
+        # this way; allocating the views independently per socket destroys the
+        # interleaving and leaves the parent with no socket-local copy.
+        self._numa_alias_parents: Dict[str, Tuple[str, str, str, str]] = {}
         # Per-NUMA-node tensor variables whose post-all-reduce re-clone is
         # actually consumed by a downstream kernel. Names added here cause
         # the corresponding deferred re-clone line to be emitted at flush
@@ -1031,6 +1044,8 @@ class PythonWrapperCodegen(CodeGen):
         buffer where one exists, and registers the outputs so downstream
         kernels resolve them through ``_numa_tensor_cache``.
         """
+        if not _NUMA_ALIAS_CHAIN:
+            return
         cache = getattr(self, "_numa_tensor_cache", None)
         if not cache:
             return
@@ -1404,6 +1419,14 @@ class PythonWrapperCodegen(CodeGen):
 
     def codegen_multi_output(self, name, value):
         self.writeline(f"{self.declare}{name} = {value}{self.ending}")
+        # A bare ``bufN = bufM`` rename. Without carrying the per-socket entry
+        # across it the replication chain BREAKS here, which is what turned
+        # rotary into NaN when only the alias and extern hooks were present.
+        if _NUMA_ALIAS_CHAIN:
+            src = str(value).strip()
+            cache = getattr(self, "_numa_tensor_cache", None)
+            if cache is not None and src in cache:
+                cache[name] = list(cache[src])
 
     def codegen_dynamic_scalar(self, node):
         (data,) = (t.codegen_reference() for t in node.inputs)
@@ -2482,6 +2505,30 @@ class PythonWrapperCodegen(CodeGen):
             out_name = f"{prefix}_{var_name}_n{sid}"
             self._ensure_numa_weight_cache_header()
             key = out_name
+
+            # A view must stay a view of its parent's socket-local copy.
+            alias = self._numa_alias_parents.get(var_name) if _NUMA_ALIAS_CHAIN else None
+            if alias is not None:
+                parent, a_size, a_stride, a_off = alias
+                pcache = self._numa_tensor_cache.get(parent)
+                if not pcache or len(pcache) < world_size:
+                    pcache = []
+                    for psid in range(world_size):
+                        pname = f"{prefix}_{parent}_n{psid}"
+                        _emit_numa_weight_cache(
+                            self, pname,
+                            f"empty_strided_cpu_numa({parent}.size(), "
+                            f"{parent}.stride(), {parent}.dtype, numa_node={psid})",
+                            pname, self._numa_suppressed_allocs,
+                        )
+                        pcache.append(pname)
+                    self._numa_tensor_cache[parent] = pcache
+                self.writeline(
+                    f"{out_name} = reinterpret_tensor("
+                    f"{pcache[sid]}, {a_size}, {a_stride}, {a_off})"
+                )
+                return out_name
+
             init_expr = (
                 f"empty_strided_cpu_numa("
                 f"{var_name}.size(), {var_name}.stride(), {var_name}.dtype, "
@@ -2829,6 +2876,20 @@ class PythonWrapperCodegen(CodeGen):
                 f"{self.comment} alias",
             )
         )
+        if _NUMA_ALIAS_CHAIN:
+            try:
+                view = layout.view
+                parent = view.data.get_name()
+                vl = view.layout
+                if isinstance(parent, str) and parent:
+                    self._numa_alias_parents[name] = (
+                        parent,
+                        self.codegen_shape_tuple(tuple(vl.size)),
+                        self.codegen_shape_tuple(tuple(vl.stride)),
+                        str(vl.offset),
+                    )
+            except Exception:
+                pass
 
     def codegen_allocation(self, buffer: ir.Buffer):
         name = buffer.get_name()
