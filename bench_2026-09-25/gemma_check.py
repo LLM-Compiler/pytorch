@@ -4,6 +4,7 @@ WS   = int(sys.argv[2]) if len(sys.argv) > 2 else 4
 NL   = int(os.environ.get("NLAYERS", 2))
 SEQ  = int(os.environ.get("SEQ", 128))
 TAG  = "%s_w%d_L%d_s%d" % (MODE, WS, NL, SEQ)
+if os.environ.get("NOROPE"): TAG += "_norope"
 CACHE = "/tmp/gc_cache_" + TAG
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE
 
@@ -11,9 +12,17 @@ REPO = "/home/shavin/llm-cpu-compiler/pytorch"
 sys.path.insert(0, os.path.join(REPO, "scripts", "inductor"))
 import torch, torch.nn as nn
 from torch._inductor import config as ic
+import simple_gemma_decoder_block_torch_compile_demo as _D
 from simple_gemma_decoder_block_torch_compile_demo import (
     SimpleGemmaStack, _build_prefill_inputs,
 )
+
+# Rotary embedding goes through view_as_complex / complex-mul / view_as_real,
+# which Inductor explicitly warns it cannot codegen ("does not support code
+# generation for complex operators"). Disabling it in BOTH arms keeps the
+# comparison valid while removing that op class from the graph.
+if os.environ.get("NOROPE"):
+    _D.apply_rotary_emb = lambda x, freqs_cis: x
 
 ic.max_autotune_gemm_backends = "TRITON"
 cpu_mod = torch._C._cpu
@@ -28,6 +37,13 @@ model = SimpleGemmaStack(num_layers=NL, hidden_size=H_IN, num_heads=NH,
                          attn_logit_softcapping=None, use_kv_cache=False).eval()
 for p in model.parameters():
     nn.init.normal_(p, std=0.02)
+ZERO = os.environ.get("ZERO", "")
+with torch.no_grad():
+    if "down" in ZERO:
+        for lyr in model.layers:
+            lyr.mlp.down_proj.zero_()
+if ZERO:
+    TAG = TAG + "_zero" + ZERO
 torch.manual_seed(1)
 x, freqs_cis, kv_write_indices, kv_caches, mask = _build_prefill_inputs(
     1, SEQ, H_IN, NKV, HD, NL, torch.device("cpu"), use_kv_cache=False)

@@ -58,3 +58,48 @@ _numa_mlp_tp_shard_plan), so that fix does not reach this.
 NOTE: scripts/inductor/simple_gemma_decoder_block_speedup_cli.py CANNOT be used
 for correctness -- it builds a fresh UNSEEDED model per arm, so the two arms
 never share weights. gemma_check.py exists because of that.
+
+## ROOT CAUSE FOUND (2026-10-09) — rotary embedding, not the TP passes
+
+Disabling `apply_rotary_emb` in BOTH arms makes every Gemma path correct:
+
+| config (1 layer, W=4, S=128) | rotary ON | rotary OFF |
+|---|---|---|
+| GeGLU MLP TP vs standard | corr 0.770 | **corr 1.000000, max_abs 1.55e-05** |
+| attention TP vs standard | corr 0.844 | **corr 1.000001, max_abs 9.78e-06** |
+
+So there is ONE defect, not the two (G1/G2) hypothesised earlier, and it is not
+in the GeGLU or attention sharding at all.
+
+### Evidence chain
+1. No GeGLU arithmetic hypothesis matched the NUMA output (8 candidates tried,
+   incl. shard mispairing, wrong slice dim, gelu-on-fuse, W-overcount). H0 (the
+   correct sharded form) reproduced STANDARD exactly, so the harness was sound.
+2. Zeroing `down_proj` so the MLP contributes NOTHING still left NUMA differing
+   from standard (corr 0.822). The error was therefore outside the MLP.
+3. Disabling rotary fixes both paths. Rotary is the shared root.
+
+### Why this fits every symptom
+- MLP-only wrong even with MLP output zeroed -> error never was in the MLP
+- attention error COMPOUNDS with depth (0.844 @1L -> 0.541 @2L): rotary runs per layer
+- GPT-2 / BERT unaffected: neither has rotary
+- "both" bit-identical to attention-only: both perturbed by the same upstream op
+
+### Mechanism
+`apply_rotary_emb` uses complex ops:
+    x_ = torch.view_as_complex(torch.stack(torch.chunk(x..., 2, -1), -1))
+    x_out = torch.view_as_real(x_ * freqs_cis).type_as(x)
+Inductor logs "does not support code generation for complex operators" and falls
+back for these. The wrapper's per-socket `numa_args` path does not give the
+fallback the per-socket treatment the surrounding Triton kernels get, so the
+sockets diverge from the master.
+
+### Next step
+Inspect the generated code around the rotary region: confirm whether the
+complex-op fallback is (a) run only on the master with per-socket buffers left
+stale, or (b) run per socket but reading/writing the wrong buffers. Fix is in
+wrapper codegen, NOT in numa_mlp_tp.py / numa_gemma_attention_tp.py.
+
+### Reproduce
+    NOROPE=1 NLAYERS=1 python bench_2026-09-25/gemma_check.py {std|mlp|attn} 4
+    python bench_2026-09-25/cmp.py /tmp/gc_std_w4_L1_s128_norope.pt /tmp/gc_mlp_w4_L1_s128_norope.pt
