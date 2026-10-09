@@ -2882,19 +2882,26 @@ class PythonWrapperCodegen(CodeGen):
             )
         )
         if _NUMA_ALIAS_CHAIN:
+            # Parse the ALREADY-GENERATED reference string rather than walking
+            # the IR. Touching layout.view.data (e.g. get_name()) can realize
+            # buffers and assign names, which perturbs Inductor's layout
+            # decisions -- observed as a view_as_complex lowering failure
+            # ("stride divisible by 2") on Gemma at 18 layers / S=512, where a
+            # ConcatKernel came out with stride (131072, 1, 256, 2, 1). A
+            # codegen hook must not influence lowering.
             try:
-                view = layout.view
-                parent = view.data.get_name()
-                vl = view.layout
-                if isinstance(parent, str) and parent:
-                    self._numa_alias_parents[name] = (
-                        parent,
-                        self.codegen_shape_tuple(tuple(vl.size)),
-                        self.codegen_shape_tuple(tuple(vl.stride)),
-                        str(vl.offset),
-                    )
+                ref = layout.view.codegen_reference()
             except Exception:
-                pass
+                ref = ""
+            m = re.match(
+                r"\s*reinterpret_tensor\(\s*([A-Za-z_]\w*)\s*,\s*"
+                r"(\(.*?\))\s*,\s*(\(.*?\))\s*,\s*([^)]+)\)\s*$",
+                ref or "",
+            )
+            if m:
+                self._numa_alias_parents[name] = (
+                    m.group(1), m.group(2), m.group(3), m.group(4).strip()
+                )
 
     def codegen_allocation(self, buffer: ir.Buffer):
         name = buffer.get_name()
