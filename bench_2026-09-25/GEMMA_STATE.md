@@ -159,3 +159,78 @@ already has per-socket versions) but NOT exercised by this bug, because the
 rotary operands are not NUMA-tracked in the first place. Keep it: it closes a
 real gap for extern ops whose inputs ARE tracked. Remove it if it ever gets in
 the way.
+
+## EXACT MECHANISM + IMPLEMENTATION PLAN (2026-10-09, end of session)
+
+### The precise bug, from the generated code
+
+    buf6 = empty_strided_cpu((1,1,128,128,2), (32768,32768,256,2,1), float32)
+    buf4 = reinterpret_tensor(buf6, (1,1,128,128,1), (...), 0)   # alias
+    buf5 = reinterpret_tensor(buf6, (1,1,128,128,1), (...), 1)   # alias
+
+    _numa_p1000_buf4_n0 = empty_strided_cpu_numa(buf4.size(), ...)   # FRESH
+    _numa_p1000_buf5_n0 = empty_strided_cpu_numa(buf5.size(), ...)   # FRESH
+    triton_poi_fused_stack_3.run(buf2, buf3, arg5_1, buf4, buf5, numa_args=[...])
+
+    buf7 = torch.ops.aten.view_as_complex.default(buf6)   # MASTER ONLY
+
+`stack` writes the real/imag pair as TWO INTERLEAVED ALIASES into one parent
+(offsets 0 and 1, stride 2). Per socket the wrapper allocates those aliases as
+two INDEPENDENT buffers, so (a) the interleaving is destroyed and (b) `buf6`
+itself never gets a socket-local copy. Everything downstream of `buf6` --
+view_as_complex, the complex mul, view_as_real -- therefore runs on master data
+only, and sockets 1..W-1 keep un-rotated q/k.
+
+NOTE the FX side is FINE: shapes are already sharded correctly in the generated
+code (1,1,128,128,2) -- H_total 4 -> H_shard 1. The value-based resize in
+`_apply_plan` works. This is purely a WRAPPER CODEGEN gap, not an FX-pass gap.
+(Supersedes the earlier "give the pass a rotary-chain handler" suggestion.)
+
+### Attempted and REVERTED
+Made `_emit_numa_empty_strided` alias-aware (carve the per-socket buffer out of
+a per-socket parent instead of allocating standalone), plus
+`_numa_extern_per_socket` to replicate extern aten calls. Result: attention went
+from corr 0.844 to **NaN**. Reverted; verified back to 0.844.
+
+Partial replication is WORSE than none. The rotary region spans FOUR codegen
+paths and all must be handled together or sockets read a mix of master and
+socket-local data:
+  1. aliased allocation      buf4/buf5 = reinterpret_tensor(buf6, ...)  # alias
+                             -> codegen_deferred_allocation
+  2. extern/fallback calls   buf7 = torch.ops.aten.view_as_complex(buf6)
+                             -> generate_extern_kernel_alloc
+  3. plain alias assignment  buf8 = buf7, buf10 = buf9, buf12 = buf11
+                             -> emitted directly, no NUMA hook at all
+  4. reinterpret reuse       buf13 = reinterpret_tensor(buf6, ...)  # reuse
+                             -> make_buffer_reuse (ALREADY handled)
+
+### Implementation plan (do all four, then test; do not land partially)
+1. `codegen_deferred_allocation`: record name -> (parent, size, stride, offset)
+   and make `_emit_numa_empty_strided` carve from a per-socket parent,
+   allocating the parent per socket on first use and registering it in
+   `_numa_tensor_cache`.
+2. `generate_extern_kernel_alloc`: replicate the call per socket, substituting
+   each operand's socket-local buffer; register the output in the cache.
+   (`_numa_extern_per_socket`, already committed, does this -- it currently
+   declines only because its operands are untracked, which step 1 fixes.)
+3. Find where `bufN = bufM` pass-through assignments are emitted and propagate
+   the cache entry across them. This is the step that was MISSING and is the
+   likely cause of the NaN: the chain broke at `buf8 = buf7`.
+4. Verify `make_buffer_reuse` still resolves `buf13 = reinterpret_tensor(buf6)`
+   now that buf6 is cached.
+
+### Test loop (fast)
+    rm -rf /tmp/gc_cache_*
+    NLAYERS=1 python bench_2026-09-25/gemma_check.py std  4
+    NLAYERS=1 python bench_2026-09-25/gemma_check.py attn 4
+    python bench_2026-09-25/cmp.py /tmp/gc_std_w4_L1_s128.pt /tmp/gc_attn_w4_L1_s128.pt
+~4 min per compile. Targets, in order:
+    attn  corr 0.844 -> 1.000000
+    mlp   corr 0.770 -> 1.000000
+    numa (both)      -> 1.000000
+Then re-run the GPT-2/BERT matrix (bench_2026-09-25/matrix.sh) to prove no
+regression, since all four hooks are shared code.
+
+### Ground truth to check against
+With rotary disabled (NOROPE=1) every Gemma path is already correct
+(corr 1.000000 / 1.000001). That is the target the fix must reach with rotary on.
