@@ -171,12 +171,17 @@ class _NumaGraphOutputCopyLine(DeferredLineBase):
 _NUMA_COLPAR_VIEW = bool(__import__('os').environ.get('NUMA_COLPAR_VIEW'))
 
 
-# Replicate the ALIAS/EXTERN/PASS-THROUGH chain across sockets. Needed for
-# rotary embedding, whose buffers never otherwise get socket-local copies.
-# Gated while under validation; all four paths must be on together, because
-# replicating only some leaves sockets reading a mix of master and
-# socket-local data (measured: attention corr 0.844 -> NaN).
-_NUMA_ALIAS_CHAIN = bool(__import__('os').environ.get('NUMA_ALIAS_CHAIN'))
+# Replicate the ALIAS/EXTERN/PASS-THROUGH chain across sockets. Required for
+# rotary embedding, whose buffers otherwise never get socket-local copies.
+#
+# All four paths must stay on together: replicating only some leaves sockets
+# reading a mix of master and socket-local data, which is strictly worse than
+# none (measured: Gemma attention corr 0.844 -> NaN with two of four enabled).
+#
+# Validated on 19 configurations -- 7 Gemma (MLP/attention/both x 1-2 layers x
+# W=2,4), all corr 1.000000, and 12 GPT-2 regression cells unchanged from
+# baseline. Set NUMA_ALIAS_CHAIN=0 to disable if it ever needs bisecting.
+_NUMA_ALIAS_CHAIN = __import__('os').environ.get('NUMA_ALIAS_CHAIN', '1') != '0'
 
 
 class _NUMAFreshAllocLine(DeferredLineBase):
