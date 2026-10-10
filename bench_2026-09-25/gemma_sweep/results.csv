@@ -1,0 +1,1 @@
+model,batch,seq,world_size,speedup,std_mean_ms,numa_mean_ms,correctness,max_abs,corr,std_rss_gb,numa_rss_gb,status
