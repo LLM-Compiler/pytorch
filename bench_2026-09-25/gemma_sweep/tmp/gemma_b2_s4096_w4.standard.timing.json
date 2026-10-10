@@ -1,0 +1,12 @@
+{
+  "model": "gemma-270m",
+  "batch": 2,
+  "seq": 4096,
+  "world_size": 4,
+  "arm": "standard",
+  "mean_ms": 47322.97936270246,
+  "median_ms": 47046.13817605423,
+  "min_ms": 46063.56061599217,
+  "iters": 50,
+  "peak_rss_gb": 4.58
+}
