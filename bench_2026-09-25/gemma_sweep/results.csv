@@ -1,1 +1,2 @@
 model,batch,seq,world_size,speedup,std_mean_ms,numa_mean_ms,correctness,max_abs,corr,std_rss_gb,numa_rss_gb,status
+gemma-270m,1,128,4,0.4027457596712405,546.0729039972648,1355.87499280693,PASS,0.00011777877807617188,1.0,2.27,6.17,ok
