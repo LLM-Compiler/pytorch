@@ -1,0 +1,23 @@
+	Command being timed: "python bench_2026-09-25/split_arm.py --model gpt2-762m --batch-size 1 --seq-length 4096 --world-size 4 --arm standard --warmup 10 --iters 50 --out-prefix bench_2026-09-25/stage3c/tmp/gpt2-762m_b1_s4096_w4.standard"
+	User time (seconds): 152980.42
+	System time (seconds): 1512.75
+	Percent of CPU this job got: 3225%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:19:49
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 7723380
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1136
+	Minor (reclaiming a frame) page faults: 64967354
+	Voluntary context switches: 779990
+	Involuntary context switches: 175972
+	Swaps: 0
+	File system inputs: 570552
+	File system outputs: 152704
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
