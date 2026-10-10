@@ -380,3 +380,53 @@ Also: never read a single-pass number as that pass's contribution. At W=4
 S=2048, MLP-only is 0.676x and attention-only 0.524x, both far WORSE than
 both-on 0.978x, because under whole-graph per-socket execution any unsharded
 region becomes duplicated work.
+
+## DEFECT 8 — value-based shape rewriting collides with unrelated dimensions
+
+Found by the Gemma grid sweep (2026-10-10). 5 of 21 cells failed to compile,
+all with reshape errors, never memory:
+
+    B=4 S=128  shape '[1, 128, 256]' invalid for input of size 131072
+    B=2 S=512  shape '[256, 256]'    invalid for input of size 262144
+    B=8 S=128  shape '[256, 256]'    invalid for input of size 262144
+
+Every wrong dimension is the correct one divided by exactly W=4.
+
+### Cause
+`_apply_plan` in numa_gemma_attention_tp.py rewrites reshape/expand shape
+literals by MATCHING ON VALUE:
+
+    if d == H_total:  new_sh.append(H_shard)
+    if d == q_size:   new_sh.append(shard_q)
+    ...
+
+Any dimension that merely happens to equal one of those quantities is rewritten,
+whether or not it is the head dimension. The file already acknowledges the
+hazard for one case (a `positionally_rewritten` guard with the comment "skip the
+value-based H_total -> H_shard rule so we don't re-rewrite"), but the guard
+covers only that one site.
+
+### Why Gemma is uniquely exposed
+Gemma 270M: num_heads=4, head_dim=256 -> q_size = 1024, H_total = 4.
+  - BATCH SIZE 4 collides with H_total=4        -> batch rewritten 4 -> 1
+  - B*S = 1024 collides with q_size=1024        -> that dim rewritten 1024 -> 256
+Both collisions are reachable from ordinary benchmark shapes. GPT-2 117M has
+H_total=12 and q_size=768; BERT-large H_total=16, q_size=1024 (so BERT could
+collide too at B*S=1024, e.g. B=1 S=1024 or B=8 S=128 -- WORTH CHECKING).
+
+### Affected cells (all Gemma, all compile-time, no wrong numbers produced)
+  B=2 S=512 | B=4 S=128 | B=4 S=512 | B=4 S=2048 | B=8 S=128
+Note B=4 S=256 and B=8 S=256 PASSED, so the collision depends on which reshape
+nodes a given shape actually produces -- it is not a clean function of B and S.
+
+### Fix direction
+Rewrite POSITIONALLY, not by value: the pass knows which axis of each node is
+the head/q axis from the match structure, so it should rewrite that axis index
+rather than scanning for a matching magnitude. The existing
+`positionally_rewritten` set is the right mechanism, applied to one site only;
+it needs to become the general path.
+
+### Severity
+Compile-time failure, loud. It does NOT silently produce wrong numbers -- every
+cell that compiled also passed correctness. So no published figure is at risk
+from this defect; it only removes cells from the grid.
