@@ -1,0 +1,146 @@
+/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/lowering.py:1725: UserWarning: Torchinductor does not support code generation for complex operators. Performance may be worse than eager.
+  warnings.warn(
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0] failed while attempting to run meta for aten.view.default
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0] Traceback (most recent call last):
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py", line 2042, in _dispatch_impl
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     r = func(*args, **kwargs)
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/_ops.py", line 720, in __call__
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     return self._op(*args, **kwargs)
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/_refs/__init__.py", line 4656, in view
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     return _reshape_view_helper(a, *shape, allow_copy=False)
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/_refs/__init__.py", line 3700, in _reshape_view_helper
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     shape = utils.infer_size(shape, a.numel())
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/_prims_common/__init__.py", line 901, in infer_size
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     torch._check(
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/__init__.py", line 1565, in _check
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     _check_with(RuntimeError, cond, message)
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]   File "/home/shavin/llm-cpu-compiler/pytorch/torch/__init__.py", line 1547, in _check_with
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0]     raise error_type(message_evaluated)
+E1010 12:48:51.627197 298206 /home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py:2046] [0/0] RuntimeError: shape '[1, 512, 256]' is invalid for input of size 524288
+Traceback (most recent call last):
+  File "/home/shavin/llm-cpu-compiler/pytorch/bench_2026-09-25/gemma_arm.py", line 90, in <module>
+    raise SystemExit(main())
+  File "/home/shavin/llm-cpu-compiler/pytorch/bench_2026-09-25/gemma_arm.py", line 68, in main
+    out = c(*inputs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/eval_frame.py", line 465, in _fn
+    return fn(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/convert_frame.py", line 1326, in __call__
+    return self._torchdynamo_orig_callable(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/convert_frame.py", line 1117, in __call__
+    result = self._inner_convert(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/convert_frame.py", line 527, in __call__
+    return _compile(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/convert_frame.py", line 941, in _compile
+    guarded_code = compile_inner(code, one_graph, hooks, transform)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/convert_frame.py", line 672, in compile_inner
+    return _compile_inner(code, one_graph, hooks, transform)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_utils_internal.py", line 87, in wrapper_function
+    return function(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/convert_frame.py", line 705, in _compile_inner
+    out_code = transform_code_object(code, transform)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/bytecode_transformation.py", line 1337, in transform_code_object
+    transformations(instructions, code_options)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/convert_frame.py", line 220, in _fn
+    return fn(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/convert_frame.py", line 640, in transform
+    tracer.run()
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/symbolic_convert.py", line 2766, in run
+    super().run()
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/symbolic_convert.py", line 973, in run
+    while self.step():
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/symbolic_convert.py", line 885, in step
+    self.dispatch_table[inst.opcode](self, inst)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/symbolic_convert.py", line 2957, in RETURN_VALUE
+    self._return(inst)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/symbolic_convert.py", line 2942, in _return
+    self.output.compile_subgraph(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/output_graph.py", line 1117, in compile_subgraph
+    self.compile_and_call_fx_graph(tx, list(reversed(stack_values)), root)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/output_graph.py", line 1369, in compile_and_call_fx_graph
+    compiled_fn = self.call_user_compiler(gm)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/output_graph.py", line 1416, in call_user_compiler
+    return self._call_user_compiler(gm)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/output_graph.py", line 1465, in _call_user_compiler
+    raise BackendCompilerFailed(self.compiler_fn, e).with_traceback(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/output_graph.py", line 1446, in _call_user_compiler
+    compiled_fn = compiler_fn(gm, self.example_inputs())
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/repro/after_dynamo.py", line 130, in __call__
+    compiled_gm = compiler_fn(gm, example_inputs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/__init__.py", line 2235, in __call__
+    return compile_fx(model_, inputs_, config_patches=self.config)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/compile_fx.py", line 1538, in compile_fx
+    return aot_autograd(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/backends/common.py", line 72, in __call__
+    cg = aot_module_simplified(gm, example_inputs, **self.kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/aot_autograd.py", line 1077, in aot_module_simplified
+    compiled_fn = dispatch_and_compile()
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/aot_autograd.py", line 1062, in dispatch_and_compile
+    compiled_fn, _ = create_aot_dispatcher_function(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/aot_autograd.py", line 523, in create_aot_dispatcher_function
+    return _create_aot_dispatcher_function(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/aot_autograd.py", line 761, in _create_aot_dispatcher_function
+    compiled_fn, fw_metadata = compiler_fn(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_functorch/_aot_autograd/jit_compile_runtime_wrappers.py", line 180, in aot_dispatch_base
+    compiled_fw = compiler(fw_module, updated_flat_args)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/compile_fx.py", line 1364, in fw_compiler_base
+    return _fw_compiler_base(model, example_inputs, is_inference)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/compile_fx.py", line 1435, in _fw_compiler_base
+    return inner_compile(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/compile_fx.py", line 459, in compile_fx_inner
+    return wrap_compiler_debug(_compile_fx_inner, compiler_name="inductor")(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_dynamo/repro/after_aot.py", line 85, in debug_wrapper
+    inner_compiled_fn = compiler_fn(gm, example_inputs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/compile_fx.py", line 655, in _compile_fx_inner
+    compiled_graph = codegen_and_compile(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/compile_fx.py", line 554, in codegen_and_compile
+    compiled_graph = fx_codegen_and_compile(gm, example_inputs, **fx_kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/compile_fx.py", line 773, in fx_codegen_and_compile
+    _recursive_post_grad_passes(gm, is_inference=is_inference)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/compile_fx.py", line 291, in _recursive_post_grad_passes
+    post_grad_passes(gm, is_inference)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/fx_passes/post_grad.py", line 174, in post_grad_passes
+    fake_tensor_updater.incremental_update()
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_inductor/fx_utils.py", line 166, in incremental_update
+    new_fake_tensor = node.target(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_ops.py", line 720, in __call__
+    return self._op(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/utils/_stats.py", line 21, in wrapper
+    return fn(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py", line 1241, in __torch_dispatch__
+    return self.dispatch(func, types, args, kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py", line 1695, in dispatch
+    return self._cached_dispatch_impl(func, types, args, kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py", line 1342, in _cached_dispatch_impl
+    output = self._dispatch_impl(func, types, args, kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_subclasses/fake_tensor.py", line 2042, in _dispatch_impl
+    r = func(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_ops.py", line 720, in __call__
+    return self._op(*args, **kwargs)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_refs/__init__.py", line 4656, in view
+    return _reshape_view_helper(a, *shape, allow_copy=False)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_refs/__init__.py", line 3700, in _reshape_view_helper
+    shape = utils.infer_size(shape, a.numel())
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/_prims_common/__init__.py", line 901, in infer_size
+    torch._check(
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/__init__.py", line 1565, in _check
+    _check_with(RuntimeError, cond, message)
+  File "/home/shavin/llm-cpu-compiler/pytorch/torch/__init__.py", line 1547, in _check_with
+    raise error_type(message_evaluated)
+torch._dynamo.exc.BackendCompilerFailed: backend='inductor' raised:
+RuntimeError: shape '[1, 512, 256]' is invalid for input of size 524288
+
+Set TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information
+
+
+You can suppress this exception and fall back to eager by setting:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+
