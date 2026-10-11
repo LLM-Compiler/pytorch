@@ -473,3 +473,45 @@ arguably over-strict upstream.
 Distinct from defect 8: it is a lowering-time constraint on the rotary input
 layout, not a shape-literal rewrite. Blocks exactly 1 cell (Gemma B=4 S=512).
 Not yet investigated.
+
+## DEFECT 9 WITHDRAWN -- it is intermittent, not a defect (2026-10-11)
+
+I recorded "defect 9: view_as_complex rejects a layout whose stride is odd on a
+size-1 axis, blocks Gemma B=4 S=512". That characterisation was WRONG.
+
+### Evidence
+After the defect-8 fix, B=4 S=512 failed ONCE, then passed on every subsequent
+attempt with NO code change in between:
+
+    d8test run        FAILED  (stride divisible by 2)
+    d9probe, plain    OK
+    d9probe, contig   OK
+    d9rep run 1..4    OK  OK  OK  OK
+
+1 failure in 6 attempts of the identical configuration.
+
+### Why it is flaky
+`max_autotune_gemm_backends = "TRITON"` makes Inductor BENCHMARK candidate
+kernels, so layout selection is timing-dependent and varies with machine load.
+With world_size == num_heads the head axis shards to SIZE 1, where the stride is
+semantically meaningless and Inductor is free to pick any value. When it happens
+to pick an odd one, view_as_complex rejects it -- the check does not special-case
+size-1 axes. The d8test run was executing cells back-to-back under load; the
+later runs were on a quiet machine.
+
+### Consequence
+All 5 cells blocked by defect 8 are recoverable; the Gemma grid should reach
+21/21. No compiler change is needed for this.
+
+### ACTIONABLE: the harness should retry before recording a failure
+A single flaky compile currently writes a permanent failure row. Any sweep cell
+could hit this. The sweeps should retry a failed cell once (fresh cache dir)
+before recording it, otherwise the grid under-reports coverage for reasons that
+have nothing to do with the technique.
+
+### If a deterministic guard is ever wanted
+Forcing the rotary input contiguous before view_as_complex gives strides
+(131072, 131072, 256, 2, 1) -- all even but the last -- and compiled fine in the
+probe. Cost is one copy of a (B, 1, S, E/2, 2) tensor per layer per socket,
+about 0.2% of a forward. Not applied, since the failure is rare and the copy
+would be paid by every Gemma cell to fix an occasional one.
