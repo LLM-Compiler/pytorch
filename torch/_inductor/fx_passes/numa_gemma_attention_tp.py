@@ -188,17 +188,36 @@ def _refresh_val(n: torch.fx.Node, new_shape: Tuple[int, ...]) -> None:
             pass
 
 
-def _replace_shape_arg(n: torch.fx.Node, *, old_dim: int, new_dim: int, arg_index: int = 1) -> None:
+def _replace_shape_arg(
+    n: torch.fx.Node, *, old_dim: int, new_dim: int, arg_index: int = 1,
+    from_dim: int = 0,
+) -> None:
     """Rewrite a list/tuple shape arg on a reshape/expand: any element equal
-    to ``old_dim`` becomes ``new_dim``. Leaves -1 and other dims alone."""
+    to ``old_dim`` becomes ``new_dim``. Leaves -1 and other dims alone.
+
+    ``from_dim`` is the first AXIS INDEX eligible for rewriting. Matching purely
+    on magnitude mistakes an unrelated axis for the head axis whenever the two
+    happen to share a value, and axis 0 is where that bites: it carries the
+    batch (or B*S), which collides readily. Measured on Gemma 270M, where
+    num_heads=4 and q_size=1024:
+
+        B=4            -> batch 4 matched H_total=4, rewritten to H_shard=1
+                          "shape '[1, 128, 256]' is invalid for input of size 131072"
+        B=2 S=512      -> B*S=1024 matched q_size=1024, rewritten to shard_q=256
+                          "shape '[256, 256]' is invalid for input of size 262144"
+
+    Passing ``from_dim=1`` keeps axis 0 untouched. The one case where axis 0 is
+    genuinely (B*H) and does need rewriting -- the 3D bmm-input reshapes -- is
+    already handled positionally and excluded via ``positionally_rewritten``.
+    """
     if len(n.args) <= arg_index:
         return
     raw = n.args[arg_index]
     if not isinstance(raw, (list, tuple)):
         return
     new_list: List[Any] = []
-    for v in raw:
-        if isinstance(v, int) and v == old_dim:
+    for ax, v in enumerate(raw):
+        if ax >= from_dim and isinstance(v, int) and v == old_dim:
             new_list.append(new_dim)
         else:
             new_list.append(v)
@@ -798,24 +817,31 @@ def _apply_plan(
             # AND in the post-bmm1 output collapse [1, S, q_size] and [S, q_size]
             # which have tag {q,k,v}. Rewrite whenever "q" is in the tag set.
             if has_q_in(tag):
-                _replace_shape_arg(n, old_dim=q_size, new_dim=shard_q)
+                _replace_shape_arg(n, old_dim=q_size, new_dim=shard_q, from_dim=1)
             # Pre-GQA-expand K/V chain: rewrite kv_size and num_kv_heads, but
             # only when we sliced Wk/Wv (otherwise K/V replicate, full literals
             # remain valid).
             if slice_kv and is_kv_only:
-                _replace_shape_arg(n, old_dim=kv_size, new_dim=shard_kv_size)
+                _replace_shape_arg(n, old_dim=kv_size, new_dim=shard_kv_size, from_dim=1)
                 if num_kv_heads != shard_kv_heads:
-                    _replace_shape_arg(n, old_dim=num_kv_heads, new_dim=shard_kv_heads)
+                    _replace_shape_arg(
+                        n, old_dim=num_kv_heads, new_dim=shard_kv_heads, from_dim=1)
             # num_heads rewrite applies everywhere (Q 4D shapes, post-GQA-expand
             # K/V, post-bmm0 softmax chain, post-bmm1 output collapse).
-            _replace_shape_arg(n, old_dim=H_total, new_dim=H_shard)
+            _replace_shape_arg(n, old_dim=H_total, new_dim=H_shard, from_dim=1)
 
         sh = _shape(n)
         if sh is None:
             continue
         new_sh: List[int] = []
         changed = False
-        for d in sh:
+        for _ax, d in enumerate(sh):
+            # Axis 0 is batch (or B*S) on every node that reaches here; the
+            # (B*H) case is handled positionally above. Same collision hazard
+            # as _replace_shape_arg, so apply the same guard.
+            if _ax == 0:
+                new_sh.append(d)
+                continue
             if has_q_in(tag) and d == q_size:
                 new_sh.append(shard_q); changed = True; continue
             if slice_kv and is_kv_only and d == kv_size:

@@ -430,3 +430,46 @@ it needs to become the general path.
 Compile-time failure, loud. It does NOT silently produce wrong numbers -- every
 cell that compiled also passed correctness. So no published figure is at risk
 from this defect; it only removes cells from the grid.
+
+## DEFECT 8 FIXED (2026-10-11)
+
+### The fix
+`_replace_shape_arg` gained a `from_dim` parameter; the value-based rewrites in
+`_apply_plan` now pass `from_dim=1`, and the meta-shape loop skips axis 0 the
+same way. Axis 0 carries the batch (or B*S) on every node that reaches the
+value-based path -- the one case where it is genuinely (B*H) is the 3D
+bmm-input reshape, already handled positionally and excluded via
+`positionally_rewritten`.
+
+### Result on the 5 previously-failing Gemma cells
+    B=4 S=128    COMPILES OK   (was: shape '[1, 128, 256]' invalid for 131072)
+    B=8 S=128    COMPILES OK   (was: shape '[256, 256]'    invalid for 262144)
+    B=2 S=512    COMPILES OK   (was: shape '[256, 256]'    invalid for 262144)
+    B=4 S=2048   COMPILES OK
+    B=4 S=512    STILL FAILS -- different cause, see DEFECT 9 below
+
+4 of 5 recovered. Gemma grid goes 16/21 -> 20/21 once re-swept.
+
+### No regression
+Gemma correctness matrix, 7 configs: corr 1.000000/1.000001 with max_abs
+IDENTICAL to pre-fix (1.5259e-05, 9.1195e-06, 1.5736e-05, 1.7643e-05,
+1.5020e-05, 1.7881e-05, 1.8597e-05).
+GPT-2 matrix, 12 cells: all corr 1.000000, max_abs identical to pre-fix.
+18-layer spot check B=1 S=2048: PASS, max_abs bit-identical
+(0.000102996826171875), speedup 0.993x vs recorded 1.013x -- 2%, inside the
+run-to-run noise seen elsewhere (1.5-6%).
+
+## DEFECT 9 (new, blocks 1 cell) -- view_as_complex stride on a size-1 axis
+
+    B=4 S=512: RuntimeError: Tensor must have a stride divisible by 2 for all
+    but last dimension   (target: aten.view_as_complex.default)
+
+Seen before at 18 layers / S=512, where a ConcatKernel came out with
+stride (131072, 1, 256, 2, 1) -- stride[1] = 1 on a SIZE-1 axis, whose stride is
+semantically meaningless, but view_as_complex rejects it anyway. Inductor's
+layout choice for that shape is what produces the odd stride; the check is
+arguably over-strict upstream.
+
+Distinct from defect 8: it is a lowering-time constraint on the rotary input
+layout, not a shape-literal rewrite. Blocks exactly 1 cell (Gemma B=4 S=512).
+Not yet investigated.
