@@ -1,21 +1,21 @@
 	Command being timed: "python bench_2026-09-25/gemma_arm.py --batch-size 4 --seq-length 512 --world-size 4 --arm standard --warmup 10 --iters 50 --out-prefix bench_2026-09-25/gemma_sweep/tmp/gemma_b4_s512_w4.standard"
-	User time (seconds): 18209.06
-	System time (seconds): 80.61
-	Percent of CPU this job got: 2844%
-	Elapsed (wall clock) time (h:mm:ss or m:ss): 10:42.95
+	User time (seconds): 18086.29
+	System time (seconds): 80.56
+	Percent of CPU this job got: 2808%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 10:46.84
 	Average shared text size (kbytes): 0
 	Average unshared data size (kbytes): 0
 	Average stack size (kbytes): 0
 	Average total size (kbytes): 0
-	Maximum resident set size (kbytes): 2601664
+	Maximum resident set size (kbytes): 2603264
 	Average resident set size (kbytes): 0
-	Major (requiring I/O) page faults: 0
-	Minor (reclaiming a frame) page faults: 4561907
-	Voluntary context switches: 219892
-	Involuntary context switches: 61469
+	Major (requiring I/O) page faults: 33
+	Minor (reclaiming a frame) page faults: 4859965
+	Voluntary context switches: 228704
+	Involuntary context switches: 64220
 	Swaps: 0
-	File system inputs: 0
-	File system outputs: 142000
+	File system inputs: 5688
+	File system outputs: 136312
 	Socket messages sent: 0
 	Socket messages received: 0
 	Signals delivered: 0
