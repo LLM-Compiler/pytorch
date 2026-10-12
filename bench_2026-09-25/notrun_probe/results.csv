@@ -7,3 +7,4 @@ gpt2-345m,8,2048,4,,,,,60,numa-arm: OOM (signal 9)
 gpt2-762m,8,2048,4,,,,,11,standard-arm: SEGFAULT
 bert-base,4,4096,4,,,,,9,standard-arm: SEGFAULT
 gpt2-117m,4,4096,4,,,,,10,standard-arm: SEGFAULT
+bert-large,4,4096,4,,,,,13,standard-arm: SEGFAULT
