@@ -1,3 +1,4 @@
 model,batch,seq,world_size,speedup,std_mean_ms,numa_mean_ms,correctness,numa_rss_gb,outcome
 gemma-270m,8,4096,4,1.4322057337477077,185530.8847342998,129542.06254210001,PASS,40.84,RUNS
 bert-base,8,2048,4,1.467981711994399,28299.232081000082,19277.64620620019,PASS,57.58,RUNS
+gpt2-117m,8,2048,4,,,,,0,numa-arm: TIMEOUT
