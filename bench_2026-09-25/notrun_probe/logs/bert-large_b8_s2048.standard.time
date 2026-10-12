@@ -1,0 +1,23 @@
+	Command being timed: "python bench_2026-09-25/split_arm.py --model bert-large --batch-size 8 --seq-length 2048 --world-size 4 --arm standard --warmup 3 --iters 10 --out-prefix bench_2026-09-25/notrun_probe/tmp/bert-large_b8_s2048.standard"
+	User time (seconds): 39695.63
+	System time (seconds): 562.80
+	Percent of CPU this job got: 3129%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 21:26.23
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 8630784
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 345
+	Minor (reclaiming a frame) page faults: 23405404
+	Voluntary context switches: 140148
+	Involuntary context switches: 48058
+	Swaps: 0
+	File system inputs: 219504
+	File system outputs: 216376
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
