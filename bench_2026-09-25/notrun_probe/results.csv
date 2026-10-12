@@ -4,3 +4,4 @@ bert-base,8,2048,4,1.467981711994399,28299.232081000082,19277.64620620019,PASS,5
 gpt2-117m,8,2048,4,,,,,0,numa-arm: TIMEOUT
 bert-large,8,2048,4,,,,,60,numa-arm: OOM (signal 9)
 gpt2-345m,8,2048,4,,,,,60,numa-arm: OOM (signal 9)
+gpt2-762m,8,2048,4,,,,,11,standard-arm: SEGFAULT
