@@ -1,0 +1,23 @@
+	Command being timed: "python bench_2026-09-25/gemma_arm.py --batch-size 8 --seq-length 4096 --world-size 4 --arm numa --warmup 3 --iters 10 --out-prefix bench_2026-09-25/notrun_probe/tmp/gemma-270m_b8_s4096.numa"
+	User time (seconds): 116741.09
+	System time (seconds): 2304.52
+	Percent of CPU this job got: 5871%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 33:47.48
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 42821168
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 55548
+	Minor (reclaiming a frame) page faults: 96060484
+	Voluntary context switches: 1051907
+	Involuntary context switches: 545713
+	Swaps: 0
+	File system inputs: 860728
+	File system outputs: 417720
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
