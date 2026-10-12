@@ -11,3 +11,4 @@ bert-large,4,4096,4,,,,,13,standard-arm: SEGFAULT
 gpt2-345m,4,4096,4,,,,,14,standard-arm: SEGFAULT
 gpt2-762m,4,4096,4,,,,,18,standard-arm: SEGFAULT
 bert-base,8,4096,4,,,,,15,standard-arm: SEGFAULT
+gpt2-117m,8,4096,4,,,,,19,standard-arm: SEGFAULT
