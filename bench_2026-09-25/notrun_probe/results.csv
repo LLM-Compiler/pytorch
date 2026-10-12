@@ -8,3 +8,4 @@ gpt2-762m,8,2048,4,,,,,11,standard-arm: SEGFAULT
 bert-base,4,4096,4,,,,,9,standard-arm: SEGFAULT
 gpt2-117m,4,4096,4,,,,,10,standard-arm: SEGFAULT
 bert-large,4,4096,4,,,,,13,standard-arm: SEGFAULT
+gpt2-345m,4,4096,4,,,,,14,standard-arm: SEGFAULT
