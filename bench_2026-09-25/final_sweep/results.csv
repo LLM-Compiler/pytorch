@@ -10,3 +10,4 @@ gpt2-117m,8,2048,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
 gpt2-345m,2,4096,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
 gpt2-345m,8,2048,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
 bert-large,2,4096,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
+bert-large,8,2048,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
