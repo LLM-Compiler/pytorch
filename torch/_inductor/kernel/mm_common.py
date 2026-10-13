@@ -388,6 +388,40 @@ def acc_type(dtype):
     return f"tl.{dtype}".replace("torch.", "")
 
 
+def needs_int64_offsets(node) -> bool:
+    """Whether a GEMM template must compute this operand's offsets in int64.
+
+    Triton-CPU lowers ``tt.addptr`` on a tensor of pointers by multiplying the
+    element offset by the element size *in the offset's own width*, and only
+    sign-extends the product afterwards (triton-cpu
+    ``third_party/cpu/lib/TritonToTritonCPU/ConvertPtrOps.cpp``,
+    ``AddPtrOpConversion``). With int32 offsets that byte product wraps
+    negative as soon as an operand exceeds 2 GiB, so the template's gather
+    load reads an unmapped address -- a segfault, not a wrong number.
+
+    Inductor's own ``can_use_32bit_indexing`` does not catch this because it
+    bounds element *counts*: a 3 GiB float32 tensor is 805M elements, well
+    inside int32. The bound that actually binds here is the byte offset.
+    """
+    import os
+
+    if os.environ.get("INDUCTOR_FORCE_I64_OFFSETS") == "1":
+        # Test hook: exercise the int64 offset path on an operand small enough
+        # to also run through the int32 path, so the two can be compared.
+        return True
+    int_max = torch.iinfo(torch.int32).max
+    try:
+        size = node.get_layout().storage_size()
+    except (AttributeError, NotImplementedError):
+        size = node.get_numel()
+    try:
+        size = int(V.graph.sizevars.size_hint(size))
+    except Exception:
+        # Extent not known at compile time: widen rather than risk the fault.
+        return True
+    return size * node.get_dtype().itemsize > int_max
+
+
 def mm_options(config, sym_m, sym_n, sym_k, layout, b_prologue_cast_type=None):
     """
     Common options to matmul triton templates.

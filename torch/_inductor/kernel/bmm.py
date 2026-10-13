@@ -19,7 +19,13 @@ from ..utils import (
 )
 from ..virtualized import V
 from .mm import _is_static_problem
-from .mm_common import addmm_epilogue, mm_args, mm_configs, mm_options
+from .mm_common import (
+    addmm_epilogue,
+    mm_args,
+    mm_configs,
+    mm_options,
+    needs_int64_offsets,
+)
 
 
 log = logging.getLogger(__name__)
@@ -73,8 +79,18 @@ bmm_template = TritonTemplate(
     rk = tl.arange(0, BLOCK_K)
 
     idx_q = tl.program_id(1)  # batch dimension for BMM
-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q*stride_aq)
-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q*stride_bq)
+    # A_LARGE / B_LARGE are set when the operand's byte extent leaves int32
+    # range. Triton-CPU scales an element offset by the element size in the
+    # offset's own width before sign-extending it, so int32 offsets wrap for
+    # operands above 2 GiB and the gather below reads an unmapped address.
+    if A_LARGE:
+        A = A + (ram[:, None].to(tl.int64) * stride_am + rk[None, :].to(tl.int64) * stride_ak + idx_q.to(tl.int64) * stride_aq)
+    else:
+        A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q*stride_aq)
+    if B_LARGE:
+        B = B + (rk[:, None].to(tl.int64) * stride_bk + rbn[None, :].to(tl.int64) * stride_bn + idx_q.to(tl.int64) * stride_bq)
+    else:
+        B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q*stride_bq)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     for k in range(K, 0, -BLOCK_K):
@@ -160,6 +176,8 @@ def tuned_bmm(mat1, mat2, *, layout=None):
                 input_nodes=(mat1, mat2),
                 layout=layout,
                 **mm_options(config, m, n, k, layout),
+                A_LARGE=needs_int64_offsets(mat1),
+                B_LARGE=needs_int64_offsets(mat2),
             )
     static_shape, is_nonzero = _is_static_problem([mat1, mat2], layout)
     if static_shape and is_nonzero and use_cutlass_template(layout, m, n, k):
@@ -192,6 +210,8 @@ def tuned_baddbmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
                 input_nodes=(inp, mat1, mat2),
                 layout=layout,
                 **mm_options(config, m, n, k, layout),
+                A_LARGE=needs_int64_offsets(mat1),
+                B_LARGE=needs_int64_offsets(mat2),
                 prefix_args=1,
                 epilogue_fn=addmm_epilogue(layout.dtype, alpha, beta),
             )
