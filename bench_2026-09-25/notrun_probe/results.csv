@@ -14,3 +14,4 @@ bert-base,8,4096,4,,,,,15,standard-arm: SEGFAULT
 gpt2-117m,8,4096,4,,,,,19,standard-arm: SEGFAULT
 bert-large,8,4096,4,,,,,16,standard-arm: OOM (signal 9)
 gpt2-345m,8,4096,4,,,,,0,standard-arm: TIMEOUT
+gpt2-762m,8,4096,4,,,,,15,standard-arm: OOM (signal 9)
