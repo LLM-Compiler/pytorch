@@ -3,3 +3,4 @@ gpt2-762m,2,2048,4,,,,,59,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by
 gpt2-345m,1,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2172s),4,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2172s),725,2172
 gpt2-345m,4,2048,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2208s),5,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2208s),846,2208
 bert-large,1,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2252s),4,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2252s),602,2252
+bert-large,4,2048,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2349s),4,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2349s),726,2349
