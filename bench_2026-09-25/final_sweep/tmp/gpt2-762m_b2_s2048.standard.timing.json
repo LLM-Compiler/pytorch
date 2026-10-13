@@ -4,10 +4,10 @@
   "seq": 2048,
   "world_size": 4,
   "arm": "standard",
-  "mean_ms": 49883.664228800626,
-  "median_ms": 49695.37346801371,
-  "min_ms": 49117.870197005686,
+  "mean_ms": 49031.50040039618,
+  "median_ms": 49199.46504899417,
+  "min_ms": 46877.816844993504,
   "iters": 10,
   "peak_rss_gb": 5.52,
-  "numa_args_cache_dir": "/tmp/gpt2_speedup_inductor_cache_qjgyuvpn"
+  "numa_args_cache_dir": "/tmp/gpt2_speedup_inductor_cache__w_pzgqq"
 }
