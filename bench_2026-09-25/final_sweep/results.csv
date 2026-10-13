@@ -3,3 +3,4 @@ gpt2-762m,2,2048,4,,,,,0,standard-arm: ok; numa-arm: rc=2,5,ok,rc=2,885,0
 gpt2-345m,1,4096,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
 gpt2-345m,4,2048,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
 bert-large,1,4096,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
+bert-large,4,2048,4,,,,,0,standard-arm: rc=2; numa-arm: rc=2,0,rc=2,rc=2,0,0
