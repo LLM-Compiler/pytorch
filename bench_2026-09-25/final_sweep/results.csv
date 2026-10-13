@@ -1,1 +1,2 @@
 model,batch,seq,world_size,speedup,std_mean_ms,numa_mean_ms,correctness,numa_rss_gb,outcome,std_rss_gb,std_outcome,numa_outcome,std_elapsed_s,numa_elapsed_s
+gpt2-762m,2,2048,4,,,,,0,standard-arm: ok; numa-arm: rc=2,5,ok,rc=2,885,0
