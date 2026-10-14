@@ -93,7 +93,13 @@ run_arm(){
     el=$(grep -a "Elapsed (wall clock)" $OUT/logs/${TAG}.${ARM}.time 2>/dev/null \
          | awk '{print $NF}' \
          | awk -F: '{s=0; for(i=1;i<=NF;i++) s=s*60+$i; printf "%d", s}')
-    el=${el:-0}
+    # /usr/bin/time writes its Elapsed line at process exit; under extreme
+    # starvation the child can be too wedged for it to flush before the
+    # outer `timeout -k` SIGKILL arrives, leaving the .time file empty. A
+    # bare `rc -eq 124` from the OUTER timeout is authoritative proof the
+    # full cap elapsed even when the inner stats are missing -- fall back
+    # to $CAP rather than a misleading 0, which would read as "instant".
+    if [ -z "$el" ] && [ $rc -eq 124 ]; then el=$CAP; else el=${el:-0}; fi
     rm -rf /tmp/fs_${TAG}_${ARM}
     gb=$(( ${rss:-0} / 1048576 ))
     if [ $rc -eq 0 ]; then why=ok; break; fi
