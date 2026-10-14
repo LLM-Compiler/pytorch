@@ -1,0 +1,24 @@
+Command terminated by signal 9
+	Command being timed: "python bench_2026-09-25/split_arm.py --model bert-large --batch-size 2 --seq-length 4096 --world-size 4 --arm numa --warmup 3 --iters 10 --out-prefix bench_2026-09-25/final_sweep/tmp/bert-large_b2_s4096.numa"
+	User time (seconds): 1211.51
+	System time (seconds): 298.44
+	Percent of CPU this job got: 59%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 42:32.72
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 63392708
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 63398
+	Minor (reclaiming a frame) page faults: 18434489
+	Voluntary context switches: 1237705
+	Involuntary context switches: 28463
+	Swaps: 0
+	File system inputs: 1195488
+	File system outputs: 89200
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
