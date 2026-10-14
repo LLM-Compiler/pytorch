@@ -14,3 +14,4 @@ bert-large,8,2048,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed b
 gpt2-762m,2,4096,4,,,,,59,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 59GB after 2312s),11,ok,MEMORY OVERFLOW (killed by signal 9 at 59GB after 2312s),2090,2312
 gpt2-762m,8,2048,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2159s),11,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2159s),2572,2159
 gpt2-117m,4,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2344s),10,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2344s),807,2344
+bert-base,4,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2495s),10,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2495s),695,2495
