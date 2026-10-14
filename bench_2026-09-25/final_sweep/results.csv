@@ -8,3 +8,4 @@ gpt2-762m,1,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by
 gpt2-762m,4,2048,4,,,,,59,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 59GB after 1875s),7,ok,MEMORY OVERFLOW (killed by signal 9 at 59GB after 1875s),1512,1875
 gpt2-117m,8,2048,4,,,,,0,standard-arm: ok; numa-arm: HIT 28800s CAP (elapsed ~28800s; /usr/bin/time wrote no stats before the final SIGKILL, so RSS is unknown),5,ok,HIT 28800s CAP (elapsed ~28800s; /usr/bin/time wrote no stats before the final SIGKILL, so RSS is unknown),581,28800
 gpt2-345m,2,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 1677s),8,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 1677s),1148,1677
+gpt2-345m,8,2048,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2275s),8,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2275s),1423,2275
