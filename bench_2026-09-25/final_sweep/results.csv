@@ -17,3 +17,4 @@ gpt2-117m,4,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by
 bert-base,4,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2495s),10,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2495s),695,2495
 gpt2-345m,4,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2458s),14,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2458s),1957,2458
 bert-large,4,4096,4,,,,,60,standard-arm: ok; numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2291s),14,ok,MEMORY OVERFLOW (killed by signal 9 at 60GB after 2291s),1831,2291
+gpt2-762m,4,4096,4,,,,,60,standard-arm: HIT 28800s CAP (elapsed 0s); numa-arm: MEMORY OVERFLOW (killed by signal 9 at 60GB after 2214s),0,HIT 28800s CAP (elapsed 0s),MEMORY OVERFLOW (killed by signal 9 at 60GB after 2214s),0,2214
