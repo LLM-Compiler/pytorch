@@ -1,0 +1,24 @@
+Command terminated by signal 9
+	Command being timed: "python bench_2026-09-25/split_arm.py --model gpt2-117m --batch-size 8 --seq-length 4096 --world-size 4 --arm numa --warmup 3 --iters 10 --out-prefix bench_2026-09-25/final_sweep/tmp/gpt2-117m_b8_s4096.numa"
+	User time (seconds): 976.58
+	System time (seconds): 258.53
+	Percent of CPU this job got: 50%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 40:44.66
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 63499916
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 8251
+	Minor (reclaiming a frame) page faults: 18396539
+	Voluntary context switches: 958897
+	Involuntary context switches: 15012
+	Swaps: 0
+	File system inputs: 678464
+	File system outputs: 138728
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
